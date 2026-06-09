@@ -1106,19 +1106,20 @@ function mapACTraceability(run: any, recommendedTests: any[]) {
         title: ac.text.length > 80 ? ac.text.substring(0, 80) + '...' : ac.text,
         fullText: ac.text,
         coverageStatus,
-        linkedExistingTests,
+        linkedExistingTests: linkedTests,
         linkedMissingTest: hasSuggestedTests ? ac.suggested_scenarios[0] : null,
         priority: ac.recommended_action === 'ADD_AUTOMATED_TEST' ? 'Must' : 'Recommended',
         notes: ac.reason || ac.mapped_behavior || ''
       });
     });
   }
-  
+
   // Also check business intent rows for AC coverage
   if (run.business_intent?.rows) {
     run.business_intent.rows.forEach((row: any) => {
       if (row.acceptance_criterion_id && !traceabilityMap.find(t => t.id === row.acceptance_criterion_id)) {
-        const linkedTests = testMap.get(row.acceptance_criterion_id) || [];
+        const linkedTestsData = acToTestsMap.get(row.acceptance_criterion_id) || [];
+        const linkedTests = linkedTestsData.map((t: any) => t.test.display_name || t.test.stable_identity);
         const hasExistingTests = linkedTests.length > 0;
         
         traceabilityMap.push({
