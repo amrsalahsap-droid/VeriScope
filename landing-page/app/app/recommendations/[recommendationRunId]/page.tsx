@@ -1946,30 +1946,33 @@ export default function RecommendationDetailPage({ params }: PageProps) {
       </Section>
 
       {/* Release Readiness Verdict */}
-      <ReleaseReadinessVerdict
-        verdict={determineReleaseReadinessVerdict(
+      {(() => {
+        const verdictEvidenceQuality = run.readiness_snapshot?.expected_confidence || "UNKNOWN";
+        const verdictCoverageRatio = run.evidence.coverage?.line_coverage_ratio ?? null;
+        const verdictHasFailures = prTestClassification.failed.length > 0;
+        const verdictMissingScenarios = scenarioMatrix.filter(s => s.status === "suggested");
+        const verdict = determineReleaseReadinessVerdict(
           run.recommended_tests,
-          scenarioMatrix.filter(s => s.status === "suggested"),
-          run.readiness_snapshot?.expected_confidence || "LOW",
-          run.evidence.coverage?.line_coverage_ratio || null,
-          false // TODO: Determine if there are failures
-        )}
-        reason={generateVerdictReason(
-          determineReleaseReadinessVerdict(
-            run.recommended_tests,
-            scenarioMatrix.filter(s => s.status === "suggested"),
-            run.readiness_snapshot?.expected_confidence || "LOW",
-            run.evidence.coverage?.line_coverage_ratio || null,
-            false
-          ),
-          extractUnderstandingData(run).impactedBehaviors,
-          run.recommended_tests,
-          scenarioMatrix.filter(s => s.status === "suggested"),
-          run.evidence.coverage?.line_coverage_ratio || null
-        )}
-        impactedAreas={extractUnderstandingData(run).impactedBehaviors}
-        confidence={run.readiness_snapshot?.expected_confidence || "LOW"}
-      />
+          verdictMissingScenarios,
+          verdictEvidenceQuality,
+          verdictCoverageRatio,
+          verdictHasFailures
+        );
+        return (
+          <ReleaseReadinessVerdict
+            verdict={verdict}
+            reason={generateVerdictReason(
+              verdict,
+              extractUnderstandingData(run).impactedBehaviors,
+              run.recommended_tests,
+              verdictMissingScenarios,
+              verdictCoverageRatio
+            )}
+            impactedAreas={extractUnderstandingData(run).impactedBehaviors}
+            confidence={run.readiness_snapshot?.expected_confidence || undefined}
+          />
+        );
+      })()}
 
       {/* What Veriscope Understood */}
       <WhatVeriscopeUnderstood {...extractUnderstandingData(run)} />
@@ -3007,7 +3010,14 @@ export default function RecommendationDetailPage({ params }: PageProps) {
               <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
                 <span className="text-zinc-400">Coverage report</span>
                 <span className={run.evidence?.coverage ? "text-emerald-400" : "text-rose-400"}>
-                  {run.evidence?.coverage ? "Available" : "Missing"}
+                  {run.evidence?.coverage
+                    ? (() => {
+                        const raw = run.evidence.coverage.line_coverage_ratio;
+                        if (raw == null) return "Available";
+                        const pct = raw > 1 ? Math.round(raw) : Math.round(raw * 100);
+                        return `Available — ${pct}% line coverage`;
+                      })()
+                    : "Missing"}
                 </span>
               </div>
               {/* Current PR coverage */}

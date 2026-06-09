@@ -125,31 +125,52 @@ export function determineReleaseReadinessVerdict(
   coverageRatio: number | null,
   hasFailures: boolean
 ): "READY_WITH_RISK" | "NOT_READY" | "NEEDS_MORE_EVIDENCE" | "VERIFIED" | "PARTIALLY_VERIFIED" {
+  // Normalize coverageRatio: backend may store as 0-1 fraction or 0-100 percentage.
+  // Values > 1 are treated as percentage and divided by 100.
+  const normalizedCoverage = coverageRatio != null
+    ? (coverageRatio > 1 ? coverageRatio / 100 : coverageRatio)
+    : null;
+
   // Check for critical failures
   if (hasFailures) {
     return "NOT_READY";
   }
-  
-  // Check evidence quality
-  if (evidenceQuality === "LOW" || !coverageRatio || coverageRatio < 0.3) {
+
+  // Contradiction guard: HIGH confidence evidence is by definition sufficient.
+  // Never return NEEDS_MORE_EVIDENCE when confidence is HIGH.
+  const isHighConfidence = evidenceQuality === "HIGH";
+
+  // Non-HIGH confidence with insufficient evidence
+  if (!isHighConfidence && (evidenceQuality === "LOW" || normalizedCoverage == null || normalizedCoverage < 0.3)) {
     return "NEEDS_MORE_EVIDENCE";
   }
-  
+
   // Check for missing critical scenarios
   const criticalMissing = missingScenarios.filter(s => s.priority === "must_run" || s.priority === "BLOCKER");
-  if (criticalMissing.length > 0) {
+  if (criticalMissing.length > 0 && !isHighConfidence) {
     return "NOT_READY";
   }
-  
-  // Check overall coverage and completeness
+
+  // HIGH confidence path: verdict is based on code coverage and missing scenario count only
+  if (isHighConfidence) {
+    const coverageValue = normalizedCoverage ?? 0;
+    if (coverageValue >= 0.8 && missingScenarios.length === 0) {
+      return "VERIFIED";
+    } else if (coverageValue >= 0.6) {
+      return missingScenarios.length === 0 ? "VERIFIED" : "PARTIALLY_VERIFIED";
+    } else {
+      return "READY_WITH_RISK";
+    }
+  }
+
+  // Medium confidence path: use test coverage percentage against total
   const totalScenarios = recommendedTests.length + missingScenarios.length;
-  const coveragePercentage = totalScenarios > 0 ? (recommendedTests.length / totalScenarios) * 100 : 0;
-  
-  if (coveragePercentage >= 90 && evidenceQuality === "HIGH" && (coverageRatio || 0) >= 0.8) {
-    return "VERIFIED";
-  } else if (coveragePercentage >= 70 && evidenceQuality !== "LOW" && (coverageRatio || 0) >= 0.6) {
+  const testCoveragePercent = totalScenarios > 0 ? (recommendedTests.length / totalScenarios) * 100 : 0;
+  const coverageValue = normalizedCoverage ?? 0;
+
+  if (testCoveragePercent >= 70 && coverageValue >= 0.6) {
     return "PARTIALLY_VERIFIED";
-  } else if (coveragePercentage >= 50 && evidenceQuality !== "LOW") {
+  } else if (testCoveragePercent >= 50) {
     return "READY_WITH_RISK";
   } else {
     return "NEEDS_MORE_EVIDENCE";
@@ -183,7 +204,10 @@ export function generateVerdictReason(
     const criticalMissing = missingScenarios.filter(s => s.priority === "must_run" || s.priority === "BLOCKER");
     reasons.push(`${criticalMissing.length} critical test scenarios are missing coverage.`);
   } else if (verdict === "NEEDS_MORE_EVIDENCE") {
-    reasons.push(`Insufficient evidence: ${coverageRatio ? Math.round(coverageRatio * 100) : 0}% code coverage.`);
+    const normalizedForDisplay = coverageRatio != null
+      ? (coverageRatio > 1 ? coverageRatio : Math.round(coverageRatio * 100))
+      : 0;
+    reasons.push(`Additional evidence needed. Current code coverage: ${normalizedForDisplay}%.`);
   }
   
   return reasons;

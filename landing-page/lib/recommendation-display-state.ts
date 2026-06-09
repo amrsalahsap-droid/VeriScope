@@ -118,8 +118,15 @@ export function resolveRecommendationDisplayState(input: DisplayStateInput): Dis
   // Banner visibility rules
   const showStaleBanner = inputStale && snapshotAvailable;
   
-  // Needs More Evidence: only show when confidence is LOW AND score < 75
-  const showNeedsMoreEvidence = snapshotAvailable && confidenceAtGeneration === "LOW" && (scoreAtGeneration || 0) < 75;
+  // Needs More Evidence: only show when confidence is LOW AND score < 75.
+  // Contradiction guard: HIGH confidence must never show Needs More Evidence.
+  const rawNeedsMoreEvidence = snapshotAvailable && confidenceAtGeneration === "LOW" && (scoreAtGeneration || 0) < 75;
+  if (confidenceAtGeneration === "HIGH" && rawNeedsMoreEvidence) {
+    if (typeof window !== "undefined") {
+      console.error("[Veriscope] Contradiction: HIGH confidence with showNeedsMoreEvidence=true. Forcing to false.");
+    }
+  }
+  const showNeedsMoreEvidence = confidenceAtGeneration === "HIGH" ? false : rawNeedsMoreEvidence;
   
   // Historical test message: show when current PR execution is missing but historical tests exist
   const hasHistoricalTests = missingEvidence.includes("current_pr_execution") === false && completenessScore > 0;
