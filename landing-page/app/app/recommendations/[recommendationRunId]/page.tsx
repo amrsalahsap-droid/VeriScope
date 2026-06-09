@@ -969,28 +969,129 @@ function TierGroup({
   );
 }
 
+// Acceptance Criteria Mapper - maps tests/scenarios to ACs using layered matching
+function mapToAcceptanceCriteria(
+  testOrScenario: any,
+  acceptanceCriteria: any[],
+  isScenario: boolean = false
+): { ac: any; method: string } | null {
+  if (!acceptanceCriteria || acceptanceCriteria.length === 0) {
+    return null;
+  }
+
+  const testName = testOrScenario.display_name || testOrScenario.stable_identity || testOrScenario.scenario_title || testOrScenario.behavior_name || "";
+  const testReqId = testOrScenario.requirement_id || "";
+  const testIntent = testOrScenario.scenario_intent || testOrScenario.behavior_name || "";
+  const testSuite = testOrScenario.test_suite_name || testOrScenario.suite_name || "";
+
+  // Helper: normalize string for comparison
+  const normalize = (s: string) => s.toLowerCase().replace(/^(a|an|the)\s+/i, "").replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
+
+  // Helper: extract keywords
+  const extractKeywords = (s: string) => {
+    const tokens = normalize(s).split(" ").filter(t => t.length >= 3);
+    return new Set(tokens);
+  };
+
+  // Helper: check keyword overlap
+  const hasKeywordOverlap = (a: string, b: string, minOverlap = 2) => {
+    const ka = extractKeywords(a);
+    const kb = extractKeywords(b);
+    let overlap = 0;
+    for (const k of ka) if (kb.has(k)) overlap++;
+    return overlap >= minOverlap;
+  };
+
+  const normalizedTestName = normalize(testName);
+  const normalizedTestIntent = normalize(testIntent);
+
+  // Layer 1: explicit AC ID match
+  if (testReqId) {
+    for (const ac of acceptanceCriteria) {
+      if (ac.id === testReqId || ac.normalized_key === testReqId) {
+        return { ac, method: "ac_id" };
+      }
+    }
+  }
+
+  // Layer 2: exact normalized AC title match
+  for (const ac of acceptanceCriteria) {
+    const normalizedACText = normalize(ac.text);
+    if (normalizedTestName === normalizedACText) {
+      return { ac, method: "normalized_title" };
+    }
+  }
+
+  // Layer 3: test name intent match (test name contains AC text or vice versa)
+  for (const ac of acceptanceCriteria) {
+    const normalizedACText = normalize(ac.text);
+    if (normalizedTestName.includes(normalizedACText) || normalizedACText.includes(normalizedTestName)) {
+      return { ac, method: "test_name_intent" };
+    }
+  }
+
+  // Layer 4: scenario intent match (for scenarios)
+  if (isScenario) {
+    for (const ac of acceptanceCriteria) {
+      const normalizedACText = normalize(ac.text);
+      if (normalizedTestIntent === normalizedACText || normalizedTestIntent.includes(normalizedACText) || normalizedACText.includes(normalizedTestIntent)) {
+        return { ac, method: "scenario_intent" };
+      }
+    }
+  }
+
+  // Layer 5: affected behavior/journey match
+  const affectedBehavior = testOrScenario.affected_behavior || testOrScenario.behavior_name || "";
+  const affectedJourney = testOrScenario.affected_journey || testOrScenario.journey_name || "";
+  for (const ac of acceptanceCriteria) {
+    const normalizedACText = normalize(ac.text);
+    const normalizedBehavior = normalize(affectedBehavior);
+    const normalizedJourney = normalize(affectedJourney);
+    if (normalizedACText.includes(normalizedBehavior) || normalizedACText.includes(normalizedJourney)) {
+      return { ac, method: "affected_behavior_journey" };
+    }
+  }
+
+  // Layer 6: keyword match fallback
+  for (const ac of acceptanceCriteria) {
+    const normalizedACText = normalize(ac.text);
+    if (hasKeywordOverlap(testName, ac.text, 2) || hasKeywordOverlap(testIntent, ac.text, 2)) {
+      return { ac, method: "keyword_fallback" };
+    }
+  }
+
+  return null;
+}
+
 // Acceptance Criteria Traceability Mapper
 function mapACTraceability(run: any, recommendedTests: any[]) {
   const traceabilityMap: any[] = [];
-  
-  // Map from requirement_id to tests
-  const testMap = new Map<string, any[]>();
+  const acceptanceCriteria = run.acceptance_criteria || [];
+
+  // Map tests to ACs using the same layered matching as test cards
+  const acToTestsMap = new Map<string, any[]>();
   recommendedTests.forEach(test => {
-    if (test.requirement_id) {
-      if (!testMap.has(test.requirement_id)) {
-        testMap.set(test.requirement_id, []);
+    const mapping = mapToAcceptanceCriteria(test, acceptanceCriteria, false);
+    if (mapping) {
+      const acId = mapping.ac.id;
+      if (!acToTestsMap.has(acId)) {
+        acToTestsMap.set(acId, []);
       }
-      testMap.get(test.requirement_id)!.push(test);
+      acToTestsMap.get(acId)!.push({
+        test,
+        method: mapping.method
+      });
     }
   });
-  
+
   // Process acceptance criteria
-  if (run.acceptance_criteria && run.acceptance_criteria.length > 0) {
-    run.acceptance_criteria.forEach((ac: any) => {
-      const linkedTests = testMap.get(ac.id) || [];
+  if (acceptanceCriteria.length > 0) {
+    acceptanceCriteria.forEach((ac: any) => {
+      const linkedTestsData = acToTestsMap.get(ac.id) || [];
+      const linkedTests = linkedTestsData.map((t: any) => t.test.display_name || t.test.stable_identity);
       const hasExistingTests = linkedTests.length > 0;
       const hasSuggestedTests = ac.suggested_scenarios && ac.suggested_scenarios.length > 0;
-      
+
       let coverageStatus = 'Not mapped';
       if (hasExistingTests) {
         coverageStatus = ac.coverage_status === 'PARTIALLY_COVERED' ? 'Partially covered' : 'Covered';
@@ -999,13 +1100,13 @@ function mapACTraceability(run: any, recommendedTests: any[]) {
       } else if (ac.mapped_behavior) {
         coverageStatus = 'Not mapped';
       }
-      
+
       traceabilityMap.push({
         id: ac.id,
         title: ac.text.length > 80 ? ac.text.substring(0, 80) + '...' : ac.text,
         fullText: ac.text,
         coverageStatus,
-        linkedExistingTests: linkedTests.map(t => t.display_name || t.stable_identity),
+        linkedExistingTests,
         linkedMissingTest: hasSuggestedTests ? ac.suggested_scenarios[0] : null,
         priority: ac.recommended_action === 'ADD_AUTOMATED_TEST' ? 'Must' : 'Recommended',
         notes: ac.reason || ac.mapped_behavior || ''
@@ -2168,9 +2269,12 @@ export default function RecommendationDetailPage({ params }: PageProps) {
             
             const typeLabel = isExisting ? 'Existing automated test' : 'Missing automated coverage';
             const typeColor = isExisting ? 'text-emerald-400' : 'text-amber-400';
-            
-            // Requirement fallback
-            const requirementText = item.requirement_id || test?.requirement_id || test?.business_intent_text || 'Requirement not mapped';
+
+            // Map to acceptance criteria using layered matching
+            const acMapping = mapToAcceptanceCriteria(test, run.acceptance_criteria || [], !isExisting);
+            const requirementText = acMapping
+              ? `AC-${acMapping.ac.id.slice(0, 8)} ${acMapping.ac.text.length > 60 ? acMapping.ac.text.substring(0, 60) + '...' : acMapping.ac.text}`
+              : 'Requirement not mapped';
             
             // Why selected - make more specific
             const whySelected = isExisting 
