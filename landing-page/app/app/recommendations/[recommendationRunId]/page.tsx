@@ -3229,35 +3229,45 @@ export default function RecommendationDetailPage({ params }: PageProps) {
           {/* Evidence Used Audit */}
           <div className="space-y-3">
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs">
-              {/* PR diff */}
+              {/* PR diff - Required */}
               <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
                 <span className="text-zinc-400">PR diff</span>
                 <span className={run.pull_request ? "text-emerald-400" : "text-rose-400"}>
                   {run.pull_request ? "Available" : "Missing"}
                 </span>
               </div>
-              {/* Acceptance criteria */}
+              {/* Acceptance criteria - Required */}
               <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
                 <span className="text-zinc-400">Acceptance criteria</span>
                 <span className={(run.acceptance_criteria && run.acceptance_criteria.length > 0) || run.business_intent?.has_business_intent ? "text-emerald-400" : "text-rose-400"}>
                   {(run.acceptance_criteria && run.acceptance_criteria.length > 0) || run.business_intent?.has_business_intent ? "Available" : "Missing"}
                 </span>
               </div>
-              {/* Historical test evidence */}
+              {/* Historical test evidence - Supporting */}
               <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
                 <span className="text-zinc-400">Historical test evidence</span>
-                <span className={run.evidence?.history?.has_flakiness_data ? "text-emerald-400" : "text-rose-400"}>
-                  {run.evidence?.history?.has_flakiness_data ? "Available" : "Missing"}
+                <span className={
+                  hasCurrentPRExecution
+                    ? "text-zinc-400"
+                    : run.evidence?.history?.has_flakiness_data
+                      ? "text-emerald-400"
+                      : "text-zinc-400"
+                }>
+                  {hasCurrentPRExecution
+                    ? "Not required — current PR execution used"
+                    : run.evidence?.history?.has_flakiness_data
+                      ? "Available"
+                      : "Not used"}
                 </span>
               </div>
-              {/* Current PR test execution */}
+              {/* Current PR test execution - Required */}
               <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
                 <span className="text-zinc-400">Current PR test execution</span>
                 <span className={hasCurrentPRExecution ? "text-emerald-400" : "text-rose-400"}>
                   {hasCurrentPRExecution ? "Attached" : "Not attached"}
                 </span>
               </div>
-              {/* Coverage report */}
+              {/* Coverage report - Required */}
               <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
                 <span className="text-zinc-400">Coverage report</span>
                 <span className={run.evidence?.coverage ? "text-emerald-400" : "text-rose-400"}>
@@ -3271,30 +3281,30 @@ export default function RecommendationDetailPage({ params }: PageProps) {
                     : "Missing"}
                 </span>
               </div>
-              {/* Current PR coverage */}
+              {/* Current PR coverage - Required */}
               <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
                 <span className="text-zinc-400">Current PR coverage</span>
                 <span className={run.evidence?.coverage ? "text-emerald-400" : "text-rose-400"}>
                   {run.evidence?.coverage ? "Attached" : "Not attached"}
                 </span>
               </div>
-              {/* Architecture intelligence */}
+              {/* Architecture intelligence - Supporting */}
               <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
                 <span className="text-zinc-400">Architecture intelligence</span>
                 <span className="text-zinc-400">Available</span>
               </div>
-              {/* Behavior catalog */}
+              {/* Behavior catalog - Supporting */}
               <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
                 <span className="text-zinc-400">Behavior catalog</span>
-                <span className={behaviorCoverageMatrix.length > 0 ? "text-emerald-400" : "text-rose-400"}>
-                  {behaviorCoverageMatrix.length > 0 ? "Available" : "Missing"}
+                <span className={behaviorCoverageMatrix.length > 0 ? "text-emerald-400" : "text-zinc-400"}>
+                  {behaviorCoverageMatrix.length > 0 ? "Available" : "Optional improvement — not available"}
                 </span>
               </div>
-              {/* Journey catalog */}
+              {/* Journey catalog - Supporting */}
               <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
                 <span className="text-zinc-400">Journey catalog</span>
-                <span className={behaviorCoverageMatrix.some((b: any) => b.journey_name) ? "text-emerald-400" : "text-rose-400"}>
-                  {behaviorCoverageMatrix.some((b: any) => b.journey_name) ? "Available" : "Missing"}
+                <span className={behaviorCoverageMatrix.some((b: any) => b.journey_name) ? "text-emerald-400" : "text-zinc-400"}>
+                  {behaviorCoverageMatrix.some((b: any) => b.journey_name) ? "Available" : "Optional improvement — not available"}
                 </span>
               </div>
             </div>
