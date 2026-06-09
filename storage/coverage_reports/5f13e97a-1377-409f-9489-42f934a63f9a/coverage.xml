@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<!DOCTYPE coverage SYSTEM "http://cobertura.sourceforge.net/xml/coverage-04.dtd">
+<coverage line-rate="0.75" branch-rate="0.50" version="2.0.3" timestamp="1405869400000">
+  <sources>
+    <source>/Users/amrsa/Downloads/veriscope</source>
+  </sources>
+  <packages>
+    <package name="app.services" line-rate="0.75" branch-rate="0.50">
+      <classes>
+        <class name="app.services.auth" filename="app/services/auth.py" line-rate="0.75" branch-rate="0.50">
+          <methods>
+            <method name="login" signature="()V" line-rate="1.0">
+              <lines>
+                <line number="1" hits="1"/>
+                <line number="2" hits="1"/>
+              </lines>
+            </method>
+            <method name="logout" signature="()V" line-rate="0.0">
+              <lines>
+                <line number="3" hits="0"/>
+              </lines>
+            </method>
+          </methods>
+          <lines>
+            <line number="1" hits="1" branch="false"/>
+            <line number="2" hits="1" branch="false"/>
+            <line number="3" hits="0" branch="false"/>
+            <line number="4" hits="0" branch="false"/>
+            <line number="5" hits="1" branch="true" condition-coverage="50% (1/2)"/>
+          </lines>
+        </class>
+      </classes>
+    </package>
+  </packages>
+</coverage>

@@ -1,0 +1,74 @@
+[
+  {
+    "scenario": "Scenario 1: Source + PR diff only",
+    "passed": false,
+    "details": "can_generate=False, expected_confidence=UNKNOWN, missing_signals=0",
+    "payload": {},
+    "timestamp": "2026-06-04T11:42:34.016466"
+  },
+  {
+    "scenario": "Scenario 2: Source + PR diff + JUnit + coverage",
+    "passed": false,
+    "details": "can_generate=False, expected_confidence=UNKNOWN, missing_signals=[]",
+    "payload": {},
+    "timestamp": "2026-06-04T11:42:34.023087"
+  },
+  {
+    "scenario": "Scenario 3: After pasting AC",
+    "passed": true,
+    "details": "AC available=True, missing_signals=[]",
+    "payload": {},
+    "timestamp": "2026-06-04T11:42:34.033975"
+  },
+  {
+    "scenario": "Scenario 4: After attaching current PR test run",
+    "passed": false,
+    "details": "Could not create recommendation",
+    "payload": null,
+    "timestamp": "2026-06-04T11:42:34.040440"
+  },
+  {
+    "scenario": "Scenario 5: Generate with missing optional inputs",
+    "passed": false,
+    "details": "Could not create recommendation",
+    "payload": null,
+    "timestamp": "2026-06-04T11:42:34.046599"
+  },
+  {
+    "scenario": "Scenario 6: Existing recommendation viewed after acknowledgement",
+    "passed": false,
+    "details": "Could not create recommendation",
+    "payload": null,
+    "timestamp": "2026-06-04T11:42:34.054978"
+  },
+  {
+    "scenario": "Scenario 7: PR head SHA changed",
+    "passed": false,
+    "details": "Could not create recommendation",
+    "payload": null,
+    "timestamp": "2026-06-04T11:42:34.061766"
+  },
+  {
+    "scenario": "Scenario 8: No duplicate AC records",
+    "passed": true,
+    "details": "paste_status=None",
+    "payload": {},
+    "timestamp": "2026-06-04T11:42:34.076423"
+  },
+  {
+    "scenario": "Scenario 9: No duplicate test run links",
+    "passed": false,
+    "details": "Could not create recommendation",
+    "payload": null,
+    "timestamp": "2026-06-04T11:42:34.083369"
+  },
+  {
+    "scenario": "Scenario 10: Frontend build/typecheck passes",
+    "passed": true,
+    "details": "Manual verification required: run 'npm run build' and 'npm run typecheck' in landing-page directory",
+    "payload": {
+      "manual": true
+    },
+    "timestamp": "2026-06-04T11:42:34.083408"
+  }
+]

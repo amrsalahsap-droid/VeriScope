@@ -1,0 +1,99 @@
+<?xml version="1.0"?>
+<!DOCTYPE coverage SYSTEM "http://cobertura.sourceforge.net/xml/coverage-04.dtd">
+<coverage line-rate="0.75" branch-rate="0.50" version="2.0.3" timestamp="1405869400000">
+  <sources>
+    <source>/Users/amrsa/Downloads/veriscope</source>
+  </sources>
+  <packages>
+    <package name="app.services" line-rate="0.75" branch-rate="0.50">
+      <classes>
+        <class name="app.services.auth" filename="app/services/auth.py" line-rate="0.75" branch-rate="0.50">
+          <methods>
+            <method name="login" signature="()V" line-rate="1.0">
+              <lines>
+                <line number="1" hits="1"/>
+                <line number="2" hits="1"/>
+              </lines>
+            </method>
+            <method name="logout" signature="()V" line-rate="0.0">
+              <lines>
+                <line number="3" hits="0"/>
+              </lines>
+            </method>
+          </methods>
+          <lines>
+            <line number="1" hits="1" branch="false"/>
+            <line number="2" hits="1" branch="false"/>
+            <line number="3" hits="0" branch="false"/>
+            <line number="4" hits="0" branch="false"/>
+            <line number="5" hits="1" branch="true" condition-coverage="50% (1/2)"/>
+          </lines>
+        </class>
+        <class name="app.utils.dummy" filename="app/utils/dummy.py" line-rate="1.0" branch-rate="1.0">
+          <lines>
+            <line number="1" hits="1" branch="false"/>
+<line number="2" hits="1" branch="false"/>
+<line number="3" hits="1" branch="false"/>
+<line number="4" hits="1" branch="false"/>
+<line number="5" hits="1" branch="false"/>
+<line number="6" hits="1" branch="false"/>
+<line number="7" hits="1" branch="false"/>
+<line number="8" hits="1" branch="false"/>
+<line number="9" hits="1" branch="false"/>
+<line number="10" hits="1" branch="false"/>
+<line number="11" hits="1" branch="false"/>
+<line number="12" hits="1" branch="false"/>
+<line number="13" hits="1" branch="false"/>
+<line number="14" hits="1" branch="false"/>
+<line number="15" hits="1" branch="false"/>
+<line number="16" hits="1" branch="false"/>
+<line number="17" hits="1" branch="false"/>
+<line number="18" hits="1" branch="false"/>
+<line number="19" hits="1" branch="false"/>
+<line number="20" hits="1" branch="false"/>
+<line number="21" hits="1" branch="false"/>
+<line number="22" hits="1" branch="false"/>
+<line number="23" hits="1" branch="false"/>
+<line number="24" hits="1" branch="false"/>
+<line number="25" hits="1" branch="false"/>
+<line number="26" hits="1" branch="false"/>
+<line number="27" hits="1" branch="false"/>
+<line number="28" hits="1" branch="false"/>
+<line number="29" hits="1" branch="false"/>
+<line number="30" hits="1" branch="false"/>
+<line number="31" hits="1" branch="false"/>
+<line number="32" hits="1" branch="false"/>
+<line number="33" hits="1" branch="false"/>
+<line number="34" hits="1" branch="false"/>
+<line number="35" hits="1" branch="false"/>
+<line number="36" hits="1" branch="false"/>
+<line number="37" hits="1" branch="false"/>
+<line number="38" hits="1" branch="false"/>
+<line number="39" hits="1" branch="false"/>
+<line number="40" hits="1" branch="false"/>
+<line number="41" hits="1" branch="false"/>
+<line number="42" hits="1" branch="false"/>
+<line number="43" hits="1" branch="false"/>
+<line number="44" hits="1" branch="false"/>
+<line number="45" hits="1" branch="false"/>
+<line number="46" hits="1" branch="false"/>
+<line number="47" hits="1" branch="false"/>
+<line number="48" hits="1" branch="false"/>
+<line number="49" hits="1" branch="false"/>
+<line number="50" hits="1" branch="false"/>
+<line number="51" hits="1" branch="false"/>
+<line number="52" hits="1" branch="false"/>
+<line number="53" hits="1" branch="false"/>
+<line number="54" hits="1" branch="false"/>
+<line number="55" hits="1" branch="false"/>
+<line number="56" hits="1" branch="false"/>
+<line number="57" hits="1" branch="false"/>
+<line number="58" hits="1" branch="false"/>
+<line number="59" hits="1" branch="false"/>
+<line number="60" hits="1" branch="false"/>
+          </lines>
+        </class>
+      </classes>
+    </package>
+  </packages>
+</coverage>

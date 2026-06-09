@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuite name="suite_mismatch" tests="5" time="0.05">
+  <testcase name="test_m1" time="0.01">
+  </testcase>
+  <testcase name="test_m2" time="0.02">
+  </testcase>
+</testsuite>

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="Veriscope Sample Regression" tests="5" failures="1" errors="0" skipped="1" time="12.34">
+  <testsuite name="auth.middleware" tests="3" failures="1" errors="0" skipped="0" time="7.20">
+    <testcase classname="auth.middleware" name="should_allow_valid_token" time="1.20"/>
+    <testcase classname="auth.middleware" name="should_reject_expired_token" time="2.10">
+      <failure message="Expected 401 but received 200">AssertionError: expired token was accepted</failure>
+    </testcase>
+    <testcase classname="auth.middleware" name="should_attach_user_context" time="3.90"/>
+  </testsuite>
+
+  <testsuite name="billing.subscription" tests="2" failures="0" errors="0" skipped="1" time="5.14">
+    <testcase classname="billing.subscription" name="should_calculate_monthly_invoice" time="4.80"/>
+    <testcase classname="billing.subscription" name="should_apply_trial_discount" time="0.34">
+      <skipped message="Feature flag disabled"/>
+    </testcase>
+  </testsuite>
+</testsuites>

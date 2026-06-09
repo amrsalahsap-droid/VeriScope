@@ -1,0 +1,7 @@
+TN:tests.services.test_auth::test_login
+SF:app/services/auth.py
+DA:1,1
+DA:2,2
+DA:3,0
+DA:4,0
+end_of_record

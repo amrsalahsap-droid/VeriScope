@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuite name="core_suite" tests="2" time="0.05">
+  <testcase name="test_auth_success" time="0.023">
+  </testcase>
+  <testcase name="test_auth_failure" time="0.015">
+    <failure message="Incorrect password">Traceback:
+  File auth.py, line 12</failure>
+  </testcase>
+</testsuite>

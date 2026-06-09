@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<!DOCTYPE coverage [
+  <!ENTITY xxe SYSTEM "http://localhost:9999/does-not-exist">
+]>
+<coverage line-rate="0.9">
+  <sources>
+    <source>&xxe;</source>
+  </sources>
+  <packages>
+    <package name="app">
+      <classes>
+        <class name="app.auth" filename="app/services/auth.py">
+          <lines>
+            <line number="1" hits="1"/>
+          </lines>
+        </class>
+      </classes>
+    </package>
+  </packages>
+</coverage>

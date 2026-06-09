@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="Mocha Tests" time="15.5" tests="4" failures="1" skipped="1">
+  <testsuite name="Authentication Services" tests="4" failures="1" skipped="1" errors="0" time="15.5">
+    <testcase name="should sign in user with valid credentials" classname="Auth" time="3.2" />
+    <testcase name="should block user with invalid password" classname="Auth" time="2.1" />
+    <testcase name="should enforce password complexity" classname="Auth" time="4.0">
+      <failure message="Enforcement failed: accepted weak password '123456'">
+        Error: expected complexity pattern to reject '123456'
+      </failure>
+    </testcase>
+    <testcase name="should skip MFA if session is trusted" classname="Auth" time="0.0">
+      <skipped />
+    </testcase>
+  </testsuite>
+</testsuites>
