@@ -247,6 +247,18 @@ export function validateRecommendationDetailView({
     });
   }
 
+  // 13b. High coverage (>=90%) marked as insufficient
+  if (r.visiblePercentages && r.visiblePercentages.length > 0) {
+    const hasHighCoverage = r.visiblePercentages.some((p) => p != null && p >= 90);
+    if (hasHighCoverage && !r.evidenceSufficient) {
+      errors.push({
+        code: "EVIDENCE_INSUFFICIENT_HIGH_COVERAGE",
+        severity: "error",
+        message: "Coverage >=90% is shown but evidence is marked as insufficient. High coverage should be considered sufficient.",
+      });
+    }
+  }
+
   // 14. Unnamed Test visible
   if (r.unnamedTestCount && r.unnamedTestCount > 0) {
     errors.push({

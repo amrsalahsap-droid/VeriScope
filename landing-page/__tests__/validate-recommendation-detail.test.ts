@@ -423,4 +423,127 @@ describe("validateRecommendationDetailView", () => {
       expect(result.errors.some((e) => e.code === "OPTIONAL_GAP_AS_BLOCKER")).toBe(false);
     });
   });
+
+  describe("Password-validation scenario — HIGH confidence with current PR execution", () => {
+    it("passes for password-validation scenario: 18 passed tests, 93% coverage, HIGH confidence, Ready health", () => {
+      const result = run(
+        makeSnap({ expected_confidence: "HIGH" }),
+        makeRendered({
+          hasPRTestResults: true,
+          showAttachTestRun: false,
+          showNeedsMoreEvidence: false,
+          displayedConfidenceLabel: "HIGH",
+          evidenceSufficient: true,
+          showNeedsReview: false,
+          criticalGapCount: 0,
+          unnamedTestCount: 0,
+          requirementNotAvailableCount: 0,
+          executiveGapCount: 5,
+          sectionGapCount: 5,
+          testCardMissingWhySelectedCount: 0,
+          missingTestWithoutActionCount: 0,
+          optionalGapAsBlockerCount: 0,
+          visibleLabels: ["Missing Coverage", "High Risk"],
+          visiblePercentages: [93, 79],
+        })
+      );
+      expect(result.hasErrors).toBe(false);
+      expect(result.hasWarnings).toBe(false);
+    });
+
+    it("errors if HIGH confidence shows Needs More Evidence", () => {
+      const result = run(
+        makeSnap({ expected_confidence: "HIGH" }),
+        makeRendered({
+          hasPRTestResults: true,
+          showNeedsMoreEvidence: true,
+          displayedConfidenceLabel: "HIGH",
+        })
+      );
+      expect(result.errors.some((e) => e.code === "HIGH_CONFIDENCE_NEEDS_EVIDENCE")).toBe(true);
+    });
+
+    it("errors if 93% coverage is shown as insufficient", () => {
+      const result = run(
+        makeSnap(),
+        makeRendered({
+          evidenceSufficient: false,
+          visiblePercentages: [93, 79],
+        })
+      );
+      expect(result.errors.some((e) => e.code === "EVIDENCE_INSUFFICIENT_HIGH_COVERAGE")).toBe(true);
+    });
+
+    it("errors if passed current PR tests appear as missing tests", () => {
+      const result = run(
+        makeSnap(),
+        makeRendered({
+          hasPRTestResults: true,
+          missingTestWithoutActionCount: 5, // Should be 0 if 18 tests passed
+        })
+      );
+      expect(result.errors.some((e) => e.code === "MISSING_TEST_WITHOUT_ACTION")).toBe(true);
+    });
+
+    it("errors if executive gap count differs from section gap count", () => {
+      const result = run(
+        makeSnap(),
+        makeRendered({
+          executiveGapCount: 8,
+          sectionGapCount: 5,
+        })
+      );
+      expect(result.errors.some((e) => e.code === "GAP_COUNT_MISMATCH")).toBe(true);
+    });
+
+    it("errors if Requirement: N/A is visible", () => {
+      const result = run(
+        makeSnap(),
+        makeRendered({
+          requirementNotAvailableCount: 2,
+        })
+      );
+      expect(result.errors.some((e) => e.code === "REQUIREMENT_NOT_AVAILABLE_VISIBLE")).toBe(true);
+    });
+
+    it("errors if Unnamed Test is visible", () => {
+      const result = run(
+        makeSnap(),
+        makeRendered({
+          unnamedTestCount: 1,
+        })
+      );
+      expect(result.errors.some((e) => e.code === "UNNAMED_TEST_VISIBLE")).toBe(true);
+    });
+
+    it("errors if raw snake_case labels appear in primary UI", () => {
+      const result = run(
+        makeSnap(),
+        makeRendered({
+          visibleLabels: ["missing_automated_coverage", "linked_work_item"],
+        })
+      );
+      expect(result.warnings.some((w) => w.code === "RAW_SNAKE_CASE_LABEL")).toBe(true);
+    });
+
+    it("errors if optional missing intelligence appears as red blocker", () => {
+      const result = run(
+        makeSnap(),
+        makeRendered({
+          optionalGapAsBlockerCount: 1,
+        })
+      );
+      expect(result.errors.some((e) => e.code === "OPTIONAL_GAP_AS_BLOCKER")).toBe(true);
+    });
+
+    it("errors if Create Regression Scope appears more than once", () => {
+      const result = run(
+        makeSnap(),
+        makeRendered({
+          createRegressionScopeButtonCount: 2,
+        })
+      );
+      expect(result.warnings.some((w) => w.code === "DUPLICATE_CREATE_REGRESSION_SCOPE")).toBe(true);
+    });
+  });
 });
