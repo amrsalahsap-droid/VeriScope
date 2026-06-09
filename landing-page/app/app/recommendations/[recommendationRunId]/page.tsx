@@ -1087,6 +1087,13 @@ function mapACTraceability(run: any, recommendedTests: any[]) {
   // Process acceptance criteria
   if (acceptanceCriteria.length > 0) {
     acceptanceCriteria.forEach((ac: any) => {
+      if (!ac.id) return;
+      const normalizedAcId = String(ac.id).trim().toLowerCase();
+      // Skip if already processed to prevent duplicate key issue
+      if (traceabilityMap.find(t => String(t.id).trim().toLowerCase() === normalizedAcId)) {
+        return;
+      }
+
       const linkedTestsData = acToTestsMap.get(ac.id) || [];
       const linkedTests = linkedTestsData.map((t: any) => t.test.display_name || t.test.stable_identity);
       const hasExistingTests = linkedTests.length > 0;
@@ -1117,10 +1124,15 @@ function mapACTraceability(run: any, recommendedTests: any[]) {
   // Also check business intent rows for AC coverage
   if (run.business_intent?.rows) {
     run.business_intent.rows.forEach((row: any) => {
-      if (row.acceptance_criterion_id && !traceabilityMap.find(t => t.id === row.acceptance_criterion_id)) {
+      if (row.acceptance_criterion_id) {
+        const normalizedRowAcId = String(row.acceptance_criterion_id).trim().toLowerCase();
+        // Skip if already in the traceability map to prevent duplicate keys
+        if (traceabilityMap.find(t => String(t.id).trim().toLowerCase() === normalizedRowAcId)) {
+          return;
+        }
+
         const linkedTestsData = acToTestsMap.get(row.acceptance_criterion_id) || [];
         const linkedTests = linkedTestsData.map((t: any) => t.test.display_name || t.test.stable_identity);
-        const hasExistingTests = linkedTests.length > 0;
         
         traceabilityMap.push({
           id: row.acceptance_criterion_id,
@@ -1129,7 +1141,7 @@ function mapACTraceability(run: any, recommendedTests: any[]) {
           coverageStatus: row.status === 'COVERED' || row.status === 'VERIFIED' ? 'Covered' : 
                         row.status === 'PARTIALLY_COVERED' ? 'Partially covered' : 
                         row.status === 'MISSING' ? 'Missing' : 'Not mapped',
-          linkedExistingTests: linkedTests.map(t => t.display_name || t.stable_identity),
+          linkedExistingTests: linkedTests,
           linkedMissingTest: row.suggested_scenario_title || null,
           priority: row.recommended_action === 'ADD_AUTOMATED_TEST' ? 'Must' : 'Recommended',
           notes: row.reason || row.affected_behavior_name || ''
