@@ -2111,20 +2111,20 @@ export default function RecommendationDetailPage({ params }: PageProps) {
               </div>
               <div>
                 <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Reason</p>
-                <p className="text-sm font-semibold text-zinc-200 truncate">
+                <p className="text-sm font-semibold text-zinc-200 leading-relaxed">
                   {(() => {
                     if (!run.readiness_snapshot?.readiness_snapshot_available) {
                       return "Legacy recommendation - regenerate for current state";
                     }
                     const mode = testing_strategy.recommendation_mode;
                     const confidence = displayState.confidenceLabel;
-                    const hasSecurity = changedFiles.some(f => 
-                      f.toLowerCase().includes("auth") || f.toLowerCase().includes("password") || 
+                    const hasSecurity = changedFiles.some(f =>
+                      f.toLowerCase().includes("auth") || f.toLowerCase().includes("password") ||
                       f.toLowerCase().includes("security") || f.toLowerCase().includes("token")
                     );
-                    
+
                     if (mode === "FULL_SUITE" && confidence === "HIGH" && hasSecurity) {
-                      return "Password validation affects authentication-sensitive flows";
+                      return "Password validation changes affect authentication-sensitive sign-up, password reset, update-password, and API validation flows.";
                     }
                     if (mode === "FULL_SUITE" && confidence === "LOW" && hasSecurity) {
                       return "Security-sensitive change with limited evidence";
@@ -2140,6 +2140,9 @@ export default function RecommendationDetailPage({ params }: PageProps) {
                     }
                     if (mode === "SMOKE") {
                       return "Quick validation of critical paths";
+                    }
+                    if (hasCurrentPRExecution && prTestClassification.passed.length > 0) {
+                      return "Current PR validation passed all selected tests. Remaining work focuses on missing automated coverage and optional improvements.";
                     }
                     return why.length > 0 ? why[0] : "Changes impact system components";
                   })()}
