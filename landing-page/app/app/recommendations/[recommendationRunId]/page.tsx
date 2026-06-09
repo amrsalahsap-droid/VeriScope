@@ -1878,8 +1878,8 @@ export default function RecommendationDetailPage({ params }: PageProps) {
     const executiveGapCount = sectionGapCount;
     
     const testCardMissingWhySelectedCount = 0; // Already validated in TestCard component
-    const missingTestWithoutActionCount = scenarioMatrix.filter((s: any) => 
-      s.status === "suggested" && generateMissingTestTitle(s) === 'Create validation test'
+    const missingTestWithoutActionCount = scenarioMatrix.filter((s: any) =>
+      s.status === "suggested" && generateMissingTestTitle(s) === 'Validate missing coverage'
     ).length;
     const optionalGapAsBlockerCount = 0; // Already fixed in gap display logic
 
@@ -2281,9 +2281,9 @@ export default function RecommendationDetailPage({ params }: PageProps) {
               : 'Requirement not mapped';
             
             // Why selected - make more specific
-            const whySelected = isExisting 
+            const whySelected = isExisting
               ? generateTestWhySelected(test, changedFiles)
-              : `Selected because it validates ${item.scenario_intent || test?.behavior_name || 'uncovered behavior'}${requirementText !== 'Requirement not mapped' ? ` and maps to ${requirementText}` : ''}.`;
+              : `No current automated test confirms ${item.scenario_intent || test?.behavior_name || 'this behavior'}${requirementText !== 'Requirement not mapped' ? ` and maps to ${requirementText}` : ''}.`;
             
             // Risk if skipped
             const riskIfSkipped = isExisting
@@ -2666,9 +2666,9 @@ export default function RecommendationDetailPage({ params }: PageProps) {
           const typeLabel = isExisting ? 'Existing test' : 'Missing automated coverage';
           const typeColor = isExisting ? 'text-emerald-400' : 'text-amber-400';
           
-          const whySelected = isExisting 
+          const whySelected = isExisting
             ? generateTestWhySelected(test, changedFiles)
-            : `Suggested because it covers ${item.scenario_intent || 'uncovered behavior'} for the changed files and maps to ${item.requirement_id || 'acceptance criteria'}.`;
+            : `No current automated test confirms ${item.scenario_intent || 'this behavior'} for the changed files${item.requirement_id ? ` and maps to ${item.requirement_id}` : ''}.`;
 
           const linkedFile = test?.linked_file || (isExisting && test?.file_path);
           

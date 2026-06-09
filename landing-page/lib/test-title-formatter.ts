@@ -100,7 +100,7 @@ function isProfessionalTitle(title: string): boolean {
 }
 
 /**
- * Generates a meaningful title for a missing test/scenario
+ * Generates a meaningful title for a missing test/scenario using active QA test-case style
  * Falls back through: requirement title → behavior name → risk area → scenario intent
  */
 export function generateMissingTestTitle(scenario: any): string {
@@ -116,7 +116,7 @@ export function generateMissingTestTitle(scenario: any): string {
 
   // Build title from available information
   let base = '';
-  
+
   if (requirementTitle && typeof requirementTitle === 'string') {
     // Extract key words from requirement title
     base = requirementTitle
@@ -124,22 +124,22 @@ export function generateMissingTestTitle(scenario: any): string {
       .replace(/\b(test|check|validate|verify)\b/gi, '') // Remove test-related words
       .trim();
   }
-  
+
   if (!base && behaviorName && typeof behaviorName === 'string') {
     base = behaviorName.trim();
   }
-  
+
   if (!base && riskArea && typeof riskArea === 'string') {
     base = riskArea.trim();
   }
-  
+
   if (!base && scenarioIntent && typeof scenarioIntent === 'string') {
     base = scenarioIntent.trim();
   }
 
   // If still no base, use a generic fallback
   if (!base) {
-    return 'Create validation test';
+    return 'Validate missing coverage';
   }
 
   // Clean up the base - make it suitable for a test title
@@ -154,15 +154,36 @@ export function generateMissingTestTitle(scenario: any): string {
     .replace(/\s+/g, ' ')
     .trim();
 
-  // Capitalize first letter
+  // Determine the appropriate verb based on the behavior
+  let verb = 'Validate';
+  const lowerBase = base.toLowerCase();
+
+  // Specific verb mappings for common patterns
+  if (lowerBase.includes('reject') || lowerBase.includes('block') || lowerBase.includes('deny')) {
+    verb = 'Reject';
+  } else if (lowerBase.includes('accept') || lowerBase.includes('allow') || lowerBase.includes('permit')) {
+    verb = 'Accept';
+  } else if (lowerBase.includes('verify') || lowerBase.includes('check') || lowerBase.includes('confirm')) {
+    verb = 'Verify';
+  } else if (lowerBase.includes('run') || lowerBase.includes('execute') || lowerBase.includes('perform')) {
+    verb = 'Run';
+  } else if (lowerBase.includes('block') || lowerBase.includes('prevent') || lowerBase.includes('stop')) {
+    verb = 'Block';
+  } else if (lowerBase.includes('expired') || lowerBase.includes('invalid') || lowerBase.includes('weak')) {
+    verb = 'Reject';
+  } else if (lowerBase.includes('valid') || lowerBase.includes('strong') || lowerBase.includes('correct')) {
+    verb = 'Accept';
+  }
+
+  // Capitalize first letter of base
   base = base.charAt(0).toUpperCase() + base.slice(1).toLowerCase();
 
   // Limit length
-  if (base.length > 50) {
-    base = base.substring(0, 47) + '...';
+  if (base.length > 60) {
+    base = base.substring(0, 57) + '...';
   }
 
-  return `Create ${base} validation test`;
+  return `${verb} ${base}`;
 }
 
 /**
