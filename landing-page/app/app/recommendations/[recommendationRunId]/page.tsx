@@ -1587,6 +1587,136 @@ export default function RecommendationDetailPage({ params }: PageProps) {
     return { passed, failed, skipped, notRun };
   })();
 
+  // Layered matching: match generated missing scenarios against current PR JUnit results.
+  // This prevents scenarios that match passed tests from appearing in Create Missing Tests.
+  const scenarioToTestMatch = (() => {
+    if (!hasCurrentPRExecution) {
+      return new Map<string, { test: any; method: string }>();
+    }
+
+    const matches = new Map<string, { test: any; method: string }>();
+    const passedTests = prTestClassification.passed;
+    const failedTests = prTestClassification.failed;
+    const skippedTests = prTestClassification.skipped;
+
+    // Helper: normalize string for comparison (lowercase, remove articles, punctuation)
+    const normalize = (s: string) => s.toLowerCase().replace(/^(a|an|the)\s+/i, "").replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
+
+    // Helper: extract keywords from string
+    const extractKeywords = (s: string) => {
+      const tokens = normalize(s).split(" ").filter(t => t.length >= 3);
+      return new Set(tokens);
+    };
+
+    // Helper: check keyword overlap
+    const hasKeywordOverlap = (a: string, b: string, minOverlap = 2) => {
+      const ka = extractKeywords(a);
+      const kb = extractKeywords(b);
+      let overlap = 0;
+      for (const k of ka) if (kb.has(k)) overlap++;
+      return overlap >= minOverlap;
+    };
+
+    scenarioMatrix.forEach((scenario: any) => {
+      if (scenario.status !== "suggested") return;
+
+      const scenarioTitle = scenario.scenario_title || scenario.behavior_name || "";
+      const scenarioIntent = scenario.behavior_name || scenario.scenario_intent || "";
+      const scenarioReqId = scenario.requirement_id || "";
+      const normalizedTitle = normalize(scenarioTitle);
+      const normalizedIntent = normalize(scenarioIntent);
+
+      // Try to match against passed tests first
+      for (const test of passedTests) {
+        const testName = test.display_name || test.stable_identity || "";
+        const testSuite = test.test_suite_name || test.suite_name || "";
+        const testReqId = test.requirement_id || "";
+        const normalizedTestName = normalize(testName);
+        const normalizedSuite = normalize(testSuite);
+
+        // Layer 1: exact test_id match
+        if (test.stable_identity === scenario.scenario_id || test.stable_identity === scenario.id) {
+          matches.set(scenario.scenario_id || scenario.id, { test, method: "exact_test_id" });
+          if (typeof window !== "undefined") {
+            console.log(`[Veriscope] Match: scenario "${scenarioTitle}" -> test "${testName}" (exact_test_id)`);
+          }
+          return;
+        }
+
+        // Layer 2: normalized name match
+        if (normalizedTitle === normalizedTestName) {
+          matches.set(scenario.scenario_id || scenario.id, { test, method: "normalized_name" });
+          if (typeof window !== "undefined") {
+            console.log(`[Veriscope] Match: scenario "${scenarioTitle}" -> test "${testName}" (normalized_name)`);
+          }
+          return;
+        }
+
+        // Layer 3: classname + test name match
+        const combinedTest = `${normalizedSuite} ${normalizedTestName}`;
+        if (normalizedTitle.includes(normalizedTestName) && normalizedTitle.includes(normalizedSuite)) {
+          matches.set(scenario.scenario_id || scenario.id, { test, method: "classname_testname" });
+          if (typeof window !== "undefined") {
+            console.log(`[Veriscope] Match: scenario "${scenarioTitle}" -> test "${testName}" (classname_testname)`);
+          }
+          return;
+        }
+
+        // Layer 4: AC ID match
+        if (scenarioReqId && testReqId && scenarioReqId === testReqId) {
+          matches.set(scenario.scenario_id || scenario.id, { test, method: "ac_id" });
+          if (typeof window !== "undefined") {
+            console.log(`[Veriscope] Match: scenario "${scenarioTitle}" -> test "${testName}" (ac_id)`);
+          }
+          return;
+        }
+
+        // Layer 5: requirement title match
+        if (test.requirement_title && normalizedTitle.includes(normalize(test.requirement_title))) {
+          matches.set(scenario.scenario_id || scenario.id, { test, method: "requirement_title" });
+          if (typeof window !== "undefined") {
+            console.log(`[Veriscope] Match: scenario "${scenarioTitle}" -> test "${testName}" (requirement_title)`);
+          }
+          return;
+        }
+
+        // Layer 6: scenario intent match
+        if (normalizedIntent === normalizedTestName || normalizedIntent.includes(normalizedTestName)) {
+          matches.set(scenario.scenario_id || scenario.id, { test, method: "scenario_intent" });
+          if (typeof window !== "undefined") {
+            console.log(`[Veriscope] Match: scenario "${scenarioTitle}" -> test "${testName}" (scenario_intent)`);
+          }
+          return;
+        }
+
+        // Layer 7: keyword/semantic intent fallback
+        if (hasKeywordOverlap(scenarioTitle, testName, 2) || hasKeywordOverlap(scenarioIntent, testName, 2)) {
+          matches.set(scenario.scenario_id || scenario.id, { test, method: "keyword_semantic" });
+          if (typeof window !== "undefined") {
+            console.log(`[Veriscope] Match: scenario "${scenarioTitle}" -> test "${testName}" (keyword_semantic)`);
+          }
+          return;
+        }
+      }
+
+      // Also check against failed/skipped tests for classification (but still show as actionable)
+      for (const test of [...failedTests, ...skippedTests]) {
+        const testName = test.display_name || test.stable_identity || "";
+        const normalizedTestName = normalize(testName);
+
+        if (normalizedTitle === normalizedTestName || hasKeywordOverlap(scenarioTitle, testName, 2)) {
+          matches.set(scenario.scenario_id || scenario.id, { test, method: "failed_or_skipped_match" });
+          if (typeof window !== "undefined") {
+            console.log(`[Veriscope] Match: scenario "${scenarioTitle}" -> test "${testName}" (failed_or_skipped_match)`);
+          }
+          return;
+        }
+      }
+    });
+
+    return matches;
+  })();
+
   // Build finalViewModel once at component scope so Executive Decision counts
   // and rendered section counts are always derived from the same collection.
   const finalViewModel = (() => {
@@ -1602,7 +1732,20 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         originalTest: test
       })),
       ...scenarioMatrix
-        .filter((s: any) => s.status === 'suggested')
+        .filter((s: any) => {
+          // Only include suggested scenarios that are NOT matched to passed tests
+          if (s.status !== 'suggested') return false;
+          const scenarioId = s.scenario_id ?? s.id;
+          const match = scenarioToTestMatch.get(scenarioId);
+          // Exclude if matched to a passed test
+          if (match && prTestClassification.passed.includes(match.test)) {
+            if (typeof window !== "undefined") {
+              console.log(`[Veriscope] Excluding scenario "${s.scenario_title || s.behavior_name}" from Create Missing Tests - matched to passed test via ${match.method}`);
+            }
+            return false;
+          }
+          return true;
+        })
         .map((scenario: any, idx: number) => ({
           id: `scenario-${scenario.scenario_id ?? scenario.id ?? scenario.requiredScenario?.slice(0, 20)?.replace(/\s+/g, '-').toLowerCase() ?? idx}`,
           title: generateMissingTestTitle(scenario),
