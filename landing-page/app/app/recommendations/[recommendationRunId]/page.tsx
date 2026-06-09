@@ -2740,29 +2740,68 @@ export default function RecommendationDetailPage({ params }: PageProps) {
 
       {/* Acceptance Criteria Traceability */}
       {((run.acceptance_criteria && run.acceptance_criteria.length > 0) || (run.business_intent?.has_business_intent)) && (
-        <CollapsibleSection title="Acceptance Criteria Traceability" icon={FileText} defaultOpen={false}>
+        <CollapsibleSection title="Acceptance Criteria Traceability" icon={FileText} defaultOpen={true}>
           {(() => {
             const acTraceability = mapACTraceability(run, recommended_tests);
-            
+
             if (acTraceability.length === 0) {
               return <p className="text-sm text-zinc-500 text-center py-6">No acceptance criteria found.</p>;
             }
-            
-            const displayAC = showAllAC ? acTraceability : acTraceability.slice(0, 5);
-            
+
+            // Calculate counts
+            const coveredCount = acTraceability.filter((ac: any) => ac.coverageStatus === 'Covered').length;
+            const missingCount = acTraceability.filter((ac: any) => ac.coverageStatus === 'Missing').length;
+            const notMappedCount = acTraceability.filter((ac: any) => ac.coverageStatus === 'Not mapped').length;
+            const partialCount = acTraceability.filter((ac: any) => ac.coverageStatus === 'Partially covered').length;
+
+            // Sort by status: Missing first, Not mapped second, Partial third, Covered last
+            const statusOrder = { 'Missing': 0, 'Not mapped': 1, 'Partially covered': 2, 'Covered': 3 };
+            const sortedAC = [...acTraceability].sort((a: any, b: any) => {
+              const orderA = statusOrder[a.coverageStatus] ?? 4;
+              const orderB = statusOrder[b.coverageStatus] ?? 4;
+              return orderA - orderB;
+            });
+
+            // Show top rows: all missing/not mapped/partial, top 3 covered
+            const topRows = sortedAC.filter((ac: any) => ac.coverageStatus !== 'Covered')
+              .concat(sortedAC.filter((ac: any) => ac.coverageStatus === 'Covered').slice(0, 3));
+            const displayAC = showAllAC ? sortedAC : topRows;
+
+            // Check if all critical AC are covered
+            const criticalAC = acTraceability.filter((ac: any) => ac.priority === 'Must');
+            const allCriticalCovered = criticalAC.length > 0 && criticalAC.every((ac: any) => ac.coverageStatus === 'Covered');
+
             return (
               <div className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-zinc-500">{acTraceability.length} acceptance criteria found</span>
-                  {acTraceability.length > 5 && !showAllAC && (
-                    <button
-                      onClick={() => setShowAllAC(true)}
-                      className="text-xs text-blue-400 hover:text-blue-300"
-                    >
-                      Show all
-                    </button>
-                  )}
+                {/* Compact Summary */}
+                <div className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg p-4">
+                  {allCriticalCovered ? (
+                    <div className="flex items-center gap-2 mb-3">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                      <p className="text-sm font-semibold text-emerald-400">Critical acceptance criteria covered.</p>
+                    </div>
+                  ) : null}
+                  <div className="grid grid-cols-4 gap-3 text-center">
+                    <div>
+                      <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Covered</p>
+                      <p className="text-lg font-bold text-emerald-400">{coveredCount}</p>
+                    </div>
+                    <div>
+                      <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Missing</p>
+                      <p className="text-lg font-bold text-rose-400">{missingCount}</p>
+                    </div>
+                    <div>
+                      <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Not mapped</p>
+                      <p className="text-lg font-bold text-zinc-400">{notMappedCount}</p>
+                    </div>
+                    <div>
+                      <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Partial</p>
+                      <p className="text-lg font-bold text-amber-400">{partialCount}</p>
+                    </div>
+                  </div>
                 </div>
+
+                {/* AC Rows */}
                 <div className="space-y-2">
                   {displayAC.map((ac: any) => {
                     const statusColor = ac.coverageStatus === 'Covered' ? 'text-emerald-400 bg-emerald-950/20 border-emerald-800/40' :
@@ -2771,17 +2810,16 @@ export default function RecommendationDetailPage({ params }: PageProps) {
                                        'text-zinc-400 bg-zinc-950/20 border-zinc-800/40';
                     const priorityColor = ac.priority === 'Must' ? 'text-rose-400' : 'text-amber-400';
                     const isExpanded = expandedAC === ac.id;
-                    
+
                     return (
                       <div key={ac.id} className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg overflow-hidden">
-                        <div 
+                        <div
                           className="p-3 cursor-pointer hover:bg-zinc-900/40 transition-colors"
                           onClick={() => setExpandedAC(expandedAC === ac.id ? null : ac.id)}
                         >
                           <div className="flex items-start justify-between gap-3">
                             <div className="flex-1 min-w-0">
                               <div className="flex items-center gap-2 mb-1 flex-wrap">
-                                <span className="text-[10px] font-mono text-zinc-500">{ac.id}</span>
                                 <span className={`text-[9px] px-1.5 py-0.5 rounded border ${statusColor}`}>
                                   {ac.coverageStatus}
                                 </span>
@@ -2789,7 +2827,17 @@ export default function RecommendationDetailPage({ params }: PageProps) {
                                   {ac.priority}
                                 </span>
                               </div>
-                              <p className="text-xs text-zinc-200 line-clamp-2">{ac.title}</p>
+                              <p className="text-xs text-zinc-200 line-clamp-1">{ac.title}</p>
+                              {ac.linkedExistingTests.length > 0 && !isExpanded && (
+                                <p className="text-[10px] text-emerald-400 mt-1">
+                                  {ac.linkedExistingTests.length} test{ac.linkedExistingTests.length > 1 ? 's' : ''} linked
+                                </p>
+                              )}
+                              {ac.linkedMissingTest && !isExpanded && (
+                                <p className="text-[10px] text-amber-400 mt-1">
+                                  Suggested test available
+                                </p>
+                              )}
                             </div>
                             {isExpanded ? <ChevronDown className="w-4 h-4 text-zinc-500 shrink-0" /> : <ChevronRight className="w-4 h-4 text-zinc-500 shrink-0" />}
                           </div>
@@ -2834,12 +2882,12 @@ export default function RecommendationDetailPage({ params }: PageProps) {
                     );
                   })}
                 </div>
-                {acTraceability.length > 5 && (
+                {sortedAC.length > topRows.length && (
                   <button
                     onClick={() => setShowAllAC(!showAllAC)}
                     className="w-full text-center text-xs text-zinc-400 hover:text-zinc-300 py-2 border-t border-zinc-800/40"
                   >
-                    {showAllAC ? 'Show top 5' : `Show all ${acTraceability.length}`}
+                    {showAllAC ? `Show top ${topRows.length}` : `Show all ${sortedAC.length}`}
                   </button>
                 )}
               </div>
