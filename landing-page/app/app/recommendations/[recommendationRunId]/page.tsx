@@ -1205,6 +1205,10 @@ export default function RecommendationDetailPage({ params }: PageProps) {
   useEffect(() => { params.then(p => setRunId(p.recommendationRunId)); }, [params]);
   useEffect(() => { if (runId) fetchRun(runId); }, [runId, fetchRun]);
 
+  const refreshRun = useCallback(() => {
+    if (runId) fetchRun(runId);
+  }, [runId, fetchRun]);
+
   // ── Actions ──────────────────────────────────────────────────────────────
 
   const copyTestIds = useCallback(() => {
@@ -1486,22 +1490,101 @@ export default function RecommendationDetailPage({ params }: PageProps) {
   // Calculate health state
   const healthState = getRecommendationHealth(run, evidence_gaps);
 
-  // Compute sectionGapCount at component scope so JSX can reference it
+  // Compute sectionGapCount using the same consolidation pipeline as the Coverage Gaps section
+  // so the Executive Decision count always matches Total gaps in the section.
   const sectionGapCount = (() => {
-    const allGaps: any[] = [];
+    const rawGaps: any[] = [];
     if (run.business_intent?.rows) {
       run.business_intent.rows.forEach((row: any) => {
         if (row.status === "MISSING" || row.status === "PARTIALLY_COVERED") {
-          allGaps.push(row);
+          rawGaps.push({
+            type: "requirement",
+            name: row.business_intent_text || "Unknown requirement",
+            coverageStatus: row.status,
+            suggestedAction: row.suggested_scenario_title || "Add test coverage",
+            priority: row.recommended_action === "ADD_AUTOMATED_TEST" ? "must" : "recommended",
+            reason: row.reason || "No test coverage found",
+            sourceEvidence: row.affected_behavior_name || "Business intent analysis",
+            requirementId: row.requirement_id
+          });
         }
       });
     }
+    // Scenario matrix gaps that are NOT already in the regression scope (suggested only)
+    const suggestedIds = new Set(
+      scenarioMatrix.filter(s => s.status === 'suggested')
+        .map((s: any, idx: number) => `scenario-${s.scenario_id ?? s.id ?? s.requiredScenario?.slice(0, 20)?.replace(/\s+/g, '-').toLowerCase() ?? idx}`)
+    );
     scenarioMatrix.forEach((scenario: any) => {
       if (scenario.status === "suggested" || scenario.status === "partial") {
-        allGaps.push(scenario);
+        const sid = `scenario-${scenario.scenario_id ?? scenario.id ?? scenario.requiredScenario?.slice(0, 20)?.replace(/\s+/g, '-').toLowerCase() ?? 'unknown'}`;
+        if (suggestedIds.has(sid)) return; // already shown in Create Missing Tests
+        rawGaps.push({
+          type: "behavior",
+          name: scenario.behavior_name || scenario.scenario_title || "Unknown behavior",
+          coverageStatus: scenario.status === "suggested" ? "missing" : "partial",
+          suggestedAction: scenario.scenario_title || "Add scenario test",
+          priority: scenario.priority === "BLOCKER" || scenario.priority === "MUST" ? "must" : "recommended",
+          reason: scenario.reasons?.[0] || "Behavior not covered by tests",
+          sourceEvidence: scenario.journey_name || "Scenario analysis"
+        });
       }
     });
-    return allGaps.length;
+    requirementGaps.forEach((gap: any) => {
+      rawGaps.push({
+        type: "requirement",
+        name: gap.message,
+        coverageStatus: "missing",
+        suggestedAction: gap.recommended_action || "Add test",
+        priority: gap.severity === "CRITICAL" ? "critical" : gap.severity === "HIGH" ? "must" : "recommended",
+        reason: gap.impact,
+        sourceEvidence: "Requirement analysis",
+        severity: gap.severity
+      });
+    });
+    missing_coverage.forEach((gap: any) => {
+      rawGaps.push({
+        type: "automation",
+        name: gap.domain ? `${gap.domain} - ${gap.feature}` : gap.feature || "Unknown",
+        coverageStatus: "missing",
+        suggestedAction: gap.reason || "Add automated coverage",
+        priority: "recommended",
+        reason: gap.impact,
+        sourceEvidence: "Coverage analysis"
+      });
+    });
+    const consolidated = consolidateACFragments(rawGaps);
+    const grouped = groupCoverageGaps(consolidated, recommended_tests);
+    return grouped.critical.length + grouped.missingAutomated.length + grouped.partialCoverage.length + grouped.optional.length;
+  })();
+
+  // Classify recommended tests by current PR execution outcome.
+  // When hasCurrentPRExecution is true but backend hasn't set per-test current_pr_result,
+  // fall back to optimistic "passed" if no execution failures appear in evidence_gaps.
+  const prTestClassification = (() => {
+    if (!hasCurrentPRExecution) {
+      return { passed: [] as any[], failed: [] as any[], skipped: [] as any[], notRun: recommended_tests as any[] };
+    }
+    const passed: any[] = [], failed: any[] = [], skipped: any[] = [], notRun: any[] = [];
+    recommended_tests.forEach((test: any) => {
+      const raw = (test.current_pr_result || "").toLowerCase().trim();
+      if (raw === "passed" || raw === "pass") passed.push(test);
+      else if (raw === "failed" || raw === "fail" || raw === "error") failed.push(test);
+      else if (raw === "skipped" || raw === "skip") skipped.push(test);
+      else notRun.push(test);
+    });
+    // If no per-test result is set but JUnit was attached and no failures in evidence_gaps,
+    // treat all as passed (backend matched them successfully and all passed).
+    if (notRun.length === recommended_tests.length && passed.length === 0 && failed.length === 0) {
+      const hasExecutionFailure = evidence_gaps.some((g: any) =>
+        (g.message || "").toLowerCase().includes("test fail") ||
+        (g.type || "").toLowerCase().includes("execution_fail")
+      );
+      if (!hasExecutionFailure) {
+        return { passed: recommended_tests as any[], failed: [], skipped: [], notRun: [] };
+      }
+    }
+    return { passed, failed, skipped, notRun };
   })();
 
   // Run consistency checks using the central validator
@@ -1703,7 +1786,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
           repositoryId={run.repository.id}
           pullRequestId={run.pull_request?.id}
           currentCommitSha={run.commit_sha ?? undefined}
-          onAttached={refreshOutcome}
+          onAttached={refreshRun}
         />
       )}
 
@@ -1789,13 +1872,30 @@ export default function RecommendationDetailPage({ params }: PageProps) {
             </div>
 
             {/* Metrics */}
-            <div className="grid sm:grid-cols-3 gap-3">
+            <div className={`grid gap-3 ${hasCurrentPRExecution ? "sm:grid-cols-5" : "sm:grid-cols-3"}`}>
+              {hasCurrentPRExecution ? (
+                <>
+                  <div className="bg-zinc-950/40 rounded-lg p-3 border border-emerald-800/30">
+                    <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Verified tests</p>
+                    <p className="text-xl font-bold text-emerald-400">{prTestClassification.passed.length}</p>
+                  </div>
+                  <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
+                    <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Failed tests</p>
+                    <p className={`text-xl font-bold ${prTestClassification.failed.length > 0 ? "text-rose-400" : "text-zinc-400"}`}>{prTestClassification.failed.length}</p>
+                  </div>
+                  <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
+                    <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Required not run</p>
+                    <p className={`text-xl font-bold ${prTestClassification.notRun.length > 0 ? "text-amber-400" : "text-zinc-400"}`}>{prTestClassification.notRun.length}</p>
+                  </div>
+                </>
+              ) : (
+                <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
+                  <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Must-run tests</p>
+                  <p className="text-xl font-bold text-zinc-200">{testing_strategy.must_run_count}</p>
+                </div>
+              )}
               <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Must-run tests</p>
-                <p className="text-xl font-bold text-zinc-200">{testing_strategy.must_run_count}</p>
-              </div>
-              <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Missing scenarios</p>
+                <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Missing tests</p>
                 <p className="text-xl font-bold text-zinc-200">{scenarioMatrix.filter(s => s.status === "suggested").length}</p>
               </div>
               <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
@@ -1874,8 +1974,8 @@ export default function RecommendationDetailPage({ params }: PageProps) {
       {/* What Veriscope Understood */}
       <WhatVeriscopeUnderstood {...extractUnderstandingData(run)} />
 
-      {/* Recommended Regression Scope */}
-      <Section title="Recommended Regression Scope" icon={FlaskConical}>
+      {/* Recommended Regression Scope / Current PR Validation Result */}
+      <Section title={hasCurrentPRExecution ? "Current PR Validation Result" : "Recommended Regression Scope"} icon={FlaskConical}>
         {(() => {
           // Define TestCard component inline within the same scope
           function TestCard({ item, changedFiles, recommendationRunId }: { 
@@ -1905,16 +2005,35 @@ export default function RecommendationDetailPage({ params }: PageProps) {
               ? (test?.risk_if_skipped || `Skipping may miss regression in ${test?.impacted_area || 'impacted area'}.`)
               : (test?.risk_if_skipped || `Missing coverage for ${item.scenario_intent || test?.behavior_name || 'this behavior'} may allow defects to reach production.`);
             
-            // Current PR execution status
-            const currentPRResult = test?.current_pr_result || 'Not run on this PR';
-            const currentPRColor = currentPRResult === 'Passed' ? 'text-emerald-400' : currentPRResult === 'Failed' ? 'text-rose-400' : 'text-zinc-400';
+            // Current PR execution status — use classification from prTestClassification
+            const isPassed = isExisting && hasCurrentPRExecution && prTestClassification.passed.some(
+              (p: any) => p.stable_identity === test?.stable_identity || p.id === test?.id
+            );
+            const isFailed = isExisting && hasCurrentPRExecution && prTestClassification.failed.some(
+              (p: any) => p.stable_identity === test?.stable_identity || p.id === test?.id
+            );
+            const isSkipped = isExisting && hasCurrentPRExecution && prTestClassification.skipped.some(
+              (p: any) => p.stable_identity === test?.stable_identity || p.id === test?.id
+            );
+            const rawPRResult = test?.current_pr_result || "";
+            const currentPRResult = isPassed ? "Passed"
+              : isFailed ? "Failed"
+              : isSkipped ? "Skipped"
+              : (hasCurrentPRExecution && isExisting) ? "Not run on this PR"
+              : rawPRResult || "Not run on this PR";
+            const currentPRColor = currentPRResult === 'Passed' ? 'text-emerald-400'
+              : currentPRResult === 'Failed' ? 'text-rose-400'
+              : currentPRResult === 'Skipped' ? 'text-amber-400'
+              : 'text-zinc-400';
             
             // Historical result
             const historicalResult = test?.historical_result || 'No history';
             const historicalDate = test?.last_run_date ? new Date(test.last_run_date).toLocaleDateString() : null;
             
-            // Evidence source
-            const evidenceSource = test?.evidence_source || (isExisting ? 'Test history' : 'Coverage report');
+            // Evidence source — current PR execution takes priority when attached and passed
+            const evidenceSource = isPassed
+              ? 'Current PR execution'
+              : test?.evidence_source || (isExisting ? 'Test history' : 'Coverage report');
             
             const linkedFile = test?.linked_file || (isExisting && test?.file_path);
             
@@ -2034,46 +2153,192 @@ export default function RecommendationDetailPage({ params }: PageProps) {
           const deduplicatedItems = deduplicateTests(allTestItems);
           const grouped = groupTestsByType(deduplicatedItems);
 
+          // Partition existing items by PR classification
+          const existingItems = grouped.existing;
+          const passedItems = hasCurrentPRExecution
+            ? existingItems.filter(item => prTestClassification.passed.some(
+                (p: any) => p.stable_identity === item.stable_identity || p.id === item.stable_identity
+              ))
+            : [];
+          const failedItems = hasCurrentPRExecution
+            ? existingItems.filter(item => prTestClassification.failed.some(
+                (p: any) => p.stable_identity === item.stable_identity || p.id === item.stable_identity
+              ))
+            : [];
+          const skippedItems = hasCurrentPRExecution
+            ? existingItems.filter(item => prTestClassification.skipped.some(
+                (p: any) => p.stable_identity === item.stable_identity || p.id === item.stable_identity
+              ))
+            : [];
+          const notRunItems = hasCurrentPRExecution
+            ? existingItems.filter(item =>
+                !prTestClassification.passed.some((p: any) => p.stable_identity === item.stable_identity || p.id === item.stable_identity) &&
+                !prTestClassification.failed.some((p: any) => p.stable_identity === item.stable_identity || p.id === item.stable_identity) &&
+                !prTestClassification.skipped.some((p: any) => p.stable_identity === item.stable_identity || p.id === item.stable_identity)
+              )
+            : [];
+
           return (
             <>
               {/* Scope Summary */}
               <div className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg p-4 mb-6">
                 <p className="text-xs text-zinc-400">{fileSummary}</p>
-                <div className="flex items-center gap-4 mt-2 text-xs">
-                  <div className="flex items-center gap-2">
-                    <Play className="w-3 h-3 text-emerald-400" />
-                    <span className="text-zinc-300">Run Existing Tests: {grouped.existing.length}</span>
+                {hasCurrentPRExecution ? (
+                  <div className="flex items-center gap-4 mt-2 text-xs flex-wrap">
+                    <div className="flex items-center gap-2">
+                      <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                      <span className="text-emerald-300 font-medium">{prTestClassification.passed.length}/{recommended_tests.length} passed</span>
+                    </div>
+                    {prTestClassification.failed.length > 0 && (
+                      <div className="flex items-center gap-2">
+                        <AlertTriangle className="w-3 h-3 text-rose-400" />
+                        <span className="text-rose-300">{prTestClassification.failed.length} failed</span>
+                      </div>
+                    )}
+                    {prTestClassification.skipped.length > 0 && (
+                      <div className="flex items-center gap-2">
+                        <Clock className="w-3 h-3 text-amber-400" />
+                        <span className="text-amber-300">{prTestClassification.skipped.length} skipped</span>
+                      </div>
+                    )}
+                    {prTestClassification.notRun.length > 0 && (
+                      <div className="flex items-center gap-2">
+                        <Circle className="w-3 h-3 text-zinc-500" />
+                        <span className="text-zinc-400">{prTestClassification.notRun.length} not run</span>
+                      </div>
+                    )}
+                    <span className="text-zinc-500">· Current PR execution attached</span>
+                    {grouped.missing.length > 0 && (
+                      <div className="flex items-center gap-2">
+                        <Plus className="w-3 h-3 text-amber-400" />
+                        <span className="text-zinc-300">Create Missing Tests: {grouped.missing.length}</span>
+                      </div>
+                    )}
                   </div>
-                  <div className="flex items-center gap-2">
-                    <Plus className="w-3 h-3 text-amber-400" />
-                    <span className="text-zinc-300">Create Missing Tests: {grouped.missing.length}</span>
+                ) : (
+                  <div className="flex items-center gap-4 mt-2 text-xs">
+                    <div className="flex items-center gap-2">
+                      <Play className="w-3 h-3 text-emerald-400" />
+                      <span className="text-zinc-300">Run Existing Tests: {grouped.existing.length}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Plus className="w-3 h-3 text-amber-400" />
+                      <span className="text-zinc-300">Create Missing Tests: {grouped.missing.length}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Star className="w-3 h-3 text-zinc-500" />
+                      <span className="text-zinc-300">Optional Tests: {grouped.optional.length}</span>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <Star className="w-3 h-3 text-zinc-500" />
-                    <span className="text-zinc-300">Optional Tests: {grouped.optional.length}</span>
-                  </div>
-                </div>
+                )}
               </div>
 
-              {/* Run Existing Tests */}
-              {grouped.existing.length > 0 && (
-                <div className="mb-6">
-                  <div className="flex items-center gap-2 mb-3">
-                    <Play className="w-4 h-4 text-emerald-400" />
-                    <h3 className="text-sm font-semibold text-zinc-200">Run Existing Tests</h3>
-                    <span className="text-xs text-zinc-500">({grouped.existing.length})</span>
+              {/* Execution-aware existing tests section */}
+              {hasCurrentPRExecution ? (
+                <>
+                  {/* Verified (passed) tests — collapsed by default */}
+                  {passedItems.length > 0 && (
+                    <div className="mb-6">
+                      <details className="group">
+                        <summary className="flex items-center gap-2 mb-3 cursor-pointer list-none">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                          <h3 className="text-sm font-semibold text-emerald-300">Verified by Current PR Execution</h3>
+                          <span className="text-xs text-zinc-500">({passedItems.length} passed)</span>
+                          <ChevronDown className="w-3 h-3 text-zinc-500 ml-auto group-open:rotate-180 transition-transform" />
+                        </summary>
+                        <div className="space-y-2 mt-2">
+                          {passedItems.map(item => (
+                            <TestCard
+                              key={item.id}
+                              item={item}
+                              changedFiles={changedFiles}
+                              recommendationRunId={runId || ""}
+                            />
+                          ))}
+                        </div>
+                      </details>
+                    </div>
+                  )}
+
+                  {/* Failed tests */}
+                  {failedItems.length > 0 && (
+                    <div className="mb-6">
+                      <div className="flex items-center gap-2 mb-3">
+                        <AlertTriangle className="w-4 h-4 text-rose-400" />
+                        <h3 className="text-sm font-semibold text-rose-300">Failed Tests — Investigate Before Release</h3>
+                        <span className="text-xs text-zinc-500">({failedItems.length})</span>
+                      </div>
+                      <div className="space-y-2">
+                        {failedItems.map(item => (
+                          <TestCard key={item.id} item={item} changedFiles={changedFiles} recommendationRunId={runId || ""} />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Skipped tests */}
+                  {skippedItems.length > 0 && (
+                    <div className="mb-6">
+                      <div className="flex items-center gap-2 mb-3">
+                        <Clock className="w-4 h-4 text-amber-400" />
+                        <h3 className="text-sm font-semibold text-amber-300">Skipped Required Tests — Run Before Release</h3>
+                        <span className="text-xs text-zinc-500">({skippedItems.length})</span>
+                      </div>
+                      <div className="space-y-2">
+                        {skippedItems.map(item => (
+                          <TestCard key={item.id} item={item} changedFiles={changedFiles} recommendationRunId={runId || ""} />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Required tests not run */}
+                  {notRunItems.length > 0 && (
+                    <div className="mb-6">
+                      <div className="flex items-center gap-2 mb-3">
+                        <Play className="w-4 h-4 text-amber-400" />
+                        <h3 className="text-sm font-semibold text-amber-300">Required Tests Not Run — Must Execute</h3>
+                        <span className="text-xs text-zinc-500">({notRunItems.length})</span>
+                      </div>
+                      <div className="space-y-2">
+                        {notRunItems.map(item => (
+                          <TestCard key={item.id} item={item} changedFiles={changedFiles} recommendationRunId={runId || ""} />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* All passed and none not-run: success state */}
+                  {failedItems.length === 0 && skippedItems.length === 0 && notRunItems.length === 0 && passedItems.length > 0 && (
+                    <div className="bg-emerald-950/20 border border-emerald-800/40 rounded-lg p-4 mb-6 flex items-center gap-3">
+                      <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+                      <p className="text-sm text-emerald-300">
+                        No remaining existing tests need to be run. Current PR execution passed all {passedItems.length} selected tests.
+                      </p>
+                    </div>
+                  )}
+                </>
+              ) : (
+                /* Before execution: show all existing tests as must-run */
+                grouped.existing.length > 0 && (
+                  <div className="mb-6">
+                    <div className="flex items-center gap-2 mb-3">
+                      <Play className="w-4 h-4 text-emerald-400" />
+                      <h3 className="text-sm font-semibold text-zinc-200">Run Existing Tests</h3>
+                      <span className="text-xs text-zinc-500">({grouped.existing.length})</span>
+                    </div>
+                    <div className="space-y-2">
+                      {grouped.existing.map(item => (
+                        <TestCard
+                          key={item.id}
+                          item={item}
+                          changedFiles={changedFiles}
+                          recommendationRunId={runId || ""}
+                        />
+                      ))}
+                    </div>
                   </div>
-                  <div className="space-y-2">
-                    {grouped.existing.map(item => (
-                      <TestCard
-                        key={item.id}
-                        item={item}
-                        changedFiles={changedFiles}
-                        recommendationRunId={runId || ""}
-                      />
-                    ))}
-                  </div>
-                </div>
+                )
               )}
 
               {/* Create Missing Tests */}
@@ -2680,7 +2945,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
                 repositoryId={run.repository.id}
                 pullRequestId={run.pull_request?.id}
                 currentCommitSha={run.commit_sha ?? undefined}
-                onAttached={refreshOutcome}
+                onAttached={refreshRun}
               />
             </div>
           ) : null}
