@@ -1587,6 +1587,37 @@ export default function RecommendationDetailPage({ params }: PageProps) {
     return { passed, failed, skipped, notRun };
   })();
 
+  // Build finalViewModel once at component scope so Executive Decision counts
+  // and rendered section counts are always derived from the same collection.
+  const finalViewModel = (() => {
+    const allTestItems = [
+      ...recommended_tests.map((test: any) => ({
+        id: test.stable_identity,
+        stable_identity: test.stable_identity,
+        title: formatTestTitle(test.stable_identity, test.display_name),
+        type: 'existing' as const,
+        tier: test.tier,
+        requirement_id: test.requirement_id,
+        scenario_intent: test.scenario_intent,
+        originalTest: test
+      })),
+      ...scenarioMatrix
+        .filter((s: any) => s.status === 'suggested')
+        .map((scenario: any, idx: number) => ({
+          id: `scenario-${scenario.scenario_id ?? scenario.id ?? scenario.requiredScenario?.slice(0, 20)?.replace(/\s+/g, '-').toLowerCase() ?? idx}`,
+          title: generateMissingTestTitle(scenario),
+          type: 'missing' as const,
+          tier: (scenario.priority === 'BLOCKER' || scenario.priority === 'MUST' ? 'must_run' : 'should_run') as "must_run" | "should_run" | "fallback",
+          requirement_id: scenario.requirement_id,
+          scenario_intent: scenario.behavior_name,
+          originalScenario: scenario
+        }))
+    ];
+    const deduplicatedItems = deduplicateTests(allTestItems);
+    const grouped = groupTestsByType(deduplicatedItems);
+    return { allTestItems, deduplicatedItems, grouped };
+  })();
+
   // Run consistency checks using the central validator
   const consistencyCheck = (() => {
     // Collect new validation data
@@ -1598,8 +1629,8 @@ export default function RecommendationDetailPage({ params }: PageProps) {
     ).length;
     const requirementNotAvailableCount = 0; // Display shows 'Requirement not mapped' instead of N/A
     
-    // Calculate gap counts (sectionGapCount is now at component scope)
-    const executiveGapCount = evidence_gaps.length;
+    // Gap counts: both executive and section use the same consolidated count.
+    const executiveGapCount = sectionGapCount;
     
     const testCardMissingWhySelectedCount = 0; // Already validated in TestCard component
     const missingTestWithoutActionCount = scenarioMatrix.filter((s: any) => 
@@ -1896,7 +1927,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
               )}
               <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
                 <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Missing tests</p>
-                <p className="text-xl font-bold text-zinc-200">{scenarioMatrix.filter(s => s.status === "suggested").length}</p>
+                <p className="text-xl font-bold text-zinc-200">{finalViewModel.grouped.missing.length}</p>
               </div>
               <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
                 <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Coverage gaps</p>
@@ -2125,36 +2156,8 @@ export default function RecommendationDetailPage({ params }: PageProps) {
             ? `PR changes: ${fileCount} file` 
             : `PR changes: ${fileCount} files across authentication, data, and test infrastructure`;
 
-          // Prepare test items for deduplication
-          const allTestItems = [
-            // Existing automated tests
-            ...recommended_tests.map(test => ({
-              id: test.stable_identity,
-              stable_identity: test.stable_identity,
-              title: formatTestTitle(test.stable_identity, test.display_name),
-              type: 'existing' as const,
-              tier: test.tier,
-              requirement_id: test.requirement_id,
-              scenario_intent: test.scenario_intent,
-              originalTest: test
-            })),
-            // Missing scenarios from scenario matrix
-            ...scenarioMatrix
-              .filter(s => s.status === 'suggested')
-              .map((scenario, idx) => ({
-                id: `scenario-${scenario.scenario_id ?? scenario.id ?? scenario.requiredScenario?.slice(0, 20)?.replace(/\s+/g, '-').toLowerCase() ?? idx}`,
-                title: generateMissingTestTitle(scenario),
-                type: 'missing' as const,
-                tier: (scenario.priority === 'BLOCKER' || scenario.priority === 'MUST' ? 'must_run' : 'should_run') as "must_run" | "should_run" | "fallback",
-                requirement_id: scenario.requirement_id,
-                scenario_intent: scenario.behavior_name,
-                originalScenario: scenario
-              }))
-          ];
-
-          // Deduplicate tests
-          const deduplicatedItems = deduplicateTests(allTestItems);
-          const grouped = groupTestsByType(deduplicatedItems);
+          // Use the hoisted finalViewModel so section counts always match Executive Decision counts.
+          const { deduplicatedItems, grouped } = finalViewModel;
 
           // Partition existing items by PR classification
           const existingItems = grouped.existing;
