@@ -1849,7 +1849,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
           return true;
         })
         .map((scenario: any, idx: number) => ({
-          id: `scenario-${scenario.scenario_id ?? scenario.id ?? scenario.requiredScenario?.slice(0, 20)?.replace(/\s+/g, '-').toLowerCase() ?? idx}`,
+          id: `missing-${scenario.scenario_id ?? scenario.id ?? scenario.requiredScenario?.slice(0, 20)?.replace(/\s+/g, '-').toLowerCase() ?? idx}`,
           title: generateMissingTestTitle(scenario),
           type: 'missing' as const,
           tier: (scenario.priority === 'BLOCKER' || scenario.priority === 'MUST' ? 'must_run' : 'should_run') as "must_run" | "should_run" | "fallback",
