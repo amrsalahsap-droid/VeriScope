@@ -10,8 +10,8 @@ jobs:
     steps:
       - name: Trigger Veriscope analysis
         run: |
-          curl -sS -X POST "$VERISCOPE_API_URL/repositories/$VERISCOPE_REPOSITORY_ID/pipeline-runs" \
-            -H "Authorization: Bearer $VERISCOPE_TOKEN" \
+          curl -sS -X POST "http://localhost:8000/repositories/a88386cc-87e7-43c2-ab73-c825777efb24/pipeline-runs" \
+            -H "Authorization: Bearer XTuKPwiTm7qcYL68Uv4oZ95q6gKK4uV2FLmTX--5GSs" \
             -H "Content-Type: application/json" \
             -d '{
               "provider": "GITHUB_ACTIONS",
