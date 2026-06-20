@@ -7,7 +7,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.routers.organization import router as organization_router
 from app.routers.auth import router as auth_router
-from app.routers.repository import router as repository_router, api_router as api_repository_router
+from app.routers.repository import router as repository_router, api_router as api_repository_router, cicd_router as cicd_repository_router
 from app.routers.recommendation import (
     router as recommendation_router,
     legacy_router as recommendation_legacy_router,
@@ -27,6 +27,11 @@ from app.routers.behavior import router as behavior_router
 from app.routers.readiness import router as readiness_router
 from app.routers.readiness_detailed import router as readiness_detailed_router
 from app.routers.regression_suite import router as regression_suite_router
+from app.routers.ci_cd_policy import router as ci_cd_policy_router
+from app.routers.organization_ci_cd_policy import router as organization_ci_cd_policy_router
+from app.routers.organization_governance import router as organization_governance_router
+from app.routers.governance_notifications import router as governance_notifications_router
+from app.routers.governance_security_api import router as governance_security_router
 
 app = FastAPI(
     title="Veriscope AI Regression Scope Intelligence Platform",
@@ -48,6 +53,7 @@ app.include_router(auth_router)
 app.include_router(organization_router)
 app.include_router(repository_router)
 app.include_router(api_repository_router)
+app.include_router(cicd_repository_router)
 app.include_router(recommendation_router)
 app.include_router(recommendation_legacy_router)
 app.include_router(debug_router)
@@ -69,6 +75,20 @@ app.include_router(behavior_router)
 app.include_router(readiness_router)
 app.include_router(readiness_detailed_router)
 app.include_router(regression_suite_router)
+app.include_router(ci_cd_policy_router)
+
+# Workspace Governance - Primary Workspace Routes
+app.include_router(organization_governance_router, prefix="/workspaces/{workspace_id}/cicd/governance")
+app.include_router(organization_ci_cd_policy_router, prefix="/workspaces/{workspace_id}/cicd/policy/default")
+app.include_router(governance_notifications_router, prefix="/workspaces/{workspace_id}/cicd/governance/notifications")
+app.include_router(governance_security_router, prefix="/workspaces/{workspace_id}/cicd/governance")
+
+# Workspace Governance - Backward Compatibility Routes (treating organization_id as workspace_id)
+app.include_router(organization_governance_router, prefix="/organizations/{workspace_id}/cicd/governance")
+app.include_router(organization_ci_cd_policy_router, prefix="/organizations/{workspace_id}/cicd/policy/default")
+app.include_router(governance_notifications_router, prefix="/organizations/{workspace_id}/cicd/governance/notifications")
+app.include_router(governance_security_router, prefix="/organizations/{workspace_id}/cicd/governance")
+
 app.include_router(migration_router)
 
 

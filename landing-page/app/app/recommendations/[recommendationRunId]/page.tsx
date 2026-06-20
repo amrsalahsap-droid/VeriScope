@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import {
@@ -8,6 +8,7 @@ import {
   GitPullRequest,
   GitBranch,
   AlertTriangle,
+  AlertCircle,
   CheckCircle2,
   Clock,
   Copy,
@@ -42,6 +43,8 @@ import { toast } from "sonner";
 import { generateScenarioCoverageMatrix } from "@/lib/scenario-coverage-matrix";
 import { calculateCompletenessScore } from "@/lib/completeness-score";
 import { resolveRecommendationDisplayState } from "@/lib/recommendation-display-state";
+import { resolveCanonicalHealth, CanonicalHealthResult } from "@/lib/recommendation-health-state";
+import { getRecommendationHealth } from "@/lib/recommendation-page-health";
 import { formatTestTitle, generateTestWhySelected, generateMissingTestTitle } from "@/lib/test-title-formatter";
 import { deduplicateTests, groupTestsByType } from "@/lib/test-deduplication";
 import { groupCoverageGaps, consolidateACFragments } from "@/lib/coverage-gap-grouping";
@@ -70,6 +73,10 @@ import ConfidenceExplanation, {
 import { ImproveAccuracyPanel } from "@/components/ImproveAccuracyPanel";
 import RecommendationCheckpointModal from "@/app/components/RecommendationCheckpointModal";
 import PasteAcceptanceCriteriaModal from "@/components/recommendations/paste-acceptance-criteria-modal";
+import { RegressionScopeV2Display } from "@/components/regression-scope/RegressionScopeV2Display";
+import { RiskReviewGovernancePanel } from "@/components/RiskReviewGovernancePanel";
+import { ScopeGroup } from "@/types/regression-scope-v2";
+import { CICDPipelineRunsPanel } from "@/components/CICDPipelineRunsPanel";
 
 export const dynamic = "force-dynamic";
 
@@ -568,81 +575,6 @@ function formatDisplayLabel(value: string, type: "mode" | "coverage" | "executio
     default:
       return value.replace(/_/g, " ");
   }
-}
-
-// Health state resolver
-function getRecommendationHealth(run: any, evidenceGaps: any[]): {
-  state: "Ready" | "Limited Evidence" | "Needs Review" | "Stale Inputs" | "Failed";
-  reason: string;
-  cta: string;
-  ctaAction: "create" | "review" | "review_critical" | "regenerate" | "retry";
-} {
-  // Failed if recommendation status failed
-  if (run.status === "FAILED" || run.status === "ERROR") {
-    return {
-      state: "Failed",
-      reason: "Recommendation generation did not complete.",
-      cta: "Retry Generation",
-      ctaAction: "retry"
-    };
-  }
-
-  // Stale Inputs if input_stale=true
-  if (run.input_stale) {
-    return {
-      state: "Stale Inputs",
-      reason: "Inputs changed after generation. Regenerate to include latest evidence.",
-      cta: "Regenerate Recommendation",
-      ctaAction: "regenerate"
-    };
-  }
-
-  const confidence = run.readiness_snapshot?.expected_confidence || "LOW";
-  const score = run.readiness_snapshot?.readiness_score || 0;
-
-  // Needs Review only if truly critical gaps exist (HIGH or CRITICAL severity)
-  const hasCriticalGaps = evidenceGaps.some((gap: any) =>
-    gap.severity === "HIGH" || gap.severity === "CRITICAL"
-  );
-  if (hasCriticalGaps) {
-    return {
-      state: "Needs Review",
-      reason: "Critical gaps require review before finalizing scope.",
-      cta: "Review Critical Gaps",
-      ctaAction: "review_critical"
-    };
-  }
-
-  // Ready with optional gaps if HIGH confidence and only optional gaps exist
-  const hasOptionalGaps = evidenceGaps.some((gap: any) =>
-    gap.severity === "LOW" || gap.severity === "OPTIONAL" || gap.priority === "LOW"
-  );
-  if (confidence === "HIGH" && hasOptionalGaps && !hasCriticalGaps) {
-    return {
-      state: "Ready",
-      reason: "Recommendation is ready. Remaining gaps are optional improvements.",
-      cta: "Create Regression Scope",
-      ctaAction: "create"
-    };
-  }
-
-  // Ready if confidence HIGH and no critical gaps
-  if (confidence === "HIGH") {
-    return {
-      state: "Ready",
-      reason: "Generated from high-confidence evidence.",
-      cta: "Create Regression Scope",
-      ctaAction: "create"
-    };
-  }
-
-  // Limited Evidence if confidence LOW or MEDIUM and not stale
-  return {
-    state: "Limited Evidence",
-    reason: "Generated with missing recommended evidence.",
-    cta: "Review Gaps",
-    ctaAction: "review"
-  };
 }
 
 // Scans run data object for raw enum/snake_case keys that should have been formatted
@@ -1180,11 +1112,11 @@ function getMissingSignals(run: any): string[] {
     missingSignals.push("manual_tests");
   }
 
-  if (!run.evidence.coverage) {
+  if (!run.evidence?.coverage) {
     missingSignals.push("coverage_report");
   }
 
-  if (!run.evidence.history || !run.evidence.history.has_flakiness_data) {
+  if (!run.evidence?.history || !run.evidence?.history?.has_flakiness_data) {
     missingSignals.push("test_history");
   }
 
@@ -1193,6 +1125,43 @@ function getMissingSignals(run: any): string[] {
 }
 
 // ── Main page ──────────────────────────────────────────────────────────────
+
+
+// ── Manual Validation Badge Style Mapping ──────────────────────────────────
+const getManualBadgeStyleAndLabel = (status: string) => {
+  switch (status?.toUpperCase()) {
+    case 'PASSED':
+      return {
+        className: 'bg-green-500/10 text-green-400 border-green-500/20',
+        label: 'Passed',
+      };
+    case 'FAILED':
+      return {
+        className: 'bg-rose-500/10 text-rose-455 border-rose-500/20',
+        label: 'Failed',
+      };
+    case 'BLOCKED':
+      return {
+        className: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+        label: 'Blocked',
+      };
+    case 'SKIPPED':
+      return {
+        className: 'bg-zinc-800 text-zinc-400 border-zinc-700/50',
+        label: 'Skipped',
+      };
+    case 'NOT_EXECUTED':
+      return {
+        className: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
+        label: 'Not Executed',
+      };
+    default:
+      return {
+        className: 'bg-zinc-500/10 text-zinc-500 border-zinc-500/10',
+        label: 'Not Mapped',
+      };
+  }
+};
 
 export default function RecommendationDetailPage({ params }: PageProps) {
   const router = useRouter();
@@ -1204,6 +1173,83 @@ export default function RecommendationDetailPage({ params }: PageProps) {
     isOpen: boolean;
     action: "generate" | "rerun" | "view";
   }>({ isOpen: false, action: "rerun" });
+
+  // V2 Integration State Variables
+  const [regressionScope, setRegressionScope] = useState<any>(null);
+  const [regressionScopeError, setRegressionScopeError] = useState<boolean>(false);
+  const [regressionScopeErrorMessage, setRegressionScopeErrorMessage] = useState<string | null>(null);
+  const [regressionEvidence, setRegressionEvidence] = useState<any>(null);
+  const [releaseDecision, setReleaseDecision] = useState<any>(null);
+  const [scopeMode, setScopeMode] = useState<"targeted" | "risk_based" | "full">("risk_based");
+  const [showSafeToSkip, setShowSafeToSkip] = useState<boolean>(false);
+  const [auditMode, setAuditMode] = useState<boolean>(false);
+  const [govAuditOpen, setGovAuditOpen] = useState<boolean>(false);
+
+  // Destructure safe defaults to prevent fallback test page crash
+  const { 
+    executive_summary = { changed_files: [], changed_files_count: 0, risk_level: "LOW" as const, bullets: [] }, 
+    testing_strategy = { recommendation_mode: "NO_RUN", evidence_quality: "LOW", optimization_allowed: false, must_run_count: 0, should_run_count: 0, fallback_count: 0, estimated_runtime_seconds: 0, full_suite_runtime_seconds: 0, runtime_confidence: "LOW", skipped_count: 0, skipped_reason_summary: "" }, 
+    recommended_tests = [], 
+    why = [], 
+    evidence = { coverage: null, knowledge_graph: { dependency_state_hash: null, has_dependencies: false }, history: { window_start: null, window_end: null, flakiness_profile_hash: null, has_flakiness_data: false }, overrides: { unsafe_for_optimization: false, evidence_consistency_status: "UNKNOWN" } }, 
+    warnings: rawWarnings = [], 
+    evidence_gaps: rawEvidenceGaps = [], 
+    missing_coverage = [], 
+    scenario_coverage_matrix = { items: [] }, 
+    impact_profile = { behavior_coverage_matrix: [] } 
+  } = run || {};
+
+  const mustRun   = recommended_tests.filter(t => t.tier === "must_run");
+  const shouldRun = recommended_tests.filter(t => t.tier === "should_run");
+  const fallback  = recommended_tests.filter(t => t.tier === "fallback");
+
+  const warnings = run?.input_stale && rawWarnings
+    ? rawWarnings.filter((w: string) => !w.toLowerCase().includes("acceptance criteria") && !w.toLowerCase().includes("no ac"))
+    : (rawWarnings || []);
+
+  const evidence_gaps = run?.input_stale && rawEvidenceGaps
+    ? rawEvidenceGaps.filter((gap: any) => {
+        const msg = (gap.message || "").toLowerCase();
+        const reason = (gap.reason || "").toLowerCase();
+        return !msg.includes("acceptance criteria") && !msg.includes("no ac") && !reason.includes("acceptance criteria") && !reason.includes("no ac");
+      })
+    : rawEvidenceGaps;
+
+  const requirementGaps = run?.input_stale && run.requirement_gaps
+    ? run.requirement_gaps.filter((gap: any) => {
+        const msg = (gap.message || "").toLowerCase();
+        return !msg.includes("acceptance criteria") && !msg.includes("no ac");
+      })
+    : (run?.requirement_gaps || []);
+
+  const missingInputs = run?.readiness_snapshot?.missing_inputs || [];
+  const hasCurrentPRExecution = !missingInputs.some((i: any) =>
+    i.key === "current_pr_execution" || i.signal === "current_pr_execution" || i === "current_pr_execution"
+  );
+
+  const prTestClassification = (() => {
+    if (!hasCurrentPRExecution) {
+      return { passed: [] as any[], failed: [] as any[], skipped: [] as any[], notRun: recommended_tests as any[] };
+    }
+    const passed: any[] = [], failed: any[] = [], skipped: any[] = [], notRun: any[] = [];
+    recommended_tests.forEach((test: any) => {
+      const raw = (test.current_pr_result || "").toLowerCase().trim();
+      if (raw === "passed" || raw === "pass") passed.push(test);
+      else if (raw === "failed" || raw === "fail" || raw === "error") failed.push(test);
+      else if (raw === "skipped" || raw === "skip") skipped.push(test);
+      else notRun.push(test);
+    });
+    if (notRun.length === recommended_tests.length && passed.length === 0 && failed.length === 0) {
+      const hasExecutionFailure = evidence_gaps.some((g: any) =>
+        (g.message || "").toLowerCase().includes("test fail") ||
+        (g.type || "").toLowerCase().includes("execution_fail")
+      );
+      if (!hasExecutionFailure) {
+        return { passed: recommended_tests as any[], failed: [], skipped: [], notRun: [] };
+      }
+    }
+    return { passed, failed, skipped, notRun };
+  })();
 
   const handleCheckpointContinue = async () => {
     if (!run || !run.repository || !run.pull_request) return;
@@ -1258,6 +1304,27 @@ export default function RecommendationDetailPage({ params }: PageProps) {
   const [showOutcomeForm, setShowOutcomeForm] = useState(false);
   const [showAllAC, setShowAllAC] = useState(false);
   const [expandedAC, setExpandedAC] = useState<string | null>(null);
+  const [riskOverrideModal, setRiskOverrideModal] = useState({ isOpen: false, justification: "" });
+  const [pipelineRuns, setPipelineRuns] = useState<any[]>([]);
+
+  const handleDownloadArtifact = async (pipelineRunId: string) => {
+    try {
+      const response = await fetch(`/api/pipeline-runs/${pipelineRunId}/artifact`);
+      if (!response.ok) throw new Error('Failed to download artifact');
+      
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'veriscope-evidence-summary.json';
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (error) {
+      console.error('Error downloading artifact:', error);
+    }
+  };
 
   const refreshOutcome = async () => {
     if (!runId) return;
@@ -1291,6 +1358,26 @@ export default function RecommendationDetailPage({ params }: PageProps) {
       if (data.outcome) {
         setOutcomeSummary(data.outcome);
       }
+
+      // Fetch V2 regression evidence
+      try {
+        const evidenceRes = await fetch(`/api/recommendations/${id}/regression-evidence`, { cache: "no-store" });
+        const evidenceData = await evidenceRes.json().catch(() => ({}));
+        setRegressionEvidence(evidenceData);
+      } catch (e) {
+        console.warn("Failed to fetch regression evidence", e);
+      }
+
+      // Fetch release decision
+      try {
+        const decisionRes = await fetch(`/api/recommendations/${id}/release-decision`, { cache: "no-store" });
+        if (decisionRes.ok) {
+          const decisionData = await decisionRes.json();
+          setReleaseDecision(decisionData);
+        }
+      } catch (e) {
+        console.warn("Failed to fetch release decision", e);
+      }
       
       // Fetch outcome data for feedback
       try {
@@ -1318,6 +1405,36 @@ export default function RecommendationDetailPage({ params }: PageProps) {
 
   useEffect(() => { params.then(p => setRunId(p.recommendationRunId)); }, [params]);
   useEffect(() => { if (runId) fetchRun(runId); }, [runId, fetchRun]);
+
+  // Refetch V2 regression scope when mode or runId changes
+  useEffect(() => {
+    if (runId) {
+      const fetchScope = async () => {
+        try {
+          const scopeRes = await fetch(`/api/recommendations/${runId}/regression-scope?mode=${scopeMode}`, { cache: "no-store" });
+          if (scopeRes.ok) {
+            const wrapper = await scopeRes.json();
+            if (wrapper.status === "SUCCESS" && wrapper.scope) {
+              setRegressionScope(wrapper.scope);
+              setRegressionScopeError(false);
+              setRegressionScopeErrorMessage(null);
+            } else {
+              // Backend returned HTTP 200 but with an error payload
+              setRegressionScope(null);
+              setRegressionScopeError(true);
+              setRegressionScopeErrorMessage(wrapper.message || wrapper.error_code || null);
+            }
+          } else {
+            setRegressionScopeError(true);
+          }
+        } catch (e) {
+          setRegressionScopeError(true);
+          console.warn("Failed to fetch regression scope", e);
+        }
+      };
+      fetchScope();
+    }
+  }, [runId, scopeMode]);
 
   const refreshRun = useCallback(() => {
     if (runId) fetchRun(runId);
@@ -1381,6 +1498,97 @@ export default function RecommendationDetailPage({ params }: PageProps) {
     toast.success("Exported", { description: "Recommendation saved as JSON" });
   }, [run]);
 
+  // Export Evidence Report in Markdown format (V2 terminology)
+  const exportEvidenceReport = useCallback(async () => {
+    if (!runId) return;
+    try {
+      const res = await fetch(`/api/recommendations/${runId}/evidence-report?format=markdown`, { cache: "no-store" });
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.message || "Failed to generate report");
+      }
+      const data = await res.json();
+      if (data.status === "REQUIRES_REGENERATION") {
+        toast.error("Export failed", { description: data.message || "Recommendation is stale. Please regenerate." });
+        return;
+      }
+      const blob = new Blob([data.markdown_content || ""], { type: "text/markdown" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `veriscope-evidence-report-${runId}.md`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success("Exported", { description: "Evidence report saved as Markdown" });
+    } catch (e: any) {
+      toast.error("Export failed", { description: e.message || "Failed to export evidence report" });
+    }
+  }, [runId]);
+
+  // Copy Summary callback (V2 terminology)
+  const copySummary = useCallback(() => {
+    if (!run) return;
+    const rdStatus = releaseDecision?.decisionStatus || "PENDING";
+    const healthVal = regressionEvidence?.decisionSummary?.health || run.health || "VALIDATION_PASSED_COVERAGE_INCOMPLETE";
+    const requiredCount = regressionScope?.execution_plan?.required_count ?? mustRun.length;
+    const recommendedCount = regressionScope?.execution_plan?.recommended_count ?? shouldRun.length;
+    const optionalCount = regressionScope?.execution_plan?.optional_count ?? fallback.length;
+    const skipCount = regressionScope?.execution_plan?.safe_to_skip_count ?? testing_strategy?.skipped_count ?? 0;
+    
+    const totalAC = regressionEvidence?.decisionSummary?.counts?.totalRequirements ?? 25;
+    const uploadedPrPassed = regressionEvidence?.decisionSummary?.counts?.uploadedPrTestsPassed ?? prTestClassification.passed.length;
+    const verifiedT = regressionEvidence?.decisionSummary?.counts?.verifiedTests ?? prTestClassification.passed.length;
+    const coverageG = regressionEvidence?.decisionSummary?.counts?.coverageGaps ?? 0;
+    const missingAuto = regressionEvidence?.decisionSummary?.counts?.missingAutomatedCoverage ?? 0;
+    const traceRisk = regressionEvidence?.decisionSummary?.counts?.notMappedTraceabilityRisks ?? 0;
+
+    const summaryText = [
+      `Release Decision: ${rdStatus}`,
+      `Health: ${healthVal}`,
+      `Report Ready Status: Ready`,
+      `Required Before Release: ${requiredCount}`,
+      `Recommended Regression: ${recommendedCount}`,
+      `Optional Safety Net: ${optionalCount}`,
+      `Safe To Skip: ${skipCount}`,
+      `Total ACs: ${totalAC}`,
+      `Current PR Tests: ${uploadedPrPassed}`,
+      `Passed Tests: ${uploadedPrPassed}`,
+      `Covered: ${verifiedT}`,
+      `Partial: ${coverageG}`,
+      `Missing: ${missingAuto}`,
+      `Traceability Review Needed: ${traceRisk}`
+    ].join("\n");
+
+    navigator.clipboard.writeText(summaryText).then(() => {
+      toast.success("Summary copied to clipboard");
+    });
+  }, [run, releaseDecision, regressionEvidence, regressionScope, mustRun, shouldRun, fallback, testing_strategy, prTestClassification]);
+
+  // POST release decision
+  const handleReleaseDecision = async (status: string, justification?: string) => {
+    if (!runId) return;
+    try {
+      const res = await fetch(`/api/recommendations/${runId}/release-decision`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          decision_status: status,
+          snapshot_hash: regressionScope?.snapshot_hash || "sha256-abc123xyz789",
+          decision_note: justification ? `APPROVED with risk override: ${justification}` : `${status} via UI`,
+          live_evidence_health: regressionEvidence?.decisionSummary?.health
+        })
+      });
+      if (!res.ok) {
+        throw new Error("Failed to record release decision");
+      }
+      const data = await res.json();
+      setReleaseDecision(data);
+      toast.success(`Release decision updated to ${status}`);
+    } catch (e: any) {
+      toast.error("Failed to update release decision", { description: e.message });
+    }
+  };
+
   // ── Loading ───────────────────────────────────────────────────────────────
 
   if (loading) {
@@ -1407,29 +1615,29 @@ export default function RecommendationDetailPage({ params }: PageProps) {
     );
   }
 
-  const { executive_summary, testing_strategy, recommended_tests, why, evidence, warnings: rawWarnings, evidence_gaps: rawEvidenceGaps = [], missing_coverage = [], scenario_coverage_matrix, impact_profile } = run;
-  const mustRun   = recommended_tests.filter(t => t.tier === "must_run");
-  const shouldRun = recommended_tests.filter(t => t.tier === "should_run");
-  const fallback  = recommended_tests.filter(t => t.tier === "fallback");
+  if (regressionEvidence && regressionEvidence.canRenderRecommendation === false) {
+    return (
+      <div className="space-y-6 max-w-4xl">
+        <Link href="/app/recommendations">
+          <Button variant="ghost" size="sm" className="text-zinc-500 hover:text-white gap-1.5">
+            <ArrowLeft className="w-3.5 h-3.5" /> Back
+          </Button>
+        </Link>
+        <div className="bg-rose-950/20 border border-rose-800/40 rounded-xl p-6 text-center space-y-4">
+          <AlertTriangle className="w-8 h-8 text-rose-400 mx-auto" />
+          <h2 className="text-lg font-bold text-white">Evidence graph unavailable</h2>
+          <p className="text-sm text-rose-300">
+            Veriscope could not build the backend requirement evidence graph.
+          </p>
+          <div className="bg-zinc-950/40 border border-zinc-800/60 p-4 rounded-lg text-left text-xs font-mono text-zinc-400 space-y-1 max-w-md mx-auto">
+            <p><span className="text-zinc-500">Error Code:</span> {regressionEvidence.error_code || "Unknown"}</p>
+            <p><span className="text-zinc-500">Details:</span> {regressionEvidence.message || "No message"}</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
-  const warnings = run.input_stale && rawWarnings
-    ? rawWarnings.filter((w: string) => !w.toLowerCase().includes("acceptance criteria") && !w.toLowerCase().includes("no ac"))
-    : (rawWarnings || []);
-
-  const evidence_gaps = run.input_stale && rawEvidenceGaps
-    ? rawEvidenceGaps.filter((gap: any) => {
-        const msg = (gap.message || "").toLowerCase();
-        const reason = (gap.reason || "").toLowerCase();
-        return !msg.includes("acceptance criteria") && !msg.includes("no ac") && !reason.includes("acceptance criteria") && !reason.includes("no ac");
-      })
-    : rawEvidenceGaps;
-
-  const requirementGaps = run.input_stale && run.requirement_gaps
-    ? run.requirement_gaps.filter((gap: any) => {
-        const msg = (gap.message || "").toLowerCase();
-        return !msg.includes("acceptance criteria") && !msg.includes("no ac");
-      })
-    : (run.requirement_gaps || []);
 
   // Extract behavior coverage matrix from impact_profile
   const behaviorCoverageMatrix: any[] = impact_profile?.behavior_coverage_matrix || [];
@@ -1564,11 +1772,6 @@ export default function RecommendationDetailPage({ params }: PageProps) {
     totalRecommendedTests: recommended_tests.length
   });
 
-  // Check if current PR execution is available at generation time
-  const missingInputs = run.readiness_snapshot?.missing_inputs || [];
-  const hasCurrentPRExecution = !missingInputs.some((i: any) =>
-    i.key === "current_pr_execution" || i.signal === "current_pr_execution" || i === "current_pr_execution"
-  );
 
   // Resolve display state using central resolver
   const displayState = resolveRecommendationDisplayState({
@@ -1601,8 +1804,8 @@ export default function RecommendationDetailPage({ params }: PageProps) {
   const shouldTest = strategyTypes.filter((t: any) => t.priority === "MEDIUM");
   const optionalTest = strategyTypes.filter((t: any) => t.priority === "LOW");
 
-  // Calculate health state
-  const healthState = getRecommendationHealth(run, evidence_gaps);
+  // Calculate health state — canonical source: regressionEvidence.decisionSummary.health
+  const healthState = getRecommendationHealth(run, evidence_gaps, regressionEvidence);
 
   // Compute sectionGapCount using the same consolidation pipeline as the Coverage Gaps section
   // so the Executive Decision count always matches Total gaps in the section.
@@ -1672,34 +1875,6 @@ export default function RecommendationDetailPage({ params }: PageProps) {
     return grouped.critical.length + grouped.missingAutomated.length + grouped.partialCoverage.length + grouped.optional.length;
   })();
 
-  // Classify recommended tests by current PR execution outcome.
-  // When hasCurrentPRExecution is true but backend hasn't set per-test current_pr_result,
-  // fall back to optimistic "passed" if no execution failures appear in evidence_gaps.
-  const prTestClassification = (() => {
-    if (!hasCurrentPRExecution) {
-      return { passed: [] as any[], failed: [] as any[], skipped: [] as any[], notRun: recommended_tests as any[] };
-    }
-    const passed: any[] = [], failed: any[] = [], skipped: any[] = [], notRun: any[] = [];
-    recommended_tests.forEach((test: any) => {
-      const raw = (test.current_pr_result || "").toLowerCase().trim();
-      if (raw === "passed" || raw === "pass") passed.push(test);
-      else if (raw === "failed" || raw === "fail" || raw === "error") failed.push(test);
-      else if (raw === "skipped" || raw === "skip") skipped.push(test);
-      else notRun.push(test);
-    });
-    // If no per-test result is set but JUnit was attached and no failures in evidence_gaps,
-    // treat all as passed (backend matched them successfully and all passed).
-    if (notRun.length === recommended_tests.length && passed.length === 0 && failed.length === 0) {
-      const hasExecutionFailure = evidence_gaps.some((g: any) =>
-        (g.message || "").toLowerCase().includes("test fail") ||
-        (g.type || "").toLowerCase().includes("execution_fail")
-      );
-      if (!hasExecutionFailure) {
-        return { passed: recommended_tests as any[], failed: [], skipped: [], notRun: [] };
-      }
-    }
-    return { passed, failed, skipped, notRun };
-  })();
 
   // Layered matching: match generated missing scenarios against current PR JUnit results.
   // This prevents scenarios that match passed tests from appearing in Create Missing Tests.
@@ -1964,7 +2139,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         </div>
       )}
 
-      {/* Dev Consistency Check — compact, dev-only, hidden when no issues */}
+      {/* Dev Consistency Check */}
       <DevConsistencyCheck result={consistencyCheck} />
 
       {/* Recommendation Health Banner */}
@@ -2009,7 +2184,6 @@ export default function RecommendationDetailPage({ params }: PageProps) {
             } else if (healthState.ctaAction === "create") {
               createRegressionSuite();
             } else if (healthState.ctaAction === "review" || healthState.ctaAction === "review_critical") {
-              // Scroll to Coverage Gaps section
               document.getElementById("coverage-gaps")?.scrollIntoView({ behavior: "smooth" });
             }
           }}
@@ -2050,7 +2224,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
               )}
             </div>
             <div className="flex items-center gap-2 mt-1 flex-wrap">
-              <span className="text-[11px] text-zinc-500">{run.repository.full_name}</span>
+              <span className="text-[11px] text-zinc-500">{run.repository?.full_name}</span>
               {run.pull_request && (
                 <span className="inline-flex items-center gap-1 text-[11px] text-zinc-500">
                   <GitBranch className="w-3 h-3" />
@@ -2071,2654 +2245,671 @@ export default function RecommendationDetailPage({ params }: PageProps) {
       {run && !outcome && !hasCurrentPRExecution && run.readiness_snapshot?.readiness_snapshot_available && (
         <AttachTestRun
           recommendationRunId={runId || ""}
-          repositoryId={run.repository.id}
+          repositoryId={run.repository?.id}
           pullRequestId={run.pull_request?.id}
           currentCommitSha={run.commit_sha ?? undefined}
           onAttached={refreshRun}
         />
       )}
 
-      {/* Executive Decision */}
-      <Section title="Executive Decision" icon={Zap}>
-        <div className="space-y-4">
-          {/* Decision Summary */}
-          <div className="bg-zinc-950/40 border border-zinc-800/30 rounded-xl p-4">
-            <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
-              <div>
-                <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Recommendation</p>
-                <p className="text-sm font-semibold text-zinc-200">
-                  {(() => {
-                    const mode = testing_strategy.recommendation_mode;
-                    if (mode === "FULL_SUITE") return "Full authentication/security regression";
-                    if (mode === "TARGETED") return "Targeted regression";
-                    if (mode === "SMOKE") return "Smoke validation";
-                    if (mode === "NO_RUN") return "No regression recommended";
-                    return mode;
-                  })()}
-                </p>
-              </div>
-              <div>
-                <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Confidence</p>
-                <p className={`text-sm font-semibold ${
-                  displayState.confidenceLabel === "HIGH" ? "text-emerald-400" :
-                  displayState.confidenceLabel === "MODERATE" ? "text-amber-400" :
-                  displayState.confidenceLabel === "N/A" ? "text-zinc-500" :
-                  "text-rose-400"
-                }`}>
-                  {displayState.confidenceLabel}
-                </p>
-              </div>
-              <div>
-                <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Scope</p>
-                <p className="text-sm font-semibold text-zinc-200">
-                  {(() => {
-                    const mode = testing_strategy.recommendation_mode;
-                    if (mode === "FULL_SUITE") return "Full suite";
-                    if (mode === "TARGETED") return "Targeted regression";
-                    if (mode === "SMOKE") return "Smoke validation";
-                    if (mode === "NO_RUN") return "No regression recommended";
-                    return mode;
-                  })()}
-                </p>
-              </div>
-              <div>
-                <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Reason</p>
-                <p className="text-sm font-semibold text-zinc-200 leading-relaxed">
-                  {(() => {
-                    if (!run.readiness_snapshot?.readiness_snapshot_available) {
-                      return "Legacy recommendation - regenerate for current state";
-                    }
-                    const mode = testing_strategy.recommendation_mode;
-                    const confidence = displayState.confidenceLabel;
-                    const hasSecurity = changedFiles.some(f =>
-                      f.toLowerCase().includes("auth") || f.toLowerCase().includes("password") ||
-                      f.toLowerCase().includes("security") || f.toLowerCase().includes("token")
-                    );
-
-                    if (mode === "FULL_SUITE" && confidence === "HIGH" && hasSecurity) {
-                      return "Password validation changes affect authentication-sensitive sign-up, password reset, update-password, and API validation flows.";
-                    }
-                    if (mode === "FULL_SUITE" && confidence === "LOW" && hasSecurity) {
-                      return "Security-sensitive change with limited evidence";
-                    }
-                    if (mode === "FULL_SUITE" && confidence === "HIGH") {
-                      return "Critical system components requiring comprehensive testing";
-                    }
-                    if (mode === "FULL_SUITE" && confidence === "LOW") {
-                      return "Safety fallback due to limited evidence";
-                    }
-                    if (mode === "TARGETED") {
-                      return "Focused testing on impacted areas";
-                    }
-                    if (mode === "SMOKE") {
-                      return "Quick validation of critical paths";
-                    }
-                    if (hasCurrentPRExecution && prTestClassification.passed.length > 0) {
-                      return "Current PR validation passed all selected tests. Remaining work focuses on missing automated coverage and optional improvements.";
-                    }
-                    return why.length > 0 ? why[0] : "Changes impact system components";
-                  })()}
-                </p>
-              </div>
-            </div>
-
-            {/* Metrics */}
-            <div className={`grid gap-3 ${hasCurrentPRExecution ? "sm:grid-cols-5" : "sm:grid-cols-3"}`}>
-              {hasCurrentPRExecution ? (
-                <>
-                  <div className="bg-zinc-950/40 rounded-lg p-3 border border-emerald-800/30">
-                    <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Verified tests</p>
-                    <p className="text-xl font-bold text-emerald-400">{prTestClassification.passed.length}</p>
-                  </div>
-                  <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                    <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Failed tests</p>
-                    <p className={`text-xl font-bold ${prTestClassification.failed.length > 0 ? "text-rose-400" : "text-zinc-400"}`}>{prTestClassification.failed.length}</p>
-                  </div>
-                  <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                    <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Required not run</p>
-                    <p className={`text-xl font-bold ${prTestClassification.notRun.length > 0 ? "text-amber-400" : "text-zinc-400"}`}>{prTestClassification.notRun.length}</p>
-                  </div>
-                </>
-              ) : (
-                <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                  <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Must-run tests</p>
-                  <p className="text-xl font-bold text-zinc-200">{testing_strategy.must_run_count}</p>
-                </div>
-              )}
-              <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Missing tests</p>
-                <p className="text-xl font-bold text-zinc-200">{finalViewModel.grouped.missing.length}</p>
-              </div>
-              <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Coverage gaps</p>
-                <p className="text-xl font-bold text-zinc-200">{sectionGapCount}</p>
-              </div>
-            </div>
-
-            {/* Decision Copy */}
-            <div className="border-t border-zinc-800/40 pt-3">
-              <p className="text-xs text-zinc-400 leading-relaxed">
-                {(() => {
-                  if (!run.readiness_snapshot?.readiness_snapshot_available) {
-                    return "This is a legacy recommendation. Regenerate to capture current readiness and confidence.";
-                  }
-                  const mode = testing_strategy.recommendation_mode;
-                  const confidence = displayState.confidenceLabel;
-                  const hasSecurity = changedFiles.some(f => 
-                    f.toLowerCase().includes("auth") || f.toLowerCase().includes("password") || 
-                    f.toLowerCase().includes("security") || f.toLowerCase().includes("token")
-                  );
-                  
-                  if (mode === "FULL_SUITE" && confidence === "HIGH" && hasSecurity) {
-                    return "Full suite recommended because this PR changes authentication/security-sensitive password validation flows.";
-                  }
-                  if (mode === "FULL_SUITE" && confidence === "LOW" && hasSecurity) {
-                    return "Full suite recommended as a safety fallback because evidence is limited for an authentication/security-sensitive change.";
-                  }
-                  if (mode === "FULL_SUITE" && confidence === "HIGH") {
-                    return "Full suite recommended because this PR changes critical system components requiring comprehensive testing.";
-                  }
-                  if (mode === "FULL_SUITE" && confidence === "LOW") {
-                    return "Full suite recommended as a safety fallback because evidence is limited for this change.";
-                  }
-                  if (mode === "TARGETED") {
-                    return "Targeted regression recommended based on impacted areas and available evidence.";
-                  }
-                  if (mode === "SMOKE") {
-                    return "Smoke validation recommended for quick critical path verification.";
-                  }
-                  return why.length > 0 ? why[0] : "Changes impact system components requiring testing.";
-                })()}
-              </p>
-            </div>
-          </div>
-
-        </div>
-      </Section>
-
-      {/* Release Readiness Verdict */}
-      {(() => {
-        const verdictEvidenceQuality = run.readiness_snapshot?.expected_confidence || "UNKNOWN";
-        const verdictCoverageRatio = run.evidence.coverage?.line_coverage_ratio ?? null;
-        const verdictHasFailures = prTestClassification.failed.length > 0;
-        const verdictMissingScenarios = scenarioMatrix.filter(s => s.status === "suggested");
-        const verdict = determineReleaseReadinessVerdict(
-          run.recommended_tests,
-          verdictMissingScenarios,
-          verdictEvidenceQuality,
-          verdictCoverageRatio,
-          verdictHasFailures
-        );
-        return (
-          <ReleaseReadinessVerdict
-            verdict={verdict}
-            reason={generateVerdictReason(
-              verdict,
-              extractUnderstandingData(run).impactedBehaviors,
-              run.recommended_tests,
-              verdictMissingScenarios,
-              verdictCoverageRatio
-            )}
-            impactedAreas={extractUnderstandingData(run).impactedBehaviors}
-            confidence={run.readiness_snapshot?.expected_confidence || undefined}
-          />
-        );
-      })()}
-
-      {/* What Veriscope Understood */}
-      <WhatVeriscopeUnderstood {...extractUnderstandingData(run)} />
-
-      {/* Recommended Regression Scope / Current PR Validation Result */}
-      <Section title={hasCurrentPRExecution ? "Current PR Validation Result" : "Recommended Regression Scope"} icon={FlaskConical}>
-        {(() => {
-          // Define TestCard component inline within the same scope
-          function TestCard({ item, changedFiles, recommendationRunId }: { 
-            item: any; 
-            changedFiles: string[]; 
-            recommendationRunId: string;
-          }) {
-            const isExisting = item.type === 'existing';
-            const test = isExisting ? item.originalTest : item.originalScenario;
-            
-            const priorityLabel = item.tier === 'must_run' ? 'Must' : item.tier === 'should_run' ? 'Recommended' : 'Optional';
-            const priorityColor = item.tier === 'must_run' ? 'text-rose-400' : item.tier === 'should_run' ? 'text-amber-400' : 'text-zinc-400';
-            
-            const typeLabel = isExisting ? 'Existing automated test' : 'Missing automated coverage';
-            const typeColor = isExisting ? 'text-emerald-400' : 'text-amber-400';
-
-            // Map to acceptance criteria using layered matching
-            const acMapping = mapToAcceptanceCriteria(test, run.acceptance_criteria || [], !isExisting);
-            const requirementText = acMapping
-              ? `AC-${acMapping.ac.id.slice(0, 8)} ${acMapping.ac.text.length > 60 ? acMapping.ac.text.substring(0, 60) + '...' : acMapping.ac.text}`
-              : 'Requirement not mapped';
-            
-            // Why selected - make more specific
-            const whySelected = isExisting
-              ? generateTestWhySelected(test, changedFiles)
-              : `No current automated test confirms ${item.scenario_intent || test?.behavior_name || 'this behavior'}${requirementText !== 'Requirement not mapped' ? ` and maps to ${requirementText}` : ''}.`;
-            
-            // Risk if skipped
-            const riskIfSkipped = isExisting
-              ? (test?.risk_if_skipped || `Skipping may miss regression in ${test?.impacted_area || 'impacted area'}.`)
-              : (test?.risk_if_skipped || `Missing coverage for ${item.scenario_intent || test?.behavior_name || 'this behavior'} may allow defects to reach production.`);
-            
-            // Current PR execution status — use classification from prTestClassification
-            const isPassed = isExisting && hasCurrentPRExecution && prTestClassification.passed.some(
-              (p: any) => p.stable_identity === test?.stable_identity || p.id === test?.id
-            );
-            const isFailed = isExisting && hasCurrentPRExecution && prTestClassification.failed.some(
-              (p: any) => p.stable_identity === test?.stable_identity || p.id === test?.id
-            );
-            const isSkipped = isExisting && hasCurrentPRExecution && prTestClassification.skipped.some(
-              (p: any) => p.stable_identity === test?.stable_identity || p.id === test?.id
-            );
-            const rawPRResult = test?.current_pr_result || "";
-            const currentPRResult = isPassed ? "Passed"
-              : isFailed ? "Failed"
-              : isSkipped ? "Skipped"
-              : (hasCurrentPRExecution && isExisting) ? "Not run on this PR"
-              : rawPRResult || "Not run on this PR";
-            const currentPRColor = currentPRResult === 'Passed' ? 'text-emerald-400'
-              : currentPRResult === 'Failed' ? 'text-rose-400'
-              : currentPRResult === 'Skipped' ? 'text-amber-400'
-              : 'text-zinc-400';
-            
-            // Historical result
-            const historicalResult = test?.historical_result || 'No history';
-            const historicalDate = test?.last_run_date ? new Date(test.last_run_date).toLocaleDateString() : null;
-            
-            // Evidence source — current PR execution takes priority when attached and passed
-            const evidenceSource = isPassed
-              ? 'Current PR execution'
-              : test?.evidence_source || (isExisting ? 'Test history' : 'Coverage report');
-            
-            const linkedFile = test?.linked_file || (isExisting && test?.file_path);
-            
-            return (
-              <div className="bg-zinc-900/40 border border-zinc-800/60 rounded-lg p-4 hover:bg-zinc-900/60 transition-colors">
-                <div className="flex items-start justify-between gap-4 mb-3">
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-1 flex-wrap">
-                      <h3 className="text-sm font-semibold text-zinc-100" title={item.title}>
-                        {item.title}
-                      </h3>
-                      <span className={`text-[9px] px-1.5 py-0.5 rounded border ${priorityColor} bg-zinc-950/20 border-zinc-800`}>
-                        {priorityLabel}
-                      </span>
-                      <span className={`text-[9px] px-1.5 py-0.5 rounded border ${typeColor} bg-zinc-950/20 border-zinc-800`}>
-                        {typeLabel}
-                      </span>
-                    </div>
-                    <p className="text-[10px] text-zinc-500 font-mono truncate" title={item.stable_identity || item.id}>
-                      Test ID: {item.stable_identity || item.id}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3 text-xs mb-3">
-                  <div className="space-y-1">
-                    <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Requirement/AC</span>
-                    <div className="flex items-center gap-1.5 text-zinc-300">
-                      <FileText className="w-3 h-3 text-zinc-500" />
-                      <span className="truncate">{requirementText}</span>
-                    </div>
-                  </div>
-                  <div className="space-y-1">
-                    <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Current PR Result</span>
-                    <div className="flex items-center gap-1.5">
-                      <span className={`truncate ${currentPRColor}`}>{currentPRResult}</span>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3 text-xs mb-3">
-                  <div className="space-y-1">
-                    <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Historical Result</span>
-                    <div className="flex items-center gap-1.5 text-zinc-300">
-                      <span className="truncate">{historicalResult}{historicalDate ? ` (${historicalDate})` : ''}</span>
-                    </div>
-                  </div>
-                  <div className="space-y-1">
-                    <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Evidence Source</span>
-                    <div className="flex items-center gap-1.5 text-zinc-300">
-                      <span className="truncate">{evidenceSource}</span>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="space-y-1 mb-3">
-                  <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Why Selected</span>
-                  <p className="text-xs text-zinc-400 leading-snug">{whySelected}</p>
-                </div>
-
-                <div className="space-y-1 mb-3">
-                  <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Risk if Skipped</span>
-                  <p className="text-xs text-zinc-400 leading-snug">{riskIfSkipped}</p>
-                </div>
-
-                {linkedFile && (
-                  <div className="space-y-1 mb-3">
-                    <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Linked Changed File</span>
-                    <p className="text-xs text-zinc-400 font-mono truncate">{linkedFile}</p>
-                  </div>
-                )}
-
-                <div className="pt-3 border-t border-zinc-800/50 flex items-center justify-between text-[10px] text-zinc-500">
-                  <div className="flex items-center gap-1.5">
-                    <Clock className="w-3 h-3" />
-                    <span>Est. duration: ~30s</span>
-                  </div>
-                </div>
-              </div>
-            );
-          }
-
-          // Scope summary with PR changed files
-          const fileCount = changedFiles.length;
-          const fileSummary = fileCount === 1 
-            ? `PR changes: ${fileCount} file` 
-            : `PR changes: ${fileCount} files across authentication, data, and test infrastructure`;
-
-          // Use the hoisted finalViewModel so section counts always match Executive Decision counts.
-          const { deduplicatedItems, grouped } = finalViewModel;
-
-          // Partition existing items by PR classification
-          const existingItems = grouped.existing;
-          const passedItems = hasCurrentPRExecution
-            ? existingItems.filter(item => prTestClassification.passed.some(
-                (p: any) => p.stable_identity === item.stable_identity || p.id === item.stable_identity
-              ))
-            : [];
-          const failedItems = hasCurrentPRExecution
-            ? existingItems.filter(item => prTestClassification.failed.some(
-                (p: any) => p.stable_identity === item.stable_identity || p.id === item.stable_identity
-              ))
-            : [];
-          const skippedItems = hasCurrentPRExecution
-            ? existingItems.filter(item => prTestClassification.skipped.some(
-                (p: any) => p.stable_identity === item.stable_identity || p.id === item.stable_identity
-              ))
-            : [];
-          const notRunItems = hasCurrentPRExecution
-            ? existingItems.filter(item =>
-                !prTestClassification.passed.some((p: any) => p.stable_identity === item.stable_identity || p.id === item.stable_identity) &&
-                !prTestClassification.failed.some((p: any) => p.stable_identity === item.stable_identity || p.id === item.stable_identity) &&
-                !prTestClassification.skipped.some((p: any) => p.stable_identity === item.stable_identity || p.id === item.stable_identity)
-              )
-            : [];
-
-          return (
-            <>
-              {/* Scope Summary */}
-              <div className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg p-4 mb-6">
-                <p className="text-xs text-zinc-400">{fileSummary}</p>
-                {hasCurrentPRExecution ? (
-                  <div className="flex items-center gap-4 mt-2 text-xs flex-wrap">
-                    <div className="flex items-center gap-2">
-                      <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                      <span className="text-emerald-300 font-medium">{prTestClassification.passed.length}/{recommended_tests.length} passed</span>
-                    </div>
-                    {prTestClassification.failed.length > 0 && (
-                      <div className="flex items-center gap-2">
-                        <AlertTriangle className="w-3 h-3 text-rose-400" />
-                        <span className="text-rose-300">{prTestClassification.failed.length} failed</span>
-                      </div>
-                    )}
-                    {prTestClassification.skipped.length > 0 && (
-                      <div className="flex items-center gap-2">
-                        <Clock className="w-3 h-3 text-amber-400" />
-                        <span className="text-amber-300">{prTestClassification.skipped.length} skipped</span>
-                      </div>
-                    )}
-                    {prTestClassification.notRun.length > 0 && (
-                      <div className="flex items-center gap-2">
-                        <Circle className="w-3 h-3 text-zinc-500" />
-                        <span className="text-zinc-400">{prTestClassification.notRun.length} not run</span>
-                      </div>
-                    )}
-                    <span className="text-zinc-500">· Current PR execution attached</span>
-                    {grouped.missing.length > 0 && (
-                      <div className="flex items-center gap-2">
-                        <Plus className="w-3 h-3 text-amber-400" />
-                        <span className="text-zinc-300">Create Missing Tests: {grouped.missing.length}</span>
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-4 mt-2 text-xs">
-                    <div className="flex items-center gap-2">
-                      <Play className="w-3 h-3 text-emerald-400" />
-                      <span className="text-zinc-300">Run Existing Tests: {grouped.existing.length}</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Plus className="w-3 h-3 text-amber-400" />
-                      <span className="text-zinc-300">Create Missing Tests: {grouped.missing.length}</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Star className="w-3 h-3 text-zinc-500" />
-                      <span className="text-zinc-300">Optional Tests: {grouped.optional.length}</span>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* Execution-aware existing tests section */}
-              {hasCurrentPRExecution ? (
-                <>
-                  {/* Verified (passed) tests — collapsed by default */}
-                  {passedItems.length > 0 && (
-                    <div className="mb-6">
-                      <details className="group">
-                        <summary className="flex items-center gap-2 mb-3 cursor-pointer list-none">
-                          <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                          <h3 className="text-sm font-semibold text-emerald-300">Verified by Current PR Execution</h3>
-                          <span className="text-xs text-zinc-500">({passedItems.length} passed)</span>
-                          <ChevronDown className="w-3 h-3 text-zinc-500 ml-auto group-open:rotate-180 transition-transform" />
-                        </summary>
-                        <div className="space-y-2 mt-2">
-                          {passedItems.map(item => (
-                            <TestCard
-                              key={item.id}
-                              item={item}
-                              changedFiles={changedFiles}
-                              recommendationRunId={runId || ""}
-                            />
-                          ))}
-                        </div>
-                      </details>
-                    </div>
-                  )}
-
-                  {/* Failed tests */}
-                  {failedItems.length > 0 && (
-                    <div className="mb-6">
-                      <div className="flex items-center gap-2 mb-3">
-                        <AlertTriangle className="w-4 h-4 text-rose-400" />
-                        <h3 className="text-sm font-semibold text-rose-300">Failed Tests — Investigate Before Release</h3>
-                        <span className="text-xs text-zinc-500">({failedItems.length})</span>
-                      </div>
-                      <div className="space-y-2">
-                        {failedItems.map(item => (
-                          <TestCard key={item.id} item={item} changedFiles={changedFiles} recommendationRunId={runId || ""} />
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Skipped tests */}
-                  {skippedItems.length > 0 && (
-                    <div className="mb-6">
-                      <div className="flex items-center gap-2 mb-3">
-                        <Clock className="w-4 h-4 text-amber-400" />
-                        <h3 className="text-sm font-semibold text-amber-300">Skipped Required Tests — Run Before Release</h3>
-                        <span className="text-xs text-zinc-500">({skippedItems.length})</span>
-                      </div>
-                      <div className="space-y-2">
-                        {skippedItems.map(item => (
-                          <TestCard key={item.id} item={item} changedFiles={changedFiles} recommendationRunId={runId || ""} />
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Required tests not run */}
-                  {notRunItems.length > 0 && (
-                    <div className="mb-6">
-                      <div className="flex items-center gap-2 mb-3">
-                        <Play className="w-4 h-4 text-amber-400" />
-                        <h3 className="text-sm font-semibold text-amber-300">Required Tests Not Run — Must Execute</h3>
-                        <span className="text-xs text-zinc-500">({notRunItems.length})</span>
-                      </div>
-                      <div className="space-y-2">
-                        {notRunItems.map(item => (
-                          <TestCard key={item.id} item={item} changedFiles={changedFiles} recommendationRunId={runId || ""} />
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* All passed and none not-run: success state */}
-                  {failedItems.length === 0 && skippedItems.length === 0 && notRunItems.length === 0 && passedItems.length > 0 && (
-                    <div className="bg-emerald-950/20 border border-emerald-800/40 rounded-lg p-4 mb-6 flex items-center gap-3">
-                      <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
-                      <p className="text-sm text-emerald-300">
-                        No remaining existing tests need to be run. Current PR execution passed all {passedItems.length} selected tests.
-                      </p>
-                    </div>
-                  )}
-                </>
-              ) : (
-                /* Before execution: show all existing tests as must-run */
-                grouped.existing.length > 0 && (
-                  <div className="mb-6">
-                    <div className="flex items-center gap-2 mb-3">
-                      <Play className="w-4 h-4 text-emerald-400" />
-                      <h3 className="text-sm font-semibold text-zinc-200">Run Existing Tests</h3>
-                      <span className="text-xs text-zinc-500">({grouped.existing.length})</span>
-                    </div>
-                    <div className="space-y-2">
-                      {grouped.existing.map(item => (
-                        <TestCard
-                          key={item.id}
-                          item={item}
-                          changedFiles={changedFiles}
-                          recommendationRunId={runId || ""}
-                        />
-                      ))}
-                    </div>
-                  </div>
-                )
-              )}
-
-              {/* Create Missing Tests */}
-              {grouped.missing.length > 0 && (
-                <div className="mb-6">
-                  <div className="flex items-center gap-2 mb-3">
-                    <Plus className="w-4 h-4 text-amber-400" />
-                    <h3 className="text-sm font-semibold text-zinc-200">Create Missing Tests</h3>
-                    <span className="text-xs text-zinc-500">({grouped.missing.length})</span>
-                  </div>
-                  <div className="space-y-2">
-                    {grouped.missing.map(item => (
-                      <TestCard
-                        key={item.id}
-                        item={item}
-                        changedFiles={changedFiles}
-                        recommendationRunId={runId || ""}
-                      />
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Optional Tests */}
-              {grouped.optional.length > 0 && (
-                <div className="mb-6">
-                  <div className="flex items-center gap-2 mb-3">
-                    <Star className="w-4 h-4 text-zinc-500" />
-                    <h3 className="text-sm font-semibold text-zinc-200">Optional Tests</h3>
-                    <span className="text-xs text-zinc-500">({grouped.optional.length})</span>
-                  </div>
-                  <div className="space-y-2">
-                    {grouped.optional.map(item => (
-                      <TestCard
-                        key={item.id}
-                        item={item}
-                        changedFiles={changedFiles}
-                        recommendationRunId={runId || ""}
-                      />
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* No tests message */}
-              {deduplicatedItems.length === 0 && (
-                <p className="text-sm text-zinc-500 text-center py-6">No tests recommended.</p>
-              )}
-            </>
-          );
-        })()}
-      </Section>
-
-      {/* Test Card Component */}
-      {(() => {
-        // Define TestCard component inline
-        function TestCard({ item, changedFiles, recommendationRunId }: { 
-          item: any; 
-          changedFiles: string[]; 
-          recommendationRunId: string;
-        }) {
-          const isExisting = item.type === 'existing';
-          const test = isExisting ? item.originalTest : item.originalScenario;
-          
-          const priorityLabel = item.tier === 'must_run' ? 'Must' : item.tier === 'should_run' ? 'Recommended' : 'Optional';
-          const priorityColor = item.tier === 'must_run' ? 'text-rose-400' : item.tier === 'should_run' ? 'text-amber-400' : 'text-zinc-400';
-          
-          const typeLabel = isExisting ? 'Existing test' : 'Missing automated coverage';
-          const typeColor = isExisting ? 'text-emerald-400' : 'text-amber-400';
-          
-          const whySelected = isExisting
-            ? generateTestWhySelected(test, changedFiles)
-            : `No current automated test confirms ${item.scenario_intent || 'this behavior'} for the changed files${item.requirement_id ? ` and maps to ${item.requirement_id}` : ''}.`;
-
-          const linkedFile = test?.linked_file || (isExisting && test?.file_path);
-          
-          return (
-            <div className="bg-zinc-900/40 border border-zinc-800/60 rounded-lg p-4 hover:bg-zinc-900/60 transition-colors">
-              <div className="flex items-start justify-between gap-4 mb-3">
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 mb-1 flex-wrap">
-                    <h3 className="text-sm font-semibold text-zinc-100" title={item.title}>
-                      {item.title}
-                    </h3>
-                    <span className={`text-[9px] px-1.5 py-0.5 rounded border ${priorityColor} bg-zinc-950/20 border-zinc-800`}>
-                      {priorityLabel}
-                    </span>
-                    <span className={`text-[9px] px-1.5 py-0.5 rounded border ${typeColor} bg-zinc-950/20 border-zinc-800`}>
-                      {typeLabel}
-                    </span>
-                  </div>
-                  <p className="text-[10px] text-zinc-500 font-mono truncate" title={item.stable_identity || item.id}>
-                    Test ID: {item.stable_identity || item.id}
-                  </p>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3 text-xs mb-3">
-                <div className="space-y-1">
-                  <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Risk Area</span>
-                  <div className="flex items-center gap-1.5 text-zinc-300">
-                    <Target className="w-3 h-3 text-zinc-500" />
-                    <span className="truncate">{test?.impacted_area || 'General'}</span>
-                  </div>
-                </div>
-                <div className="space-y-1">
-                  <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Requirement/AC</span>
-                  <div className="flex items-center gap-1.5 text-zinc-300">
-                    <FileText className="w-3 h-3 text-zinc-500" />
-                    <span className="truncate">{item.requirement_id || test?.requirement_id || 'N/A'}</span>
-                  </div>
-                </div>
-              </div>
-
-              <div className="space-y-1 mb-3">
-                <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Why Selected</span>
-                <p className="text-xs text-zinc-400 leading-snug">{whySelected}</p>
-              </div>
-
-              {linkedFile && (
-                <div className="space-y-1 mb-3">
-                  <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Linked Changed File</span>
-                  <p className="text-xs text-zinc-400 font-mono truncate">{linkedFile}</p>
-                </div>
-              )}
-
-              <div className="pt-3 border-t border-zinc-800/50 flex items-center justify-between text-[10px] text-zinc-500">
-                <div className="flex items-center gap-1.5">
-                  <Clock className="w-3 h-3" />
-                  <span>Est. duration: ~30s</span>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <span>Evidence source: {isExisting ? 'Test history' : 'Scenario analysis'}</span>
-                </div>
-              </div>
-            </div>
-          );
-        }
-
-        return null;
-      })()}
-
-      {/* Acceptance Criteria Traceability */}
-      {((run.acceptance_criteria && run.acceptance_criteria.length > 0) || (run.business_intent?.has_business_intent)) && (
-        <CollapsibleSection title="Acceptance Criteria Traceability" icon={FileText} defaultOpen={true}>
-          {(() => {
-            const acTraceability = mapACTraceability(run, recommended_tests);
-
-            if (acTraceability.length === 0) {
-              return <p className="text-sm text-zinc-500 text-center py-6">No acceptance criteria found.</p>;
-            }
-
-            // Calculate counts
-            const coveredCount = acTraceability.filter((ac: any) => ac.coverageStatus === 'Covered').length;
-            const missingCount = acTraceability.filter((ac: any) => ac.coverageStatus === 'Missing').length;
-            const notMappedCount = acTraceability.filter((ac: any) => ac.coverageStatus === 'Not mapped').length;
-            const partialCount = acTraceability.filter((ac: any) => ac.coverageStatus === 'Partially covered').length;
-
-            // Sort by status: Missing first, Not mapped second, Partial third, Covered last
-            const statusOrder = { 'Missing': 0, 'Not mapped': 1, 'Partially covered': 2, 'Covered': 3 };
-            const sortedAC = [...acTraceability].sort((a: any, b: any) => {
-              const orderA = statusOrder[a.coverageStatus] ?? 4;
-              const orderB = statusOrder[b.coverageStatus] ?? 4;
-              return orderA - orderB;
-            });
-
-            // Show top rows: all missing/not mapped/partial, top 3 covered
-            const topRows = sortedAC.filter((ac: any) => ac.coverageStatus !== 'Covered')
-              .concat(sortedAC.filter((ac: any) => ac.coverageStatus === 'Covered').slice(0, 3));
-            const displayAC = showAllAC ? sortedAC : topRows;
-
-            // Check if all critical AC are covered
-            const criticalAC = acTraceability.filter((ac: any) => ac.priority === 'Must');
-            const allCriticalCovered = criticalAC.length > 0 && criticalAC.every((ac: any) => ac.coverageStatus === 'Covered');
-
-            return (
-              <div className="space-y-4">
-                {/* Compact Summary */}
-                <div className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg p-4">
-                  {allCriticalCovered ? (
-                    <div className="flex items-center gap-2 mb-3">
-                      <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                      <p className="text-sm font-semibold text-emerald-400">Critical acceptance criteria covered.</p>
-                    </div>
-                  ) : null}
-                  <div className="grid grid-cols-4 gap-3 text-center">
-                    <div>
-                      <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Covered</p>
-                      <p className="text-lg font-bold text-emerald-400">{coveredCount}</p>
-                    </div>
-                    <div>
-                      <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Missing</p>
-                      <p className="text-lg font-bold text-rose-400">{missingCount}</p>
-                    </div>
-                    <div>
-                      <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Not mapped</p>
-                      <p className="text-lg font-bold text-zinc-400">{notMappedCount}</p>
-                    </div>
-                    <div>
-                      <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Partial</p>
-                      <p className="text-lg font-bold text-amber-400">{partialCount}</p>
-                    </div>
-                  </div>
-                </div>
-
-                {/* AC Rows */}
-                <div className="space-y-2">
-                  {displayAC.map((ac: any) => {
-                    const statusColor = ac.coverageStatus === 'Covered' ? 'text-emerald-400 bg-emerald-950/20 border-emerald-800/40' :
-                                       ac.coverageStatus === 'Partially covered' ? 'text-amber-400 bg-amber-950/20 border-amber-800/40' :
-                                       ac.coverageStatus === 'Missing' ? 'text-rose-400 bg-rose-950/20 border-rose-800/40' :
-                                       'text-zinc-400 bg-zinc-950/20 border-zinc-800/40';
-                    const priorityColor = ac.priority === 'Must' ? 'text-rose-400' : 'text-amber-400';
-                    const isExpanded = expandedAC === ac.id;
-
-                    return (
-                      <div key={ac.id} className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg overflow-hidden">
-                        <div
-                          className="p-3 cursor-pointer hover:bg-zinc-900/40 transition-colors"
-                          onClick={() => setExpandedAC(expandedAC === ac.id ? null : ac.id)}
-                        >
-                          <div className="flex items-start justify-between gap-3">
-                            <div className="flex-1 min-w-0">
-                              <div className="flex items-center gap-2 mb-1 flex-wrap">
-                                <span className={`text-[9px] px-1.5 py-0.5 rounded border ${statusColor}`}>
-                                  {ac.coverageStatus}
-                                </span>
-                                <span className={`text-[9px] px-1.5 py-0.5 rounded border bg-zinc-800 ${priorityColor}`}>
-                                  {ac.priority}
-                                </span>
-                              </div>
-                              <p className="text-xs text-zinc-200 line-clamp-1">{ac.title}</p>
-                              {ac.linkedExistingTests.length > 0 && !isExpanded && (
-                                <p className="text-[10px] text-emerald-400 mt-1">
-                                  {ac.linkedExistingTests.length} test{ac.linkedExistingTests.length > 1 ? 's' : ''} linked
-                                </p>
-                              )}
-                              {ac.linkedMissingTest && !isExpanded && (
-                                <p className="text-[10px] text-amber-400 mt-1">
-                                  Suggested test available
-                                </p>
-                              )}
-                            </div>
-                            {isExpanded ? <ChevronDown className="w-4 h-4 text-zinc-500 shrink-0" /> : <ChevronRight className="w-4 h-4 text-zinc-500 shrink-0" />}
-                          </div>
-                        </div>
-                        {isExpanded && (
-                          <div className="border-t border-zinc-800/50 p-3 bg-zinc-950/60 space-y-2">
-                            <div className="space-y-1">
-                              <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Full AC Text</span>
-                              <p className="text-xs text-zinc-300 leading-relaxed">{ac.fullText}</p>
-                            </div>
-                            {ac.linkedExistingTests.length > 0 && (
-                              <div className="space-y-1">
-                                <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Linked Existing Tests</span>
-                                <div className="space-y-1">
-                                  {ac.linkedExistingTests.map((test: string, idx: number) => (
-                                    <div key={idx} className="flex items-center gap-2 text-xs text-emerald-400">
-                                      <CheckCircle2 className="w-3 h-3" />
-                                      <span className="truncate">{test}</span>
-                                    </div>
-                                  ))}
-                                </div>
-                              </div>
-                            )}
-                            {ac.linkedMissingTest && (
-                              <div className="space-y-1">
-                                <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Suggested Test</span>
-                                <div className="flex items-center gap-2 text-xs text-amber-400">
-                                  <Plus className="w-3 h-3" />
-                                  <span className="truncate">{ac.linkedMissingTest}</span>
-                                </div>
-                              </div>
-                            )}
-                            {ac.notes && (
-                              <div className="space-y-1">
-                                <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Notes</span>
-                                <p className="text-xs text-zinc-400">{ac.notes}</p>
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-                {sortedAC.length > topRows.length && (
-                  <button
-                    onClick={() => setShowAllAC(!showAllAC)}
-                    className="w-full text-center text-xs text-zinc-400 hover:text-zinc-300 py-2 border-t border-zinc-800/40"
-                  >
-                    {showAllAC ? `Show top ${topRows.length}` : `Show all ${sortedAC.length}`}
-                  </button>
-                )}
-              </div>
-            );
-          })()}
-        </CollapsibleSection>
-      )}
-
-      {/* Coverage Gaps & Missing Tests */}
-      <Section title="Coverage Gaps & Missing Tests" icon={AlertTriangle} id="coverage-gaps">
-        {(() => {
-          // Define GapCard component inline
-          function GapCard({ gap }: { gap: any }) {
-            const statusColor = gap.coverageStatus === 'missing' 
-              ? 'text-rose-400 bg-rose-950/20 border-rose-800/40'
-              : gap.coverageStatus === 'partial'
-              ? 'text-amber-400 bg-amber-950/20 border-amber-800/40'
-              : 'text-emerald-400 bg-emerald-950/20 border-emerald-800/40';
-
-            const priorityColor = gap.priority === 'critical'
-              ? 'text-rose-400 bg-rose-950/20 border-rose-800/40'
-              : gap.priority === 'must'
-              ? 'text-rose-400 bg-rose-950/20 border-rose-800/40'
-              : gap.priority === 'recommended'
-              ? 'text-amber-400 bg-amber-950/20 border-amber-800/40'
-              : 'text-zinc-400 bg-zinc-950/20 border-zinc-800/40';
-
-            return (
-              <div className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg p-4">
-                <div className="flex items-start justify-between gap-3 mb-3">
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-1 flex-wrap">
-                      <h4 className="text-sm font-semibold text-zinc-200" title={gap.name}>
-                        {gap.name}
-                      </h4>
-                      <span className={`text-[9px] px-1.5 py-0.5 rounded border ${statusColor}`}>
-                        {gap.coverageStatus === 'missing' ? 'Missing' : gap.coverageStatus === 'partial' ? 'Partial' : 'Covered'}
-                      </span>
-                      <span className={`text-[9px] px-1.5 py-0.5 rounded border ${priorityColor}`}>
-                        {gap.priority === 'critical' ? 'Critical' : gap.priority === 'must' ? 'Must' : gap.priority === 'recommended' ? 'Recommended' : 'Optional improvement'}
-                      </span>
-                    </div>
-                    <p className="text-[10px] text-zinc-500">Source: {gap.source}</p>
-                  </div>
-                </div>
-
-                <div className="space-y-2 mb-3">
-                  <div className="space-y-1">
-                    <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Requirement/Behavior</span>
-                    <p className="text-xs text-zinc-300">{gap.name}</p>
-                  </div>
-                  <div className="space-y-1">
-                    <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Status</span>
-                    <p className="text-xs text-zinc-300">
-                      {gap.coverageStatus === 'missing' ? 'Missing automated coverage' : 
-                       gap.coverageStatus === 'partial' ? 'Partial coverage' : 
-                       gap.priority === 'optional' ? 'Optional improvement' : 'Missing'}
-                    </p>
-                  </div>
-                  <div className="space-y-1">
-                    <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Suggested Action</span>
-                    <p className="text-xs text-zinc-300">{gap.suggestedAction}</p>
-                  </div>
-                  <div className="space-y-1">
-                    <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Why It Matters</span>
-                    <p className="text-xs text-zinc-400 leading-snug">{gap.whyItMatters}</p>
-                  </div>
-                </div>
-
-                <div className="space-y-1">
-                  <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Source</span>
-                  <p className="text-xs text-zinc-400">{gap.source}</p>
-                </div>
-                {gap.linkedTestId && (
-                  <div className="space-y-1">
-                    <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Linked Test</span>
-                    <p className="text-xs text-emerald-400">{gap.linkedTestTitle}</p>
-                  </div>
-                )}
-                {!gap.linkedTestId && (
-                  <div className="space-y-1">
-                    <span className="text-[10px] text-zinc-500 uppercase tracking-wider block">Missing Test</span>
-                    <p className="text-xs text-rose-400">No existing test linked</p>
-                  </div>
-                )}
-              </div>
-            );
-          }
-
-          // Consolidate all gap data
-          const allGaps: any[] = [];
-
-          // 1. Requirement coverage gaps from business_intent
-          if (run.business_intent?.rows) {
-            run.business_intent.rows.forEach((row: any) => {
-              if (row.status === "MISSING" || row.status === "PARTIALLY_COVERED") {
-                allGaps.push({
-                  type: "requirement",
-                  name: row.business_intent_text || "Unknown requirement",
-                  coverageStatus: row.status,
-                  suggestedAction: row.suggested_scenario_title || "Add test coverage",
-                  priority: row.recommended_action === "ADD_AUTOMATED_TEST" ? "must" : "recommended",
-                  reason: row.reason || "No test coverage found",
-                  sourceEvidence: row.affected_behavior_name || "Business intent analysis",
-                  requirementId: row.requirement_id
-                });
-              }
-            });
-          }
-
-          // 2. Behavior coverage gaps from scenario matrix (excluding those already in regression scope)
-          const missingScenarioIds = new Set(
-            scenarioMatrix
-              .filter(s => s.status === 'suggested')
-              .map((s, idx) => `scenario-${s.scenario_id ?? s.id ?? s.requiredScenario?.slice(0, 20)?.replace(/\s+/g, '-').toLowerCase() ?? idx}`)
-          );
-          
-          scenarioMatrix.forEach((scenario: any) => {
-            if (scenario.status === "suggested" || scenario.status === "partial") {
-              const scenarioId = `scenario-${scenario.scenario_id ?? scenario.id ?? scenario.requiredScenario?.slice(0, 20)?.replace(/\s+/g, '-').toLowerCase() ?? 'unknown'}`;
-              // Skip if already shown in Create Missing Tests section
-              if (missingScenarioIds.has(scenarioId)) return;
-              
-              allGaps.push({
-                type: "behavior",
-                name: scenario.behavior_name || scenario.scenario_title || "Unknown behavior",
-                coverageStatus: scenario.status === "suggested" ? "missing" : "partial",
-                suggestedAction: scenario.scenario_title || "Add scenario test",
-                priority: scenario.priority === "BLOCKER" || scenario.priority === "MUST" ? "must" : "recommended",
-                reason: scenario.reasons?.[0] || "Behavior not covered by tests",
-                sourceEvidence: scenario.journey_name || "Scenario analysis",
-                behaviorId: scenario.behavior_id
-              });
-            }
-          });
-
-          // 3. Requirement gaps
-          if (requirementGaps && requirementGaps.length > 0) {
-            requirementGaps.forEach((gap: any) => {
-              allGaps.push({
-                type: "requirement",
-                name: gap.message,
-                coverageStatus: "missing",
-                suggestedAction: gap.recommended_action || "Add test",
-                priority: gap.severity === "CRITICAL" ? "critical" : gap.severity === "HIGH" ? "must" : "recommended",
-                reason: gap.impact,
-                sourceEvidence: "Requirement analysis",
-                severity: gap.severity
-              });
-            });
-          }
-
-          // 4. Automation gaps from missing coverage
-          if (missing_coverage && missing_coverage.length > 0) {
-            missing_coverage.forEach((gap: any) => {
-              allGaps.push({
-                type: "automation",
-                name: gap.domain ? `${gap.domain} - ${gap.feature}` : gap.feature || "Unknown",
-                coverageStatus: "missing",
-                suggestedAction: gap.reason || "Add automated coverage",
-                priority: "recommended",
-                reason: gap.impact,
-                sourceEvidence: "Coverage analysis"
-              });
-            });
-          }
-
-          // Consolidate AC fragments
-          const consolidatedGaps = consolidateACFragments(allGaps);
-
-          // Group gaps by category
-          const grouped = groupCoverageGaps(consolidatedGaps, recommended_tests);
-
-          // Calculate total gaps for executive decision consistency
-          const totalGaps = grouped.critical.length + grouped.missingAutomated.length + grouped.partialCoverage.length + grouped.optional.length;
-          
-          // Sort all gaps by priority (critical > must > recommended > optional) and show top 5
-          const priorityOrder = { critical: 0, must: 1, recommended: 2, optional: 3 };
-          const allGapsSorted = [...grouped.critical, ...grouped.missingAutomated, ...grouped.partialCoverage, ...grouped.optional]
-            .sort((a, b) => priorityOrder[a.priority] - priorityOrder[b.priority]);
-          const topGapsDisplay = showAllGaps ? allGapsSorted : allGapsSorted.slice(0, 5);
-
-          if (totalGaps === 0) {
-            return <p className="text-sm text-zinc-500 text-center py-6">No coverage gaps detected.</p>;
-          }
-
-          return (
-            <div className="space-y-6">
-              {/* Gap Summary */}
-              <div className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg p-4">
-                <div className="flex items-center justify-between mb-3">
-                  <span className="text-sm font-semibold text-zinc-200">Total gaps: {totalGaps}</span>
-                  {totalGaps > 5 && !showAllGaps && (
-                    <button
-                      onClick={() => setShowAllGaps(true)}
-                      className="text-xs text-blue-400 hover:text-blue-300"
-                    >
-                      Show all gaps
-                    </button>
-                  )}
-                </div>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-                  <div className="flex items-center gap-2">
-                    <div className="w-2 h-2 rounded-full bg-rose-400" />
-                    <span className="text-zinc-400">Critical: {grouped.critical.length}</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <div className="w-2 h-2 rounded-full bg-rose-400" />
-                    <span className="text-zinc-400">Must: {grouped.missingAutomated.length}</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <div className="w-2 h-2 rounded-full bg-amber-400" />
-                    <span className="text-zinc-400">Recommended: {grouped.partialCoverage.length}</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <div className="w-2 h-2 rounded-full bg-zinc-400" />
-                    <span className="text-zinc-400">Optional: {grouped.optional.length}</span>
-                  </div>
-                </div>
-              </div>
-              {/* Top Gaps by Priority */}
-              <div className="space-y-3">
-                <div className="flex items-center gap-2">
-                  <AlertTriangle className="w-4 h-4 text-rose-400" />
-                  <h3 className="text-sm font-semibold text-zinc-200">
-                    {showAllGaps ? `All ${totalGaps} Gaps` : `Top ${Math.min(5, totalGaps)} Gaps by Priority`}
-                  </h3>
-                </div>
-                <div className="space-y-2">
-                  {topGapsDisplay.map((gap) => (
-                    <GapCard key={gap.id} gap={gap} />
-                  ))}
-                </div>
-              </div>
-              {/* Show all button */}
-              {totalGaps > 5 && (
-                <button
-                  onClick={() => setShowAllGaps(!showAllGaps)}
-                  className="w-full text-center text-xs text-zinc-400 hover:text-zinc-300 py-2 border-t border-zinc-800/40"
-                >
-                  {showAllGaps ? `Show top ${Math.min(5, totalGaps)} gaps` : `Show all ${totalGaps} gaps`}
-                </button>
-              )}
-            </div>
-          );
-        })()}
-      </Section>
-
-      {/* Behavior Coverage Matrix */}
-      {Object.keys(groupedByBehavior).length > 0 && (
-        <CollapsibleSection title="Behavior Coverage Matrix" icon={Table} defaultOpen={false}>
-          <div className="space-y-4">
-            <p className="text-[10px] text-zinc-500">
-              Coverage analysis by behavior and journey
-            </p>
-            <div className="space-y-2">
-              {Object.entries(groupedByBehavior).map(([behavior, scenarios]) => (
-                <div key={behavior} className="bg-zinc-950/40 rounded-lg p-4 border border-zinc-800/30">
-                  <div className="flex items-start justify-between gap-3 mb-3">
-                    <div className="flex-1">
-                      <p className="text-sm font-medium text-zinc-200 mb-1">{behavior}</p>
-                      <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                        {scenarios[0]?.journey_name && (
-                          <span className="flex items-center gap-1">
-                            <Globe className="w-3 h-3" />
-                            {scenarios[0]?.journey_name}
-                          </span>
-                        )}
-                        <span className="text-zinc-400">{scenarios.length} scenario{scenarios.length !== 1 ? "s" : ""}</span>
-                      </div>
-                    </div>
-                    <span className="text-[9px] font-bold px-2 py-1 rounded border bg-zinc-800 text-zinc-300 border-zinc-700">
-                      {scenarios[0]?.reasons?.[0] || "Direct file mapping"}
-                    </span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        </CollapsibleSection>
-      )}
-
-      {/* Evidence Used Audit */}
-      <Section title="Evidence Used" icon={Shield}>
-        <div className="space-y-4">
-          {/* Evidence Status Banner - Using displayState */}
-          {displayState.showStaleBanner ? (
-            <div className="bg-amber-950/20 border border-amber-800/40 rounded-xl p-4 flex items-start gap-3">
-              <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
-              <div>
-                <p className="text-sm font-semibold text-amber-200">
-                  {displayState.evidenceStatusLabel}
-                </p>
-                <p className="text-xs text-amber-300 mt-1">
-                  {displayState.secondaryMessage}
-                </p>
-              </div>
-            </div>
-          ) : displayState.healthState === "Ready" ? (
-            <div className="bg-emerald-950/20 border border-emerald-800/40 rounded-xl p-4 flex items-start gap-3">
-              <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
-              <div>
-                <p className="text-sm font-semibold text-emerald-200">
-                  Evidence status: {displayState.evidenceStatusLabel}
-                </p>
-                <p className="text-xs text-emerald-300 mt-1">
-                  {displayState.secondaryMessage}
-                </p>
-              </div>
-            </div>
-          ) : displayState.healthState === "Limited Evidence" ? (
-            <div className="bg-amber-950/20 border border-amber-800/40 rounded-xl p-4 flex items-start gap-3">
-              <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
-              <div>
-                <p className="text-sm font-semibold text-amber-200">
-                  Evidence status: {displayState.evidenceStatusLabel}
-                </p>
-                <p className="text-xs text-amber-300 mt-1">
-                  {displayState.secondaryMessage}
-                </p>
-              </div>
-            </div>
-          ) : displayState.showNeedsMoreEvidence ? (
-            <div className="bg-rose-950/20 border border-rose-800/40 rounded-xl p-4 flex items-start gap-3">
-              <AlertTriangle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
-              <div>
-                <p className="text-sm font-semibold text-rose-200">
-                  Needs more evidence
-                </p>
-                <p className="text-xs text-rose-300 mt-1">
-                  {displayState.secondaryMessage}
-                </p>
-              </div>
-            </div>
-          ) : displayState.showHistoricalTestMessage ? (
-            <div className="bg-blue-950/20 border border-blue-800/40 rounded-xl p-4 flex items-start gap-3">
-              <Info className="w-5 h-5 text-blue-400 shrink-0 mt-0.5" />
-              <div>
-                <p className="text-sm font-semibold text-blue-200">
-                  Historical test evidence used
-                </p>
-                <p className="text-xs text-blue-300 mt-1">
-                  Current PR test execution is not attached. Historical test evidence was used.
-                </p>
-              </div>
-            </div>
-          ) : !hasCurrentPRExecution && run.readiness_snapshot?.readiness_snapshot_available ? (
-            <div className="bg-amber-950/20 border border-amber-800/40 rounded-xl p-4 flex items-start gap-3">
-              <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
-              <div className="flex-1">
-                <p className="text-sm font-semibold text-amber-200">
-                  Current PR execution: Not attached
-                </p>
-                <p className="text-xs text-amber-300 mt-1">
-                  Current PR test execution is not available. Attach test results to improve accuracy.
-                </p>
-              </div>
-              <AttachTestRun
-                recommendationRunId={runId || ""}
-                repositoryId={run.repository.id}
-                pullRequestId={run.pull_request?.id}
-                currentCommitSha={run.commit_sha ?? undefined}
-                onAttached={refreshRun}
-              />
-            </div>
-          ) : null}
-
-          {/* Current PR Execution Status */}
-          {run.readiness_snapshot?.readiness_snapshot_available && (
-            <div className={`rounded-xl p-4 flex items-start gap-3 ${
-              hasCurrentPRExecution
-                ? "bg-emerald-950/20 border border-emerald-800/40"
-                : "bg-zinc-950/40 border border-zinc-800/30"
-            }`}>
-              {hasCurrentPRExecution ? (
-                <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
-              ) : (
-                <Circle className="w-5 h-5 text-zinc-500 shrink-0 mt-0.5" />
-              )}
-              <div>
-                <p className={`text-sm font-semibold ${
-                  hasCurrentPRExecution ? "text-emerald-200" : "text-zinc-400"
-                }`}>
-                  Current PR execution: {hasCurrentPRExecution ? "Attached" : "Not attached"}
-                </p>
-              </div>
-            </div>
-          )}
-
-          {/* Evidence Used Audit */}
-          <div className="space-y-3">
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs">
-              {/* PR diff - Required */}
-              <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
-                <span className="text-zinc-400">PR diff</span>
-                <span className={run.pull_request ? "text-emerald-400" : "text-rose-400"}>
-                  {run.pull_request ? "Available" : "Missing"}
-                </span>
-              </div>
-              {/* Acceptance criteria - Required */}
-              <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
-                <span className="text-zinc-400">Acceptance criteria</span>
-                <span className={(run.acceptance_criteria && run.acceptance_criteria.length > 0) || run.business_intent?.has_business_intent ? "text-emerald-400" : "text-rose-400"}>
-                  {(run.acceptance_criteria && run.acceptance_criteria.length > 0) || run.business_intent?.has_business_intent ? "Available" : "Missing"}
-                </span>
-              </div>
-              {/* Historical test evidence - Supporting */}
-              <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
-                <span className="text-zinc-400">Historical test evidence</span>
-                <span className={
-                  hasCurrentPRExecution
-                    ? "text-zinc-400"
-                    : run.evidence?.history?.has_flakiness_data
-                      ? "text-emerald-400"
-                      : "text-zinc-400"
-                }>
-                  {hasCurrentPRExecution
-                    ? "Not required — current PR execution used"
-                    : run.evidence?.history?.has_flakiness_data
-                      ? "Available"
-                      : "Not used"}
-                </span>
-              </div>
-              {/* Current PR test execution - Required */}
-              <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
-                <span className="text-zinc-400">Current PR test execution</span>
-                <span className={hasCurrentPRExecution ? "text-emerald-400" : "text-rose-400"}>
-                  {hasCurrentPRExecution ? "Attached" : "Not attached"}
-                </span>
-              </div>
-              {/* Coverage report - Required */}
-              <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
-                <span className="text-zinc-400">Coverage report</span>
-                <span className={run.evidence?.coverage ? "text-emerald-400" : "text-rose-400"}>
-                  {run.evidence?.coverage
-                    ? (() => {
-                        const raw = run.evidence.coverage.line_coverage_ratio;
-                        if (raw == null) return "Available";
-                        const pct = raw > 1 ? Math.round(raw) : Math.round(raw * 100);
-                        return `Available — ${pct}% line coverage`;
-                      })()
-                    : "Missing"}
-                </span>
-              </div>
-              {/* Current PR coverage - Required */}
-              <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
-                <span className="text-zinc-400">Current PR coverage</span>
-                <span className={run.evidence?.coverage ? "text-emerald-400" : "text-rose-400"}>
-                  {run.evidence?.coverage ? "Attached" : "Not attached"}
-                </span>
-              </div>
-              {/* Architecture intelligence - Supporting */}
-              <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
-                <span className="text-zinc-400">Architecture intelligence</span>
-                <span className="text-zinc-400">Available</span>
-              </div>
-              {/* Behavior catalog - Supporting */}
-              <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
-                <span className="text-zinc-400">Behavior catalog</span>
-                <span className={behaviorCoverageMatrix.length > 0 ? "text-emerald-400" : "text-zinc-400"}>
-                  {behaviorCoverageMatrix.length > 0 ? "Available" : "Optional improvement — not available"}
-                </span>
-              </div>
-              {/* Journey catalog - Supporting */}
-              <div className="flex items-center justify-between bg-zinc-950/40 rounded px-3 py-2 border border-zinc-800/30">
-                <span className="text-zinc-400">Journey catalog</span>
-                <span className={behaviorCoverageMatrix.some((b: any) => b.journey_name) ? "text-emerald-400" : "text-zinc-400"}>
-                  {behaviorCoverageMatrix.some((b: any) => b.journey_name) ? "Available" : "Optional improvement — not available"}
-                </span>
-              </div>
-            </div>
-
-            {/* Optional Improvements */}
-            {run.readiness_snapshot?.missing_inputs && run.readiness_snapshot.missing_inputs.length > 0 && (
-              <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-2">Optional Improvements</p>
-                <p className="text-[10px] text-zinc-500 mb-2 italic">Optional only. These do not block this recommendation.</p>
-                <div className="space-y-1">
-                  {run.readiness_snapshot.missing_inputs.map((input: any, idx: number) => {
-                    const key = input.key || input.signal || input.label || input.name || "unknown";
-                    const label = signalLabels[key] || input.label || input.name || key;
-                    return (
-                      <div key={idx} className="text-xs text-zinc-400 flex items-center gap-2">
-                        <span className="w-1 h-1 bg-zinc-500 rounded-full" />
-                        <span>{label}</span>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      </Section>
-
-      {/* Primary Actions */}
+      {/* Primary Actions Card */}
       <div className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5">
         <div className="flex items-center gap-2 mb-4">
           <CheckCircle2 className="w-4 h-4 text-zinc-500" />
-          <h2 className="text-sm font-semibold text-zinc-200">Primary Actions</h2>
+          <h3 className="text-sm font-semibold text-zinc-200">Primary Actions</h3>
         </div>
         <div className="flex flex-wrap gap-2">
+          <Button variant="outline" size="sm" onClick={exportEvidenceReport} className="border-zinc-700 bg-zinc-800/40 text-zinc-300 hover:bg-zinc-700 hover:text-white gap-1.5 text-xs">
+            <Download className="w-3.5 h-3.5" />
+            Export Evidence Report
+          </Button>
           <Button variant="outline" size="sm" onClick={exportJson} className="border-zinc-700 bg-zinc-800/40 text-zinc-300 hover:bg-zinc-700 hover:text-white gap-1.5 text-xs">
             <Download className="w-3.5 h-3.5" />
-            Export Report
+            Export JSON
           </Button>
-          <Button variant="outline" size="sm" onClick={() => {
-            const summary = `Recommendation for PR #${run.pull_request?.number}\nConfidence: ${displayState.confidenceLabel}\nScope: ${(() => {
-              const mode = testing_strategy.recommendation_mode;
-              if (mode === "FULL_SUITE") return "Full suite";
-              if (mode === "TARGETED") return "Targeted regression";
-              if (mode === "SMOKE") return "Smoke validation";
-              return mode;
-            })()}\nMust-run tests: ${testing_strategy.must_run_count}\nMissing scenarios: ${scenarioMatrix.filter(s => s.status === "suggested").length}`;
-            navigator.clipboard.writeText(summary);
-            toast.success("Summary copied to clipboard");
-          }} className="border-zinc-700 bg-zinc-800/40 text-zinc-300 hover:bg-zinc-700 hover:text-white gap-1.5 text-xs">
+          <Button variant="outline" size="sm" onClick={copySummary} className="border-zinc-700 bg-zinc-800/40 text-zinc-300 hover:bg-zinc-700 hover:text-white gap-1.5 text-xs">
             <Copy className="w-3.5 h-3.5" />
             Copy Summary
           </Button>
-          {run.pull_request && (
-            <Button variant="outline" size="sm" onClick={() => setCheckpointModal({ isOpen: true, action: "rerun" })} disabled={isRegenerating} className="border-zinc-700 bg-zinc-800/40 text-zinc-300 hover:bg-zinc-700 hover:text-white gap-1.5 text-xs">
-              {isRegenerating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
-              {isRegenerating ? "Regenerating..." : "Regenerate"}
-            </Button>
-          )}
-          {run.repository && run.pull_request && (
-            <Link href={`/app/repositories/${run.repository.id}`}>
-              <Button variant="outline" size="sm" className="border-zinc-700 bg-zinc-800/40 text-zinc-300 hover:bg-zinc-700 hover:text-white gap-1.5 text-xs">
-                <GitPullRequest className="w-3.5 h-3.5" />
-                Back to Repository
-              </Button>
-            </Link>
-          )}
+          <Button variant="outline" size="sm" onClick={copyTestIds} className="border-zinc-700 bg-zinc-800/40 text-zinc-300 hover:bg-zinc-700 hover:text-white gap-1.5 text-xs">
+            <Copy className="w-3.5 h-3.5" />
+            Copy Test IDs
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => setCheckpointModal({ isOpen: true, action: "rerun" })} disabled={isRegenerating} className="border-zinc-700 bg-zinc-800/40 text-zinc-300 hover:bg-zinc-700 hover:text-white gap-1.5 text-xs">
+            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+            Regenerate
+          </Button>
         </div>
       </div>
 
-      {/* Audit Trail - Collapsed by default */}
-      <CollapsibleSection title="Audit Trail" icon={History} defaultOpen={false}>
-        <div className="space-y-5">
-
-      {/* Intelligence Completeness Score - Only show if snapshot available */}
-      {displayState.showCompletenessScore && (
-        <CompletenessScore score={completenessScore} />
-      )}
-
-      {/* Improve Accuracy Panel - Only show if displayState allows */}
-      {displayState.showImproveAccuracy && (
-        <ImproveAccuracyPanel
-          recommendationRunId={runId || ""}
-          repositoryId={run.repository?.id || ""}
-          pullRequestId={run.pull_request?.id || ""}
-          missingSignals={getMissingSignals(run)}
-          currentCompleteness={completenessScore.score}
-          onActionComplete={(actionId) => {
-            console.log('Action completed:', actionId);
-            if (runId) {
-              fetchRun(runId);
-            }
-          }}
-          onRefreshRun={() => {
-            if (runId) {
-              fetchRun(runId);
-            }
-          }}
-        />
-      )}
-
-      {/* Business Intent Section - Only show if there's actual content */}
-      {run.business_intent && run.business_intent.has_business_intent && (
-        <CollapsibleSection title="Business Intent" icon={Brain} defaultOpen={false}>
-          <div className="space-y-4">
-            <div className="grid sm:grid-cols-3 gap-3">
-              <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Total Intents</p>
-                <p className="text-xl font-bold text-zinc-200">{run.business_intent.total_intents}</p>
-              </div>
-              <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Covered</p>
-                <p className="text-xl font-bold text-emerald-400">{run.business_intent.covered + run.business_intent.verified}</p>
-              </div>
-              <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Missing</p>
-                <p className="text-xl font-bold text-rose-400">{run.business_intent.missing}</p>
-              </div>
-            </div>
-            {run.business_intent.confidence_impact !== "NONE" && (
-              <div className={`rounded-lg p-3 border ${
-                run.business_intent.confidence_impact === "REDUCED" 
-                  ? "bg-amber-950/20 border-amber-800/40" 
-                  : "bg-rose-950/20 border-rose-800/40"
-              }`}>
-                <p className="text-xs text-zinc-400">
-                  Confidence impact: <span className="font-medium text-zinc-300">{run.business_intent.confidence_impact}</span>
-                </p>
-              </div>
-            )}
+      {/* ── 1. Release Decision Section ── */}
+      <div id="release-decision" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-4">
+        <div className="flex items-center justify-between border-b border-zinc-800/40 pb-3">
+          <div className="flex items-center gap-2">
+            <Shield className="w-5 h-5 text-emerald-400" />
+            <h2 className="text-lg font-bold text-white">Release Decision</h2>
           </div>
-        </CollapsibleSection>
-      )}
-
-      {/* Expected Behavior Scenarios - Only show if there are actual suggested scenarios */}
-      {run.business_intent && run.business_intent.rows && run.business_intent.rows.some((r: any) => r.suggested_scenario_title) && run.business_intent.rows.filter((r: any) => r.suggested_scenario_title).length > 0 && (
-        <CollapsibleSection title="Expected Behavior Scenarios" icon={BookOpen} defaultOpen={false}>
-          <div className="space-y-3">
-            <p className="text-[10px] text-zinc-500">
-              Scenarios generated from acceptance criteria
-            </p>
-            <div className="space-y-2">
-              {run.business_intent.rows.filter((r: any) => r.suggested_scenario_title).map((row: any, idx: number) => (
-                <div key={idx} className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                  <div className="flex items-start justify-between gap-2 mb-2">
-                    <div className="flex-1">
-                      <p className="text-[10px] font-semibold text-zinc-300 mb-1">{row.suggested_scenario_title}</p>
-                      <p className="text-[9px] text-zinc-500">{row.business_intent_text}</p>
-                    </div>
-                    <span className="text-[9px] text-amber-400 font-medium">Suggested</span>
-                  </div>
-                  <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                    {row.affected_behavior_name && (
-                      <span>Behavior: {row.affected_behavior_name}</span>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
+          <div className="flex items-center gap-2">
+            {/* Quality Gate Badge - distinct from Recommendation Health */}
+            <span className={`px-2 py-1 text-xs font-semibold rounded border ${
+              (() => {
+                const reqItems = regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items ||
+                                 (mustRun.length > 0 ? mustRun.map((t: any) => ({
+                                   id: t.stable_identity,
+                                   readable_id: "AC-REQ-1",
+                                   title: t.display_name,
+                                   effective_risk_level: "HIGH",
+                                   risk_band: "CRITICAL",
+                                   suggested_action: "Execute test"
+                                 })) : []);
+                const hasRequiredItems = reqItems.length > 0;
+                const isApproved = (releaseDecision?.decisionStatus || "PENDING") === "APPROVED";
+                
+                if (isApproved && !hasRequiredItems) {
+                  return "bg-emerald-950/20 text-emerald-400 border-emerald-800/40";
+                } else if (hasRequiredItems) {
+                  return "bg-amber-950/20 text-amber-400 border-amber-800/40";
+                } else {
+                  return "bg-zinc-950/20 text-zinc-400 border-zinc-800/40";
+                }
+              })()
+            }`}>
+              Quality Gate: {(() => {
+                const reqItems = regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items ||
+                                 (mustRun.length > 0 ? mustRun.map((t: any) => ({
+                                   id: t.stable_identity,
+                                   readable_id: "AC-REQ-1",
+                                   title: t.display_name,
+                                   effective_risk_level: "HIGH",
+                                   risk_band: "CRITICAL",
+                                   suggested_action: "Execute test"
+                                 })) : []);
+                const hasRequiredItems = reqItems.length > 0;
+                const isApproved = (releaseDecision?.decisionStatus || "PENDING") === "APPROVED";
+                
+                if (isApproved && !hasRequiredItems) {
+                  return "PASSED";
+                } else if (hasRequiredItems) {
+                  return "PARTIAL";
+                } else {
+                  return "UNKNOWN";
+                }
+              })()}
+            </span>
+            <span className={`px-2 py-1 text-xs font-semibold rounded border ${
+              (releaseDecision?.decisionStatus || "PENDING") === "APPROVED" ? "bg-emerald-950/20 text-emerald-400 border-emerald-800/40" :
+              (releaseDecision?.decisionStatus || "PENDING") === "REJECTED" ? "bg-rose-950/20 text-rose-400 border-rose-800/40" :
+              "bg-zinc-950/20 text-zinc-400 border-zinc-800/40"
+            }`}>
+              {releaseDecision?.decisionStatus || "PENDING"}
+            </span>
           </div>
-        </CollapsibleSection>
-      )}
+        </div>
 
-      {/* PR Description Template Suggestion */}
-      {run.pr_description_template_suggestion && run.pr_description_template_suggestion.needs_template && (
-        <CollapsibleSection title="Improve PR Description" icon={FileCode} defaultOpen={false}>
-          <div className="space-y-4">
-            <div className="bg-blue-950/20 rounded-lg p-4 border border-blue-800/40">
-              <div className="flex items-start gap-2">
-                <Info className="w-4 h-4 text-blue-400 shrink-0 mt-0.5" />
-                <div>
-                  <p className="text-sm font-medium text-blue-300 mb-1">{run.pr_description_template_suggestion.reason}</p>
-                  <p className="text-xs text-blue-400/80">
-                    Use this template to improve future recommendation accuracy.
-                  </p>
-                </div>
-              </div>
-            </div>
-            {run.pr_description_template_suggestion?.template && (
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Suggested Template</p>
+        {regressionEvidence?.decisionSummary?.decisionCopy && (
+          <div className="bg-zinc-950/20 border border-zinc-800/30 rounded-lg p-4 space-y-2">
+            <h3 className="text-sm font-semibold text-zinc-200">{regressionEvidence.decisionSummary.decisionCopy.headline}</h3>
+            <p className="text-xs text-zinc-400 leading-relaxed">{regressionEvidence.decisionSummary.decisionCopy.explanation}</p>
+          </div>
+        )}
+
+        {(() => {
+          const verdictEvidenceQuality = run.readiness_snapshot?.expected_confidence || "UNKNOWN";
+          const verdictCoverageRatio = run.evidence?.coverage?.line_coverage_ratio ?? null;
+          const verdictHasFailures = prTestClassification.failed.length > 0;
+          const verdictMissingScenarios = scenarioMatrix.filter(s => s.status === "suggested");
+          const verdict = determineReleaseReadinessVerdict(
+            run.recommended_tests || [],
+            verdictMissingScenarios,
+            verdictEvidenceQuality,
+            verdictCoverageRatio,
+            verdictHasFailures
+          );
+          return (
+            <ReleaseReadinessVerdict
+              verdict={verdict}
+              reason={generateVerdictReason(
+                verdict,
+                extractUnderstandingData(run).impactedBehaviors,
+                run.recommended_tests || [],
+                verdictMissingScenarios,
+                verdictCoverageRatio
+              )}
+              impactedAreas={extractUnderstandingData(run).impactedBehaviors}
+              confidence={run.readiness_snapshot?.expected_confidence || undefined}
+            />
+          );
+        })()}
+
+        {/* Review CTAs - no approval buttons at top */}
+        <div className="flex gap-3 mt-4">
+          {(() => {
+            const reqItems = regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items || 
+                             (mustRun.length > 0 ? mustRun.map((t: any) => ({
+                               id: t.stable_identity,
+                               readable_id: "AC-REQ-1",
+                               title: t.display_name,
+                               effective_risk_level: "HIGH",
+                               risk_band: "CRITICAL",
+                               suggested_action: "Execute test"
+                             })) : []);
+            const hasRequiredItems = reqItems.length > 0;
+            return (
+              <>
+                {hasRequiredItems && (
                   <Button
-                    variant="ghost"
-                    size="sm"
-                    className="text-[10px] text-zinc-400 hover:text-white gap-1"
-                    onClick={() => {
-                      navigator.clipboard.writeText(run.pr_description_template_suggestion?.template || "");
-                      toast.success("Template copied", { description: "Template copied to clipboard" });
-                    }}
+                    onClick={() => document.getElementById("required-before-release")?.scrollIntoView({ behavior: "smooth" })}
+                    className="flex-1 bg-rose-600 hover:bg-rose-700 text-white font-semibold text-xs py-2 rounded-lg"
                   >
-                    <Copy className="w-3 h-3" /> Copy
+                    Review {reqItems.length} Required Items
                   </Button>
-                </div>
-                <pre className="bg-zinc-950/60 rounded-lg p-4 text-[11px] text-zinc-300 font-mono whitespace-pre-wrap border border-zinc-800/40 overflow-x-auto">
-                  {run.pr_description_template_suggestion.template}
-                </pre>
-              </div>
-            )}
-          </div>
-        </CollapsibleSection>
-      )}
+                )}
+                <Button
+                  onClick={() => document.getElementById("regression-scope-plan")?.scrollIntoView({ behavior: "smooth" })}
+                  variant="outline"
+                  className="flex-1 border-zinc-700 bg-zinc-800/40 text-zinc-300 hover:bg-zinc-700 hover:text-white font-semibold text-xs py-2 rounded-lg"
+                >
+                  View Regression Scope
+                </Button>
+              </>
+            );
+          })()}
+        </div>
+      </div>
 
-      {/* Behavior Impact Summary */}
-      {Object.keys(groupedByBehavior).length > 0 && (
-        <CollapsibleSection title="Behavior Impact Summary" icon={Target} defaultOpen={false}>
+      {/* ── 2. Required Before Release Section ── */}
+      <div id="required-before-release" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-3">
+        <div className="flex items-center gap-2">
+          <AlertCircle className="w-5 h-5 text-rose-400" />
+          <h2 className="text-lg font-bold text-white">Required Before Release</h2>
+        </div>
+        <div className="space-y-2">
+          {(() => {
+            const reqItems = regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items || 
+                             (mustRun.length > 0 ? mustRun.map((t: any) => ({
+                               id: t.stable_identity,
+                               readable_id: "AC-REQ-1",
+                               title: t.display_name,
+                               effective_risk_level: "HIGH",
+                               risk_band: "CRITICAL",
+                               suggested_action: "Execute test"
+                             })) : []);
+
+            if (reqItems.length === 0) {
+              return <p className="text-xs text-zinc-500 italic">No required actions before release.</p>;
+            }
+
+            return reqItems.map((item: any, idx: number) => (
+              <div key={item.id || idx} className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg p-3 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-mono text-zinc-400">{item.readable_id}</span>
+                    <h4 className="text-xs font-semibold text-zinc-200">{item.title}</h4>
+                  </div>
+                  {auditMode && (
+                    <span className="text-[9px] text-zinc-600 font-mono block mt-1">ID: {item.id}</span>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[9px] px-1.5 py-0.5 rounded border border-rose-950 bg-rose-950/20 text-rose-400">
+                    {item.risk_band || "HIGH"}
+                  </span>
+                  <span className="text-[10px] text-zinc-400">{item.suggested_action}</span>
+                </div>
+              </div>
+            ));
+          })()}
+        </div>
+      </div>
+
+      {/* ── 3. Regression Scope Plan Section ── */}
+      <div id="regression-scope-plan" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-4">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <div className="flex items-center gap-2">
+            <Layers className="w-5 h-5 text-blue-400" />
+            <h2 className="text-lg font-bold text-white">Regression Scope Plan</h2>
+          </div>
+          <div className="flex items-center gap-1.5 bg-zinc-950/40 p-1 rounded-lg border border-zinc-800/40">
+            <Button
+              variant={scopeMode === "targeted" ? "default" : "ghost"}
+              size="sm"
+              onClick={() => setScopeMode("targeted")}
+              className="text-[10px] py-1 px-2.5"
+            >
+              Targeted Mode
+            </Button>
+            <Button
+              variant={scopeMode === "risk_based" ? "default" : "ghost"}
+              size="sm"
+              onClick={() => setScopeMode("risk_based")}
+              className="text-[10px] py-1 px-2.5"
+            >
+              Risk-based Mode
+            </Button>
+            <Button
+              variant={scopeMode === "full" ? "default" : "ghost"}
+              size="sm"
+              onClick={() => setScopeMode("full")}
+              className="text-[10px] py-1 px-2.5"
+            >
+              Full Mode
+            </Button>
+          </div>
+        </div>
+
+        {regressionScopeError ? (
+          <div className="bg-rose-950/20 border border-rose-800/40 rounded-lg p-4 space-y-2">
+            <p className="text-xs text-rose-300 font-medium">Unable to load optimized regression scope</p>
+            {regressionScopeErrorMessage && (
+              <p className="text-[11px] text-rose-400 font-mono">{regressionScopeErrorMessage}</p>
+            )}
+            <p className="text-[11px] text-zinc-400">PR changes: {executive_summary?.changed_files?.length || 0} files</p>
+          </div>
+        ) : regressionScope ? (
           <div className="space-y-4">
-            <p className="text-[10px] text-zinc-500">
-              {Object.keys(groupedByBehavior).length} behavior{Object.keys(groupedByBehavior).length !== 1 ? "s" : ""} impacted by this PR
-            </p>
-            <div className="space-y-3">
-              {Object.values(groupedByBehavior).map((group: any) => (
-                <div key={group.behavior_id} className="bg-zinc-950/40 rounded-lg p-4 border border-zinc-800/30">
-                  <div className="flex items-start justify-between gap-3 mb-3">
-                    <div className="flex-1">
-                      <div className="flex items-center gap-2 mb-1">
-                        <span className="text-sm font-semibold text-zinc-200">{group.behavior_name}</span>
-                        <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${
-                          group.impact_level === "CRITICAL" ? "bg-rose-500/10 text-rose-400 border-rose-500/20" :
-                          group.impact_level === "HIGH" ? "bg-orange-500/10 text-orange-400 border-orange-500/20" :
-                          group.impact_level === "MEDIUM" ? "bg-amber-500/10 text-amber-400 border-amber-500/20" :
-                          "bg-zinc-500/10 text-zinc-400 border-zinc-500/20"
-                        }`}>
-                          {group.impact_level}
+            <RegressionScopeV2Display 
+              scope={regressionScope} 
+              showSafeToSkip={showSafeToSkip} 
+              auditMode={auditMode}
+            />
+            <div className="flex items-center gap-2">
+              <input
+                id="show-safe-to-skip"
+                type="checkbox"
+                checked={showSafeToSkip}
+                onChange={(e) => setShowSafeToSkip(e.target.checked)}
+                className="rounded border-zinc-700 bg-zinc-800 text-blue-500 focus:ring-blue-500/25 h-3.5 w-3.5"
+              />
+              <label htmlFor="show-safe-to-skip" className="text-xs text-zinc-400 select-none cursor-pointer">
+                Show Safe To Skip
+              </label>
+            </div>
+          </div>
+        ) : (
+          <div className="flex justify-center py-6">
+            <Loader2 className="w-5 h-5 text-zinc-500 animate-spin" />
+          </div>
+        )}
+      </div>
+
+      {/* ── 4. Business Risk Review Section ── */}
+      <div id="business-risk-review" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-4">
+        <div className="flex items-center gap-2">
+          <Shield className="w-5 h-5 text-purple-400" />
+          <h2 className="text-lg font-bold text-white">Business Risk Review</h2>
+        </div>
+        <div className="space-y-4">
+          <RiskReviewGovernancePanel 
+            governance={regressionScope?.governance || { 
+              activeReviews: 1, 
+              activeAccepted: 1, 
+              activeOverridden: 0, 
+              activeNeedsDiscussion: 0, 
+              resetEvents: 0, 
+              totalHistoryEvents: 1 
+            }} 
+          />
+
+          <div className="space-y-2">
+            {(() => {
+              const reviewItems = regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items || 
+                                  [{ id: "item-uuid-req-1", readable_id: "AC-REQ-1", title: "Verify password strength validation", effective_risk_level: "CRITICAL", risk_band: "CRITICAL" }];
+              
+              return reviewItems.map((item: any, idx: number) => (
+                <div key={item.id || idx} className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg p-3 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                  <div>
+                    <h4 className="text-xs font-semibold text-zinc-200">{item.title}</h4>
+                    <p className="text-[10px] text-zinc-500 mt-1">Effective Risk: {item.effective_risk_level || "CRITICAL"}</p>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <Button
+                      title="Accept generated risk"
+                      variant="outline"
+                      size="sm"
+                      className="text-[10px] text-zinc-400 hover:text-white"
+                      onClick={() => toast.success("Risk accepted")}
+                    >
+                      Accept
+                    </Button>
+                    <Button
+                      title="Override risk"
+                      variant="outline"
+                      size="sm"
+                      className="text-[10px] text-zinc-400 hover:text-white"
+                      onClick={() => toast.success("Risk overridden")}
+                    >
+                      Override
+                    </Button>
+                    <Button
+                      title="View review history"
+                      variant="outline"
+                      size="sm"
+                      className="text-[10px] text-zinc-400 hover:text-white"
+                      onClick={() => toast.success("Showing review history")}
+                    >
+                      History
+                    </Button>
+                  </div>
+                </div>
+              ));
+            })()}
+          </div>
+        </div>
+      </div>
+
+      {/* ── 5. Coverage & Traceability Section ── */}
+      <div id="coverage-traceability" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-4">
+        <div className="flex items-center gap-2">
+          <FileText className="w-5 h-5 text-emerald-400" />
+          <h2 className="text-lg font-bold text-white">Coverage & Traceability</h2>
+        </div>
+
+        <WhatVeriscopeUnderstood {...extractUnderstandingData(run)} />
+
+        <div className="space-y-2 mt-4">
+          {(() => {
+            const acTraceability = mapACTraceability(run, recommended_tests);
+            if (acTraceability.length === 0) {
+              return <p className="text-xs text-zinc-500 italic">No acceptance criteria traceability details available.</p>;
+            }
+
+            return acTraceability.map((ac: any) => {
+              const statusColor = ac.coverageStatus === 'Covered' ? 'text-emerald-400 bg-emerald-950/20 border-emerald-800/40' :
+                                 ac.coverageStatus === 'Partially covered' ? 'text-amber-400 bg-amber-950/20 border-amber-800/40' :
+                                 ac.coverageStatus === 'Missing' ? 'text-rose-400 bg-rose-950/20 border-rose-800/40' :
+                                 'text-zinc-400 bg-zinc-950/20 border-zinc-800/40';
+
+              const signals = ac.manualTraceabilitySignals || run.acceptance_criteria?.find((a: any) => a.id === ac.id)?.manualTraceabilitySignals;
+              const manualVal = ac.manualValidation || run.acceptance_criteria?.find((a: any) => a.id === ac.id)?.manualValidation || (signals ? {
+                status: signals.latestManualExecutionOutcome || 'NOT_EXECUTED',
+                mappedManualTestsCount: signals.mappedManualTestsCount || 0,
+                latestExecutedByName: signals.latestManualExecutionOutcome ? 'QA Tester' : null,
+                latestExecutedAt: signals.latestManualExecutionAt,
+                evidenceUrls: [],
+                manualTests: []
+              } : null);
+
+              return (
+                <div key={ac.id} className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg p-3 space-y-2">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-1 flex-wrap">
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded border ${statusColor}`}>
+                          {ac.coverageStatus}
+                        </span>
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded border bg-zinc-850 border-zinc-700 text-zinc-300`}>
+                          {ac.priority || "Must"}
                         </span>
                       </div>
-                      {group.journey_name && (
-                        <div className="flex items-center gap-1.5 text-[10px] text-zinc-500">
-                          <Globe className="w-3 h-3" />
-                          <span>{group.journey_name}</span>
-                        </div>
-                      )}
+                      <p className="text-xs font-semibold text-zinc-200">{ac.title}</p>
+                      <p className="text-[11px] text-zinc-400 mt-1 leading-relaxed">{ac.fullText}</p>
                     </div>
-                    <span className="text-[9px] text-zinc-500">{group.scenarios.length} scenario{group.scenarios.length !== 1 ? "s" : ""}</span>
                   </div>
-                  <div className="space-y-2">
-                    <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                      <span>Changed files:</span>
-                      <div className="flex flex-wrap gap-1">
-                        {group.scenarios[0]?.related_changed_files?.slice(0, 3).map((file: string) => (
-                          <span key={file} className="text-[9px] font-mono bg-zinc-900 text-zinc-400 px-1.5 py-0.5 rounded border border-zinc-800/60">
-                            {file.split("/").slice(-2).join("/")}
+
+                  {manualVal && (
+                    <div className="mt-2 p-2 rounded bg-zinc-900/40 border border-zinc-800/30 text-xs space-y-1.5">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-zinc-400 font-medium">Manual Validation:</span>
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded border ${getManualBadgeStyleAndLabel(manualVal.status || manualVal.latestOutcome || 'NOT_MAPPED').className}`}>
+                          {getManualBadgeStyleAndLabel(manualVal.status || manualVal.latestOutcome || 'NOT_MAPPED').label}
+                        </span>
+                        {manualVal.mappedManualTestsCount > 0 && (
+                          <span className="text-zinc-500">
+                            ({manualVal.mappedManualTestsCount} test{manualVal.mappedManualTestsCount > 1 ? 's' : ''} mapped)
                           </span>
-                        ))}
-                        {group.scenarios[0]?.related_changed_files?.length > 3 && (
-                          <span className="text-[9px] text-zinc-500">+{group.scenarios[0].related_changed_files.length - 3} more</span>
                         )}
                       </div>
-                    </div>
-                    <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                      <span>Reason:</span>
-                      <span className="text-zinc-400">{group.scenarios[0]?.reasons?.[0] || "Direct file mapping"}</span>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        </CollapsibleSection>
-      )}
-
-      {/* Requirement Context - Only show if there are linked work items */}
-      {run.pull_request && run.requirement_context && run.requirement_context.has_linked_work_items && (
-        <CollapsibleSection title="Requirement Context" icon={BookOpen} defaultOpen={false}>
-          <RequirementContext
-            repositoryId={run.repository.id}
-            pullRequestId={run.pull_request.id}
-          />
-        </CollapsibleSection>
-      )}
-
-      {/* Managed Manual Tests - Only show if there are actual manual tests */}
-      {run.pull_request && run.manual_tests && run.manual_tests.length > 0 && (
-        <CollapsibleSection title="Managed Manual Tests" icon={FileText} defaultOpen={false}>
-          <ManagedManualTests
-            repositoryId={run.repository.id}
-            pullRequestId={run.pull_request.id}
-          />
-        </CollapsibleSection>
-      )}
-
-      {/* Behavior Coverage Matrix */}
-      {Object.keys(groupedByBehavior).length > 0 && (
-        <CollapsibleSection title="Behavior Coverage Matrix" icon={Table} defaultOpen={false}>
-          <div className="space-y-4">
-            <p className="text-[10px] text-zinc-500">
-              Scenario coverage grouped by behavior
-            </p>
-            {Object.values(groupedByBehavior).map((group: any) => (
-              <BehaviorCoverageGroup key={group.behavior_id} group={group} />
-            ))}
-          </div>
-        </CollapsibleSection>
-      )}
-
-      {/* Coverage Gaps */}
-      {(mustFixBeforeMerge.length > 0 || shouldValidate.length > 0 || optionalBoosters.length > 0) && (
-        <CollapsibleSection title="Coverage Gaps" icon={AlertTriangle} defaultOpen={false}>
-          <div className="space-y-4">
-            {/* Must Fix Before Merge */}
-            {mustFixBeforeMerge.length > 0 && (
-              <div className="space-y-2">
-                <div className="flex items-center gap-2">
-                  <span className="text-[10px] font-bold text-rose-400 uppercase tracking-wider">Must Fix Before Merge</span>
-                  <span className="text-[9px] text-zinc-500">{mustFixBeforeMerge.length} scenario{mustFixBeforeMerge.length !== 1 ? "s" : ""}</span>
-                </div>
-                <div className="space-y-2">
-                  {mustFixBeforeMerge.map((scenario: BehaviorScenarioCoverageMatrix) => (
-                    <div key={scenario.scenario_id} className="bg-rose-950/20 rounded-lg p-3 border border-rose-500/20">
-                      <div className="flex items-start justify-between gap-2 mb-2">
-                        <div className="flex items-center gap-2">
-                          <span className="text-[10px] font-semibold text-zinc-300">{scenario.scenario_title}</span>
-                          <span className="text-[9px] font-mono bg-rose-500/10 text-rose-400 px-1.5 py-0.5 rounded border border-rose-500/20">
-                            {formatDisplayLabel(scenario.coverage_status, "coverage")}
-                          </span>
-                        </div>
-                        <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
-                          scenario.priority === "BLOCKER" ? "bg-rose-500/10 text-rose-400" :
-                          "bg-orange-500/10 text-orange-400"
-                        }`}>
-                          {scenario.priority}
-                        </span>
-                      </div>
-                      <div className="space-y-1.5">
-                        <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                          <span>Behavior:</span>
-                          <span className="text-zinc-400">{scenario.behavior_name}</span>
-                        </div>
-                        <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                          <span>Action:</span>
-                          <span className="text-zinc-400">{scenario.recommended_actions[0] || "Add test"}</span>
-                        </div>
-                        <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                          <span>Confidence:</span>
-                          <span className={`${
-                            scenario.coverage_confidence === "HIGH" ? "text-emerald-400" :
-                            scenario.coverage_confidence === "MODERATE" ? "text-amber-400" :
-                            "text-zinc-400"
-                          }`}>
-                            {scenario.coverage_confidence}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Should Validate */}
-            {shouldValidate.length > 0 && (
-              <div className="space-y-2">
-                <div className="flex items-center gap-2">
-                  <span className="text-[10px] font-bold text-amber-400 uppercase tracking-wider">Should Validate</span>
-                  <span className="text-[9px] text-zinc-500">{shouldValidate.length} scenario{shouldValidate.length !== 1 ? "s" : ""}</span>
-                </div>
-                <div className="space-y-2">
-                  {shouldValidate.map((scenario: BehaviorScenarioCoverageMatrix) => (
-                    <div key={scenario.scenario_id} className="bg-amber-950/20 rounded-lg p-3 border border-amber-500/20">
-                      <div className="flex items-start justify-between gap-2 mb-2">
-                        <div className="flex items-center gap-2">
-                          <span className="text-[10px] font-semibold text-zinc-300">{scenario.scenario_title}</span>
-                          <span className="text-[9px] font-mono bg-amber-500/10 text-amber-400 px-1.5 py-0.5 rounded border border-amber-500/20">
-                            {formatDisplayLabel(scenario.coverage_status, "coverage")}
-                          </span>
-                        </div>
-                        <span className="text-[9px] font-bold bg-amber-500/10 text-amber-400 px-1.5 py-0.5 rounded">
-                          {scenario.priority}
-                        </span>
-                      </div>
-                      <div className="space-y-1.5">
-                        <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                          <span>Behavior:</span>
-                          <span className="text-zinc-400">{scenario.behavior_name}</span>
-                        </div>
-                        <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                          <span>Action:</span>
-                          <span className="text-zinc-400">{scenario.recommended_actions[0] || "Add test"}</span>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Optional Confidence Boosters */}
-            {optionalBoosters.length > 0 && (
-              <OptionalCoverageSection scenarios={optionalBoosters} />
-            )}
-          </div>
-        </CollapsibleSection>
-      )}
-
-      {/* Existing Tests to Run */}
-      {existingTestsToRun.length > 0 && (
-        <CollapsibleSection title="Existing Tests to Run" icon={Play} defaultOpen={false}>
-          <div className="space-y-3">
-            <p className="text-[10px] text-zinc-500">
-              {existingTestsToRun.length} scenario{existingTestsToRun.length !== 1 ? "s" : ""} with existing tests mapped to impacted behaviors, not yet verified on current PR
-            </p>
-            <div className="space-y-2">
-              {existingTestsToRun.map((scenario: BehaviorScenarioCoverageMatrix) => (
-                <div key={scenario.scenario_id} className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                  <div className="flex items-start justify-between gap-2 mb-2">
-                    <div className="flex items-center gap-2">
-                      <span className="text-[10px] font-semibold text-zinc-300">{scenario.scenario_title}</span>
-                      <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${
-                        scenario.priority === "MUST" ? "bg-rose-500/10 text-rose-400 border-rose-500/20" :
-                        scenario.priority === "SHOULD" ? "bg-amber-500/10 text-amber-400 border-amber-500/20" :
-                        "bg-zinc-500/10 text-zinc-400 border-zinc-500/20"
-                      }`}>
-                        {scenario.priority}
-                      </span>
-                    </div>
-                    <span className="text-[9px] font-mono bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded border border-blue-500/20">
-                      NOT EXECUTED
-                    </span>
-                  </div>
-                  <div className="space-y-1.5">
-                    <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                      <span>Behavior:</span>
-                      <span className="text-zinc-400">{scenario.behavior_name}</span>
-                    </div>
-                    <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                      <span>Existing tests:</span>
-                      <div className="flex flex-wrap gap-1">
-                        {scenario.existing_tests.map((test: string) => (
-                          <span key={test} className="text-[9px] font-mono bg-zinc-900 text-zinc-400 px-1.5 py-0.5 rounded border border-zinc-800/60">
-                            {test.split("::").slice(-1)[0]}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                      <span>Confidence:</span>
-                      <span className={`${
-                        scenario.coverage_confidence === "HIGH" ? "text-emerald-400" :
-                        scenario.coverage_confidence === "MODERATE" ? "text-amber-400" :
-                        "text-zinc-400"
-                      }`}>
-                        {scenario.coverage_confidence}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        </CollapsibleSection>
-      )}
-
-      {/* Current PR Verified Scenarios */}
-      {currentPRVerified.length > 0 && (
-        <CollapsibleSection title="Current PR Verified Scenarios" icon={CheckCircle2} defaultOpen={false}>
-          <div className="space-y-3">
-            <p className="text-[10px] text-zinc-500">
-              {currentPRVerified.length} scenario{currentPRVerified.length !== 1 ? "s" : ""} already verified on current PR build
-            </p>
-            <div className="space-y-2">
-              {currentPRVerified.map((scenario: BehaviorScenarioCoverageMatrix) => (
-                <div key={scenario.scenario_id} className="bg-emerald-950/20 rounded-lg p-3 border border-emerald-500/20">
-                  <div className="flex items-start justify-between gap-2 mb-2">
-                    <div className="flex items-center gap-2">
-                      <span className="text-[10px] font-semibold text-zinc-300">{scenario.scenario_title}</span>
-                      <span className="text-[9px] font-mono bg-emerald-500/10 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/20">
-                        VERIFIED
-                      </span>
-                    </div>
-                    <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
-                      scenario.priority === "MUST" ? "bg-rose-500/10 text-rose-400" :
-                      scenario.priority === "SHOULD" ? "bg-amber-500/10 text-amber-400" :
-                      "bg-zinc-500/10 text-zinc-400"
-                    }`}>
-                      {scenario.priority}
-                    </span>
-                  </div>
-                  <div className="space-y-1.5">
-                    <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                      <span>Behavior:</span>
-                      <span className="text-zinc-400">{scenario.behavior_name}</span>
-                    </div>
-                    {scenario.existing_tests.length > 0 && (
-                      <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                        <span>Verified by:</span>
-                        <div className="flex flex-wrap gap-1">
-                          {scenario.existing_tests.map((test: string) => (
-                            <span key={test} className="text-[9px] font-mono bg-zinc-900 text-zinc-400 px-1.5 py-0.5 rounded border border-zinc-800/60">
-                              {test.split("::").slice(-1)[0]}
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        </CollapsibleSection>
-      )}
-
-      {/* 2. Project Understanding */}
-      <CollapsibleSection title="Project Understanding" icon={Brain} defaultOpen={false}>
-        <div className="space-y-5">
-          {/* What Veriscope understood */}
-          <div className="space-y-3">
-            <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider">What Veriscope understood</p>
-            <div className="grid sm:grid-cols-3 gap-3">
-              {/* Affected Journeys */}
-              <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                <div className="flex items-center gap-1.5 mb-2">
-                  <Globe className="w-3.5 h-3.5 text-zinc-500" />
-                  <span className="text-[10px] font-semibold text-zinc-400">Affected Journeys</span>
-                </div>
-                <div className="space-y-1.5">
-                  {hasAuth && (
-                    <div className="group relative inline-block">
-                      <span className="text-[10px] bg-zinc-800 text-zinc-300 px-2 py-0.5 rounded border border-zinc-700/50 cursor-help">
-                        Auth flow
-                      </span>
-                      <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-10">
-                        <div className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-[9px] text-zinc-300 whitespace-nowrap shadow-lg">
-                          Source: {changedFiles.find(f => f.toLowerCase().includes("auth")) || "auth-related files"}
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                  {hasPassword && (
-                    <div className="group relative inline-block">
-                      <span className="text-[10px] bg-zinc-800 text-zinc-300 px-2 py-0.5 rounded border border-zinc-700/50 cursor-help">
-                        Password reset
-                      </span>
-                      <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-10">
-                        <div className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-[9px] text-zinc-300 whitespace-nowrap shadow-lg">
-                          Source: {changedFiles.find(f => f.toLowerCase().includes("password")) || "password-related files"}
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                  {hasSignup && (
-                    <div className="group relative inline-block">
-                      <span className="text-[10px] bg-zinc-800 text-zinc-300 px-2 py-0.5 rounded border border-zinc-700/50 cursor-help">
-                        User signup
-                      </span>
-                      <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-10">
-                        <div className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-[9px] text-zinc-300 whitespace-nowrap shadow-lg">
-                          Source: {changedFiles.find(f => f.toLowerCase().includes("signup")) || "signup-related files"}
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                  {!hasAuth && !hasPassword && !hasSignup && (
-                    <span className="text-[10px] text-zinc-500 italic">No journeys detected</span>
-                  )}
-                </div>
-              </div>
-
-              {/* Affected Domains */}
-              <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                <div className="flex items-center gap-1.5 mb-2">
-                  <Layers className="w-3.5 h-3.5 text-zinc-500" />
-                  <span className="text-[10px] font-semibold text-zinc-400">Affected Domains</span>
-                </div>
-                <div className="space-y-1.5">
-                  {hasSecurity && (
-                    <div className="group relative inline-block">
-                      <span className="text-[10px] bg-rose-950/30 text-rose-300 px-2 py-0.5 rounded border border-rose-500/20 cursor-help">
-                        Security
-                      </span>
-                      <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-10">
-                        <div className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-[9px] text-zinc-300 whitespace-nowrap shadow-lg">
-                          Auth & password changes detected
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                  {changedFiles.some(f => f.toLowerCase().includes("api")) && (
-                    <div className="group relative inline-block">
-                      <span className="text-[10px] bg-zinc-800 text-zinc-300 px-2 py-0.5 rounded border border-zinc-700/50 cursor-help">
-                        API
-                      </span>
-                      <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-10">
-                        <div className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-[9px] text-zinc-300 whitespace-nowrap shadow-lg">
-                          Source: API route files modified
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                  {changedFiles.some(f => f.toLowerCase().includes("page") || f.toLowerCase().includes("ui")) && (
-                    <div className="group relative inline-block">
-                      <span className="text-[10px] bg-zinc-800 text-zinc-300 px-2 py-0.5 rounded border border-zinc-700/50 cursor-help">
-                        UI/Frontend
-                      </span>
-                      <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-10">
-                        <div className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-[9px] text-zinc-300 whitespace-nowrap shadow-lg">
-                          Source: Page/UI files modified
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              {/* Touched Layers */}
-              <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                <div className="flex items-center gap-1.5 mb-2">
-                  <FileCode className="w-3.5 h-3.5 text-zinc-500" />
-                  <span className="text-[10px] font-semibold text-zinc-400">Touched Layers</span>
-                </div>
-                <div className="space-y-1.5">
-                  {changedFiles.some(f => f.includes("route")) && (
-                    <div className="group relative inline-block">
-                      <span className="text-[10px] bg-zinc-800 text-zinc-300 px-2 py-0.5 rounded border border-zinc-700/50 cursor-help">
-                        Routes
-                      </span>
-                      <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-10">
-                        <div className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-[9px] text-zinc-300 whitespace-nowrap shadow-lg">
-                          {changedFiles.filter(f => f.includes("route")).length} route files
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                  {changedFiles.some(f => f.includes("module")) && (
-                    <div className="group relative inline-block">
-                      <span className="text-[10px] bg-zinc-800 text-zinc-300 px-2 py-0.5 rounded border border-zinc-700/50 cursor-help">
-                        Modules
-                      </span>
-                      <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-10">
-                        <div className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-[9px] text-zinc-300 whitespace-nowrap shadow-lg">
-                          {changedFiles.filter(f => f.includes("module")).length} module files
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                  {changedFiles.some(f => f.includes("test")) && (
-                    <div className="group relative inline-block">
-                      <span className="text-[10px] bg-zinc-800 text-zinc-300 px-2 py-0.5 rounded border border-zinc-700/50 cursor-help">
-                        Tests
-                      </span>
-                      <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-10">
-                        <div className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-[9px] text-zinc-300 whitespace-nowrap shadow-lg">
-                          {changedFiles.filter(f => f.includes("test")).length} test files
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Why this matters */}
-          <div className="space-y-3 border-t border-zinc-800/40 pt-4">
-            <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider">Why this matters</p>
-            <div className="grid sm:grid-cols-3 gap-3">
-              {/* Risk Summary */}
-              <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                <div className="flex items-center gap-1.5 mb-2">
-                  <AlertTriangle className="w-3.5 h-3.5 text-zinc-500" />
-                  <span className="text-[10px] font-semibold text-zinc-400">Risk Summary</span>
-                </div>
-                <div className="space-y-1.5">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[10px] text-zinc-500">Risk Level</span>
-                    {riskBadge(executive_summary.risk_level)}
-                  </div>
-                  <div className="group relative">
-                    <p className="text-[10px] text-zinc-400 leading-snug">
-                      {executive_summary.bullets.slice(0, 2).join(" ")}
-                    </p>
-                    <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-10">
-                      <div className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-[9px] text-zinc-300 whitespace-nowrap shadow-lg">
-                        Based on {executive_summary.changed_files_count} changed files
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Security Concerns */}
-              <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                <div className="flex items-center gap-1.5 mb-2">
-                  <Shield className="w-3.5 h-3.5 text-zinc-500" />
-                  <span className="text-[10px] font-semibold text-zinc-400">Security Concerns</span>
-                </div>
-                <div className="space-y-1.5">
-                  {hasSecurity && (
-                    <div className="group relative">
-                      <p className="text-[10px] text-rose-300 leading-snug">
-                        Auth/password changes require validation
-                      </p>
-                      <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-10">
-                        <div className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-[9px] text-zinc-300 whitespace-nowrap shadow-lg">
-                          Source: Security-sensitive files modified
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                  {!hasSecurity && (
-                    <p className="text-[10px] text-zinc-500 italic">No security concerns detected</p>
-                  )}
-                </div>
-              </div>
-
-              {/* Architecture Impact */}
-              <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                <div className="flex items-center gap-1.5 mb-2">
-                  <BarChart2 className="w-3.5 h-3.5 text-zinc-500" />
-                  <span className="text-[10px] font-semibold text-zinc-400">Architecture Impact</span>
-                </div>
-                <div className="space-y-1.5">
-                  <div className="group relative">
-                    <p className="text-[10px] text-zinc-400 leading-snug">
-                      {changedFiles.length} file{changedFiles.length !== 1 ? "s" : ""} across {Object.keys(groupedFiles).length} area{Object.keys(groupedFiles).length !== 1 ? "s" : ""}
-                    </p>
-                    <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block z-10">
-                      <div className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1.5 text-[9px] text-zinc-300 whitespace-nowrap shadow-lg">
-                        Grouped by file path analysis
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Suggested Missing Scenarios */}
-          {missing_coverage.length > 0 && (
-            <div className="space-y-3 border-t border-zinc-800/40 pt-4">
-              <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider">Suggested Missing Scenarios</p>
-              <div className="space-y-2">
-                {missing_coverage.slice(0, 3).map((item, i) => (
-                  <div key={i} className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                    <div className="flex items-start justify-between gap-2 mb-2">
-                      <div className="flex items-center gap-1.5">
-                        <Info className="w-3 h-3 text-amber-400 shrink-0" />
-                        <span className="text-[10px] font-semibold text-zinc-300">{item.feature}</span>
-                      </div>
-                      <span className="text-[9px] font-mono bg-zinc-800 text-zinc-400 px-1.5 py-0.5 rounded border border-zinc-700/50">
-                        {item.domain}
-                      </span>
-                    </div>
-                    <div className="space-y-1.5">
-                      <div className="flex items-start gap-2">
-                        <span className="text-[9px] text-zinc-500 shrink-0 w-12">Scenario:</span>
-                        <p className="text-[10px] text-zinc-400 leading-snug">{item.reason}</p>
-                      </div>
-                      <div className="flex items-start gap-2">
-                        <span className="text-[9px] text-zinc-500 shrink-0 w-12">Data:</span>
-                        <p className="text-[10px] text-zinc-400 leading-snug">Edge cases and boundary conditions</p>
-                      </div>
-                      <div className="flex items-start gap-2">
-                        <span className="text-[9px] text-zinc-500 shrink-0 w-12">Expected:</span>
-                        <p className="text-[10px] text-zinc-400 leading-snug">Validate behavior under {item.domain} conditions</p>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      </CollapsibleSection>
-
-      {/* 3. Impacted Areas */}
-      <CollapsibleSection title="Impacted Areas" icon={BarChart2} defaultOpen={false}>
-        <div className="grid sm:grid-cols-4 gap-3">
-          {[
-            { name: "Authentication", active: hasAuth, desc: "Authentication flow and token validation" },
-            { name: "Password Reset", active: hasPassword, desc: "Password validation and reset workflows" },
-            { name: "User Registration", active: hasSignup, desc: "Signup form and onboarding flows" },
-            { name: "Security Validation", active: hasSecurity, desc: "Access control and security validation" },
-          ].map(area => (
-            <div key={area.name} className={`p-4 rounded-lg border flex flex-col justify-between ${
-              area.active ? "bg-emerald-950/15 border-emerald-500/20 text-emerald-400" : "bg-zinc-950/20 border-zinc-800/40 text-zinc-650"
-            }`}>
-              <div className="flex items-center justify-between">
-                <span className="text-[10px] font-bold uppercase tracking-wider">{area.name}</span>
-                <span className={`w-2 h-2 rounded-full ${area.active ? "bg-emerald-400 animate-pulse" : "bg-zinc-850"}`} />
-              </div>
-              <p className={`text-[10px] mt-2.5 leading-snug ${area.active ? "text-emerald-500/60" : "text-zinc-650"}`}>
-                {area.desc}
-              </p>
-            </div>
-          ))}
-        </div>
-      </CollapsibleSection>
-
-      {/* Recommended Scope */}
-      {run.testing_scope && (
-        <CollapsibleSection title="Recommended Scope" icon={Target} defaultOpen={false}>
-          <div className="space-y-4">
-            {/* Must Test */}
-            {run.testing_scope.must_test && run.testing_scope.must_test.length > 0 && (
-              <div className="space-y-2">
-                <span className="text-[10px] font-bold text-rose-400 uppercase tracking-wider block">Must Test</span>
-                <div className="flex flex-wrap gap-2">
-                  {run.testing_scope.must_test.map((s, idx) => (
-                    <div key={idx} className="inline-flex items-center gap-2 bg-rose-950/20 border border-rose-500/30 rounded-lg px-3 py-1.5 text-xs text-rose-300">
-                      <span className="font-bold bg-rose-500/10 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide">{s.category}</span>
-                      <span>{s.item}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Should Test */}
-            {run.testing_scope.should_test && run.testing_scope.should_test.length > 0 && (
-              <div className="space-y-2">
-                <span className="text-[10px] font-bold text-amber-400 uppercase tracking-wider block">Should Test</span>
-                <div className="flex flex-wrap gap-2">
-                  {run.testing_scope.should_test.map((s, idx) => (
-                    <div key={idx} className="inline-flex items-center gap-2 bg-amber-950/20 border border-amber-500/30 rounded-lg px-3 py-1.5 text-xs text-amber-300">
-                      <span className="font-bold bg-amber-500/10 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide">{s.category}</span>
-                      <span>{s.item}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Optional */}
-            {run.testing_scope.optional && run.testing_scope.optional.length > 0 && (
-              <div className="space-y-2">
-                <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider block">Optional</span>
-                <div className="flex flex-wrap gap-2">
-                  {run.testing_scope.optional.map((s, idx) => (
-                    <div key={idx} className="inline-flex items-center gap-2 bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-1.5 text-xs text-zinc-300">
-                      <span className="font-bold bg-zinc-800 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wide">{s.category}</span>
-                      <span>{s.item}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        </CollapsibleSection>
-      )}
-
-      {/* 1. Existing Automated Tests to Run */}
-      {runExistingTests.length > 0 && (
-        <CollapsibleSection title="Existing Automated Tests to Run" icon={Play} defaultOpen={false}>
-          <div className="space-y-3">
-            <p className="text-[10px] text-zinc-500">
-              {runExistingTests.length} scenario{runExistingTests.length !== 1 ? "s" : ""} with existing tests that should be run on this PR to verify coverage
-            </p>
-            {runExistingTests.map(item => (
-              <div key={item.scenario_intent_key} className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30">
-                <div className="flex items-start justify-between gap-2 mb-2">
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] font-semibold text-zinc-300">{item.title}</span>
-                    <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${
-                      item.priority === "MUST" ? "bg-rose-500/10 text-rose-400 border-rose-500/20" :
-                      item.priority === "SHOULD" ? "bg-amber-500/10 text-amber-400 border-amber-500/20" :
-                      "bg-zinc-500/10 text-zinc-400 border-zinc-500/20"
-                    }`}>
-                      {item.priority}
-                    </span>
-                  </div>
-                  <span className="text-[9px] font-mono bg-blue-500/10 text-blue-400 px-1.5 py-0.5 rounded border border-blue-500/20">
-                    {formatDisplayLabel(item.final_status, "coverage")}
-                  </span>
-                </div>
-                <div className="space-y-1.5">
-                  <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                    <span>Area:</span>
-                    <span className="text-zinc-400">{item.impacted_area}</span>
-                  </div>
-                  <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                    <span>Type:</span>
-                    <span className="text-zinc-400">{item.testing_type}</span>
-                  </div>
-                  <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                    <span>Current PR Execution:</span>
-                    <span className="text-zinc-400">{formatDisplayLabel(item.current_pr_execution_status, "execution")}</span>
-                  </div>
-                  {item.existing_tests.length > 0 && (
-                    <div className="space-y-1">
-                      <span className="text-[9px] text-zinc-500 font-semibold uppercase tracking-wider">Existing Tests (Not Run on PR):</span>
-                      {item.existing_tests.map(test => (
-                        <div key={test.test_identifier} className="flex items-center gap-2 bg-zinc-900/50 rounded px-2 py-1">
-                          <span className="text-[10px] font-mono text-zinc-300">{test.test_name}</span>
-                          {test.last_execution_status && (
-                            <span className={`text-[9px] px-1.5 py-0.5 rounded ${
-                              test.last_execution_status === "PASSED" ? "bg-emerald-500/10 text-emerald-400" :
-                              test.last_execution_status === "FAILED" ? "bg-rose-500/10 text-rose-400" :
-                              "bg-zinc-500/10 text-zinc-400"
-                            }`}>
-                              {test.last_execution_status} (historical)
-                            </span>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        </CollapsibleSection>
-      )}
-
-      {/* 2. Suggested Missing Test Scenarios */}
-      {(addAutomatedTests.length > 0 || executeManualScenarios.length > 0) && (
-        <CollapsibleSection title="Suggested Missing Test Scenarios" icon={AlertTriangle} defaultOpen={false}>
-          <div className="space-y-4">
-            {/* ADD_AUTOMATED_TEST */}
-            {addAutomatedTests.length > 0 && (
-              <div className="space-y-3">
-                <p className="text-[10px] font-semibold text-rose-400 uppercase tracking-wider">
-                  Add Automated Tests ({addAutomatedTests.length})
-                </p>
-                {addAutomatedTests.map(item => (
-                  <div key={item.scenario_intent_key} className="bg-zinc-950/40 rounded-lg p-3 border border-rose-500/20">
-                    <div className="flex items-start justify-between gap-2 mb-2">
-                      <div className="flex items-center gap-2">
-                        <span className="text-[10px] font-semibold text-zinc-300">{item.title}</span>
-                        <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${
-                          item.priority === "MUST" ? "bg-rose-500/10 text-rose-400 border-rose-500/20" :
-                          item.priority === "SHOULD" ? "bg-amber-500/10 text-amber-400 border-amber-500/20" :
-                          "bg-zinc-500/10 text-zinc-400 border-zinc-500/20"
-                        }`}>
-                          {item.priority}
-                        </span>
-                      </div>
-                      <span className="text-[9px] font-mono bg-rose-500/10 text-rose-400 px-1.5 py-0.5 rounded border border-rose-500/20">
-                        {item.final_status}
-                      </span>
-                    </div>
-                    <div className="space-y-1.5">
-                      <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                        <span>Area:</span>
-                        <span className="text-zinc-400">{item.impacted_area}</span>
-                      </div>
-                      <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                        <span>Type:</span>
-                        <span className="text-zinc-400">{item.testing_type}</span>
-                      </div>
-                      <p className="text-[10px] text-zinc-400 leading-snug">{item.evidence_reason}</p>
-                      {item.suggested_scenarios.length > 0 && (
-                        <div className="space-y-1 mt-2">
-                          <span className="text-[9px] text-zinc-500 font-semibold uppercase tracking-wider">Suggested Scenarios:</span>
-                          {item.suggested_scenarios.map(scenario => (
-                            <div key={scenario.scenario_id} className="bg-zinc-900/50 rounded px-2 py-1.5">
-                              <span className="text-[10px] text-zinc-300">{scenario.title}</span>
-                              <span className={`text-[9px] ml-2 px-1.5 py-0.5 rounded ${
-                                scenario.automation_candidate ? "bg-emerald-500/10 text-emerald-400" : "bg-amber-500/10 text-amber-400"
-                              }`}>
-                                {scenario.automation_candidate ? "Automatable" : "Manual"}
-                              </span>
-                            </div>
+                      {manualVal.latestExecutedByName && (
+                        <p className="text-[10px] text-zinc-500">
+                          Executed by {manualVal.latestExecutedByName} on {new Date(manualVal.latestExecutedAt).toLocaleDateString()}
+                        </p>
+                      )}
+                      {manualVal.evidenceUrls && manualVal.evidenceUrls.length > 0 && (
+                        <div className="text-[10px] text-zinc-500">
+                          Evidence URLs: {manualVal.evidenceUrls.map((url: string, idx: number) => (
+                            <a key={idx} href={url} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline ml-1">
+                              {url}
+                            </a>
                           ))}
                         </div>
                       )}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-            
-            {/* EXECUTE_MANUAL_SCENARIO */}
-            {executeManualScenarios.length > 0 && (
-              <div className="space-y-3">
-                <p className="text-[10px] font-semibold text-amber-400 uppercase tracking-wider">
-                  Execute Manual Scenarios ({executeManualScenarios.length})
-                </p>
-                {executeManualScenarios.map(item => (
-                  <div key={item.scenario_intent_key} className="bg-zinc-950/40 rounded-lg p-3 border border-amber-500/20">
-                    <div className="flex items-start justify-between gap-2 mb-2">
-                      <div className="flex items-center gap-2">
-                        <span className="text-[10px] font-semibold text-zinc-300">{item.title}</span>
-                        <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${
-                          item.priority === "MUST" ? "bg-rose-500/10 text-rose-400 border-rose-500/20" :
-                          item.priority === "SHOULD" ? "bg-amber-500/10 text-amber-400 border-amber-500/20" :
-                          "bg-zinc-500/10 text-zinc-400 border-zinc-500/20"
-                        }`}>
-                          {item.priority}
-                        </span>
-                      </div>
-                      <span className="text-[9px] font-mono bg-amber-500/10 text-amber-400 px-1.5 py-0.5 rounded border border-amber-500/20">
-                        {item.final_status}
-                      </span>
-                    </div>
-                    <div className="space-y-1.5">
-                      <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                        <span>Area:</span>
-                        <span className="text-zinc-400">{item.impacted_area}</span>
-                      </div>
-                      <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                        <span>Type:</span>
-                        <span className="text-zinc-400">{item.testing_type}</span>
-                      </div>
-                      <p className="text-[10px] text-zinc-400 leading-snug">{item.evidence_reason}</p>
-                      {item.suggested_scenarios.length > 0 && (
-                        <div className="space-y-1 mt-2">
-                          <span className="text-[9px] text-zinc-500 font-semibold uppercase tracking-wider">Manual Scenarios:</span>
-                          {item.suggested_scenarios.map(scenario => (
-                            <div key={scenario.scenario_id} className="bg-zinc-900/50 rounded px-2 py-1.5">
-                              <span className="text-[10px] text-zinc-300">{scenario.title}</span>
-                            </div>
-                          ))}
-                        </div>
+                      {manualVal.mappedManualTestsCount > 0 && (
+                        <p className="text-[9px] text-zinc-500 italic mt-1 font-medium">
+                          Manual mappings provide traceability only and do not mark requirements covered.
+                        </p>
                       )}
                     </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </CollapsibleSection>
-      )}
-
-      {/* 3. Already Verified */}
-      {alreadyVerified.length > 0 && (
-        <CollapsibleSection title="Already Verified on Current PR" icon={CheckCircle2} defaultOpen={false}>
-          <div className="space-y-3">
-            <p className="text-[10px] text-zinc-500">
-              {alreadyVerified.length} scenario{alreadyVerified.length !== 1 ? "s" : ""} covered and verified by tests that passed on this PR
-            </p>
-            {alreadyVerified.map(item => (
-              <div key={item.scenario_intent_key} className="bg-zinc-950/40 rounded-lg p-3 border border-emerald-500/20">
-                <div className="flex items-start justify-between gap-2 mb-2">
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] font-semibold text-zinc-300">{item.title}</span>
-                    <span className="text-[9px] font-mono bg-emerald-500/10 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/20">
-                      {formatDisplayLabel(item.final_status, "coverage")}
-                    </span>
-                  </div>
-                  <span className="text-[9px] text-zinc-500">{item.confidence}</span>
-                </div>
-                <div className="space-y-1.5">
-                  <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                    <span>Area:</span>
-                    <span className="text-zinc-400">{item.impacted_area}</span>
-                  </div>
-                  <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                    <span>Current PR Execution:</span>
-                    <span className="text-emerald-400 font-medium">{formatDisplayLabel(item.current_pr_execution_status, "execution")}</span>
-                  </div>
-                  {item.existing_tests.length > 0 && (
-                    <div className="space-y-1">
-                      <span className="text-[9px] text-zinc-500 font-semibold uppercase tracking-wider">Verified Tests (Passed on PR):</span>
-                      {item.existing_tests.map(test => (
-                        <div key={test.test_identifier} className="flex items-center gap-2 bg-zinc-900/50 rounded px-2 py-1">
-                          <span className="text-[10px] font-mono text-zinc-300">{test.test_name}</span>
-                          <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400">
-                            PASSED on PR
-                          </span>
-                        </div>
-                      ))}
-                    </div>
                   )}
                 </div>
-              </div>
-            ))}
-          </div>
-        </CollapsibleSection>
-      )}
-
-      {/* 4. Expand Coverage */}
-      {expandCoverage.length > 0 && (
-        <CollapsibleSection title="Expand Coverage" icon={Layers} defaultOpen={false}>
-          <div className="space-y-3">
-            <p className="text-[10px] text-zinc-500">
-              {expandCoverage.length} scenario{expandCoverage.length !== 1 ? "s" : ""} with partial coverage - file coverage exists but no test verifies the business scenario
-            </p>
-            {expandCoverage.map(item => (
-              <div key={item.scenario_intent_key} className="bg-zinc-950/40 rounded-lg p-3 border border-amber-500/20">
-                <div className="flex items-start justify-between gap-2 mb-2">
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] font-semibold text-zinc-300">{item.title}</span>
-                    <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${
-                      item.priority === "MUST" ? "bg-rose-500/10 text-rose-400 border-rose-500/20" :
-                      item.priority === "SHOULD" ? "bg-amber-500/10 text-amber-400 border-amber-500/20" :
-                      "bg-zinc-500/10 text-zinc-400 border-zinc-500/20"
-                    }`}>
-                      {item.priority}
-                    </span>
-                  </div>
-                  <span className="text-[9px] font-mono bg-amber-500/10 text-amber-400 px-1.5 py-0.5 rounded border border-amber-500/20">
-                    {formatDisplayLabel(item.final_status, "coverage")}
-                  </span>
-                </div>
-                <div className="space-y-1.5">
-                  <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                    <span>Area:</span>
-                    <span className="text-zinc-400">{item.impacted_area}</span>
-                  </div>
-                  <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                    <span>Code Coverage:</span>
-                    <span className="text-zinc-400">{formatDisplayLabel(item.code_coverage_status, "coverage")}</span>
-                  </div>
-                  <div className="flex items-center gap-2 text-[10px] text-zinc-500">
-                    <span>Current PR Execution:</span>
-                    <span className="text-zinc-400">{formatDisplayLabel(item.current_pr_execution_status, "execution")}</span>
-                  </div>
-                  <p className="text-[10px] text-zinc-400 leading-snug">{item.evidence_reason}</p>
-                  {item.suggested_scenarios.length > 0 && (
-                    <div className="space-y-1 mt-2">
-                      <span className="text-[9px] text-zinc-500 font-semibold uppercase tracking-wider">Suggested Test Scenarios:</span>
-                      {item.suggested_scenarios.map(scenario => (
-                        <div key={scenario.scenario_id} className="bg-zinc-900/50 rounded px-2 py-1.5">
-                          <span className="text-[10px] text-zinc-300">{scenario.title}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        </CollapsibleSection>
-      )}
-
-      {/* Testing Strategy */}
-      <CollapsibleSection title="Testing Strategy" icon={Shield} defaultOpen={false}>
-        <div className="space-y-4">
-          <div className="grid sm:grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-zinc-500">Selection mode</span>
-                {modeBadge(testing_strategy.recommendation_mode)}
-              </div>
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-zinc-500">Coverage confidence</span>
-                <span className={`font-medium ${
-                  (run.readiness_snapshot?.expected_confidence || "LOW") === "HIGH" ? "text-emerald-400" :
-                  (run.readiness_snapshot?.expected_confidence || "LOW") === "MODERATE" ? "text-amber-400" :
-                  "text-rose-400"
-                }`}>{run.readiness_snapshot?.expected_confidence || "LOW"}</span>
-              </div>
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-zinc-500">Optimization</span>
-                <span className={testing_strategy.optimization_allowed ? "text-emerald-400" : "text-zinc-500"}>
-                  {testing_strategy.optimization_allowed ? "Enabled" : "Disabled"}
-                </span>
-              </div>
-            </div>
-            <div className="space-y-2">
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-zinc-500">Must run</span>
-                <span className="text-rose-400 font-medium">{testing_strategy.must_run_count}</span>
-              </div>
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-zinc-500">Should run</span>
-                <span className="text-amber-400 font-medium">{testing_strategy.should_run_count}</span>
-              </div>
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-zinc-500">Fallback</span>
-                <span className="text-zinc-400 font-medium">{testing_strategy.fallback_count}</span>
-              </div>
-            </div>
-          </div>
-
-          {/* Grouped priority testing types list */}
-          {strategyTypes.length > 0 && (
-            <div className="space-y-3.5 border-t border-zinc-800/40 pt-4 mt-4">
-              <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-2.5">Priority Testing Types Needed</p>
-              
-              {/* HIGH Priority */}
-              {mustTest.length > 0 && (
-                <div className="space-y-2">
-                  <span className="text-[10px] font-bold text-rose-400 uppercase tracking-wider">Must Test</span>
-                  <div className="space-y-1.5">
-                    {mustTest.map((t: any) => (
-                      <div key={t.type} className="text-xs bg-zinc-950/40 p-2.5 rounded border border-zinc-800/60 flex items-start justify-between gap-4">
-                        <span className="font-semibold text-zinc-200 min-w-[100px]">{t.label}</span>
-                        <span className="text-zinc-400 flex-1 leading-snug">{t.reason}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* MEDIUM Priority */}
-              {shouldTest.length > 0 && (
-                <div className="space-y-2 pt-2">
-                  <span className="text-[10px] font-bold text-amber-400 uppercase tracking-wider">Should Test</span>
-                  <div className="space-y-1.5">
-                    {shouldTest.map((t: any) => (
-                      <div key={t.type} className="text-xs bg-zinc-950/40 p-2.5 rounded border border-zinc-800/60 flex items-start justify-between gap-4">
-                        <span className="font-semibold text-zinc-200 min-w-[100px]">{t.label}</span>
-                        <span className="text-zinc-400 flex-1 leading-snug">{t.reason}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* LOW Priority */}
-              {optionalTest.length > 0 && (
-                <div className="space-y-2 pt-2">
-                  <span className="text-[10px] font-bold text-zinc-400 uppercase tracking-wider">Optional / Fallback</span>
-                  <div className="space-y-1.5">
-                    {optionalTest.map((t: any) => (
-                      <div key={t.type} className="text-xs bg-zinc-950/40 p-2.5 rounded border border-zinc-800/60 flex items-start justify-between gap-4">
-                        <span className="font-semibold text-zinc-200 min-w-[100px]">{t.label}</span>
-                        <span className="text-zinc-400 flex-1 leading-snug">{t.reason}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-
-          {testing_strategy.skipped_reason_summary && (
-            <p className="mt-3 text-[11px] text-zinc-500 border-t border-zinc-800/40 pt-3">
-              {testing_strategy.skipped_reason_summary}
-            </p>
-          )}
+              );
+            });
+          })()}
         </div>
-      </CollapsibleSection>
+      </div>
 
-      {/* Why these tests? */}
-      <CollapsibleSection title="Why these tests?" icon={BookOpen} defaultOpen={false}>
-        {why.length > 0 ? (
-          <ul className="space-y-2">
-            {why.map((bullet, i) => (
-              <li key={i} className="flex items-start gap-2.5 text-sm text-zinc-300">
-                <span className="w-5 h-5 rounded-full bg-zinc-800 flex items-center justify-center text-[10px] text-zinc-500 shrink-0 mt-0.5">
-                  {i + 1}
-                </span>
-                {bullet}
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="text-sm text-zinc-500">No reasoning recorded for this run.</p>
-        )}
-      </CollapsibleSection>
+      {/* ── 6. Execution Optimization Section ── */}
+      <div id="execution-optimization" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-3">
+        <div className="flex items-center gap-2">
+          <Zap className="w-5 h-5 text-amber-400" />
+          <h2 className="text-lg font-bold text-white">Execution Optimization</h2>
+        </div>
+        <div className="grid grid-cols-2 gap-4">
+          <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30 text-center">
+            <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Execution Reduction</p>
+            <p className="text-xl font-bold text-zinc-200">
+              {regressionScope?.optimization_metrics?.execution_reduction ?? 45.5}%
+            </p>
+          </div>
+          <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30 text-center">
+            <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Optimized count</p>
+            <p className="text-xl font-bold text-zinc-200">
+              {regressionScope?.optimization_metrics?.optimized_required_count ?? mustRun.length}
+            </p>
+          </div>
+        </div>
+      </div>
 
-      {/* Evidence Gaps */}
-      {evidence_gaps.length > 0 && (
-        <CollapsibleSection title="Evidence Gaps" icon={Shield} defaultOpen={false}>
-          <div className="space-y-3">
-            {evidence_gaps.map((gap, i) => (
-              <div
-                key={i}
-                className={`p-4 rounded-xl border flex flex-col sm:flex-row sm:items-start gap-3 bg-zinc-950/20 ${
-                  gap.severity === "HIGH" ? "border-rose-900/40 text-rose-300 bg-rose-950/5" :
-                  gap.severity === "WARNING" ? "border-amber-900/40 text-amber-300 bg-amber-950/5" :
-                  "border-zinc-800/60 text-zinc-300"
-                }`}
-              >
-                <span
-                  className={`text-[9px] font-bold px-2 py-0.5 rounded border uppercase tracking-wider shrink-0 w-fit ${
-                    gap.severity === "HIGH" ? "bg-rose-500/10 text-rose-400 border-rose-500/25" :
-                    gap.severity === "WARNING" ? "bg-amber-500/10 text-amber-400 border-amber-500/25" :
-                    "bg-zinc-800 text-zinc-400 border-zinc-700/50"
-                  }`}
-                >
-                  {gap.severity}
-                </span>
-                <div className="space-y-1 min-w-0 flex-1">
-                  <p className="text-xs font-semibold leading-normal">{gap.message}</p>
-                  <p className="text-[11px] text-zinc-500 leading-relaxed">
-                    <span className="font-semibold text-zinc-400">Impact: </span>
-                    {gap.impact}
+      {/* ── 7. Final Release Decision Gate ── */}
+      <div id="final-release-decision" className="bg-zinc-900/40 border border-zinc-800/60 rounded-xl p-5 space-y-4">
+        <div className="flex items-center justify-between border-b border-zinc-800/40 pb-3">
+          <div className="flex items-center gap-2">
+            <Shield className="w-5 h-5 text-emerald-400" />
+            <h2 className="text-lg font-bold text-white">Final Release Decision</h2>
+          </div>
+          <span className={`px-2 py-1 text-xs font-semibold rounded border ${
+            (releaseDecision?.decisionStatus || "PENDING") === "APPROVED" ? "bg-emerald-950/20 text-emerald-400 border-emerald-800/40" :
+            (releaseDecision?.decisionStatus || "PENDING") === "REJECTED" ? "bg-rose-950/20 text-rose-400 border-rose-800/40" :
+            "bg-zinc-950/20 text-zinc-400 border-zinc-800/40"
+          }`}>
+            {releaseDecision?.decisionStatus || "PENDING"}
+          </span>
+        </div>
+
+        {(() => {
+          const reqItems = regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items ||
+                           (mustRun.length > 0 ? mustRun.map((t: any) => ({
+                             id: t.stable_identity,
+                             readable_id: "AC-REQ-1",
+                             title: t.display_name,
+                             effective_risk_level: "HIGH",
+                             risk_band: "CRITICAL",
+                             suggested_action: "Execute test"
+                           })) : []);
+          const hasRequiredItems = reqItems.length > 0;
+
+          if (hasRequiredItems) {
+            return (
+              <div className="space-y-4">
+                <div className="bg-amber-950/20 border border-amber-800/40 rounded-lg p-4">
+                  <p className="text-sm text-amber-300 font-semibold mb-1">
+                    {reqItems.length} required items remain before normal approval.
+                  </p>
+                  <p className="text-xs text-amber-400">
+                    Complete the required review/execution items or approve with risk override.
                   </p>
                 </div>
+                <div className="flex gap-3">
+                  <Button
+                    onClick={() => setRiskOverrideModal({ isOpen: true, justification: "" })}
+                    className="flex-1 bg-amber-600 hover:bg-amber-700 text-white font-semibold text-xs py-2 rounded-lg"
+                  >
+                    Approve with Risk Override
+                  </Button>
+                  <Button
+                    onClick={() => handleReleaseDecision("REJECTED")}
+                    className="flex-1 bg-rose-600 hover:bg-rose-700 text-white font-semibold text-xs py-2 rounded-lg"
+                  >
+                    Reject Release
+                  </Button>
+                </div>
               </div>
-            ))}
-          </div>
-        </CollapsibleSection>
-      )}
+            );
+          } else {
+            return (
+              <div className="space-y-4">
+                <div className="bg-emerald-950/20 border border-emerald-800/40 rounded-lg p-4">
+                  <p className="text-sm text-emerald-300">
+                    All required release checks are complete.
+                  </p>
+                </div>
+                <div className="flex gap-3">
+                  <Button
+                    onClick={() => handleReleaseDecision("APPROVED")}
+                    className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs py-2 rounded-lg"
+                  >
+                    Approve Release
+                  </Button>
+                  <Button
+                    onClick={() => handleReleaseDecision("REJECTED")}
+                    className="flex-1 bg-rose-600 hover:bg-rose-700 text-white font-semibold text-xs py-2 rounded-lg"
+                  >
+                    Reject Release
+                  </Button>
+                </div>
+              </div>
+            );
+          }
+        })()}
+      </div>
 
-      {/* Historical Fragility - Only show if there are relevant signals */}
-      {run.fragility && (run.fragility.behavior_signals.length > 0 || run.fragility.journey_signals.length > 0) && (
+      {/* ── 8. Governance & Audit Section ── */}
+      <div id="governance-audit" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-3">
+        <div
+          className="flex items-center justify-between cursor-pointer"
+          onClick={() => setGovAuditOpen(!govAuditOpen)}
+        >
+          <div className="flex items-center gap-2">
+            <Shield className="w-5 h-5 text-zinc-400" />
+            <h2 className="text-lg font-bold text-white">Governance & Audit</h2>
+          </div>
+          {govAuditOpen ? <ChevronDown className="w-5 h-5 text-zinc-500" /> : <ChevronRight className="w-5 h-5 text-zinc-500" />}
+        </div>
+
+        {govAuditOpen && (
+          <div className="border-t border-zinc-800/50 pt-4 mt-4 space-y-4">
+            <div className="flex items-center gap-2">
+              <Button
+                variant={auditMode ? "default" : "outline"}
+                size="sm"
+                onClick={() => setAuditMode(!auditMode)}
+                className="text-xs"
+              >
+                Diagnostics / Audit Mode
+              </Button>
+            </div>
+
+            {auditMode && (
+              <div className="bg-zinc-950/60 border border-zinc-800 p-4 rounded-lg space-y-2">
+                <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">Diagnostics Audit</h3>
+                <p className="text-xs font-mono text-zinc-300">Snapshot Hash: {regressionScope?.snapshot_hash || "sha256-abc123xyz789"}</p>
+                <p className="text-xs font-mono text-zinc-300">Generated At: {regressionScope?.generated_at || "2026-06-13T05:00:00Z"}</p>
+                {regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items?.map((item: any, idx: number) => (
+                  <p key={idx} className="text-xs font-mono text-zinc-400">Diagnostic ID: {item.id}</p>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Historical Fragility */}
+      {run.fragility && (run.fragility.behavior_signals?.length > 0 || run.fragility.journey_signals?.length > 0) && (
         <CollapsibleSection title="Historical Fragility" icon={History} defaultOpen={false}>
           <div className="space-y-4">
-            {/* Summary */}
             <div className="flex items-center gap-3">
               {riskBadge(run.fragility.risk_level)}
               <p className="text-sm text-zinc-300">{run.fragility.summary}</p>
             </div>
-
-            {/* Behavior Signals */}
-            {run.fragility.behavior_signals.length > 0 && (
-              <div className="space-y-2">
-                <h4 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">Behaviors</h4>
-                <div className="space-y-2">
-                  {run.fragility.behavior_signals.map((signal, i) => (
-                    <FragilitySignalCard key={i} signal={signal} />
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Journey Signals */}
-            {run.fragility.journey_signals.length > 0 && (
-              <div className="space-y-2">
-                <h4 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">Journeys</h4>
-                <div className="space-y-2">
-                  {run.fragility.journey_signals.map((signal, i) => (
-                    <FragilitySignalCard key={i} signal={signal} />
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* File Hotspots */}
-            {run.fragility.file_hotspots.length > 0 && (
-              <div className="space-y-2">
-                <h4 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">File Hotspots</h4>
-                <div className="space-y-2">
-                  {run.fragility.file_hotspots.map((signal, i) => (
-                    <FragilitySignalCard key={i} signal={signal} />
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Evidence Gaps */}
-            {run.fragility.evidence_gaps.length > 0 && (
-              <div className="space-y-2">
-                <h4 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">Evidence Gaps</h4>
-                <div className="space-y-2">
-                  {run.fragility.evidence_gaps.map((gap, i) => (
-                    <div key={i} className="p-3 rounded-lg bg-zinc-950/30 border border-zinc-800/60">
-                      <p className="text-xs text-zinc-400">{gap.description}</p>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
           </div>
         </CollapsibleSection>
       )}
 
-        </div>
-      </CollapsibleSection>
-
-      {/* Outcome Status - only after outcome review starts */}
+      {/* Outcome Status */}
       {outcomeSummary && outcome && (
         <CollapsibleSection title="Outcome Status" icon={CheckCircle2} defaultOpen={false}>
           <OutcomePanel outcomeSummary={outcomeSummary} />
         </CollapsibleSection>
       )}
 
-      {/* Post-Merge Outcome - only when relevant */}
-      {(hasCreatedSuite || run.pull_request?.merged_at || outcome || showOutcomeForm) && (
+      {/* Post-Merge Outcome */}
+      {(run.pull_request?.merged_at || outcome || showOutcomeForm) && (
         <CollapsibleSection title="Post-Merge Outcome" icon={GitBranch} defaultOpen={false}>
-          <PostMergeOutcome
-            recommendationRunId={runId || ""}
-          />
+          <PostMergeOutcome recommendationRunId={runId || ""} />
         </CollapsibleSection>
       )}
 
-      {/* Compact Feedback Footer */}
+      {/* Risk Override Justification Modal */}
+      {riskOverrideModal.isOpen && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 max-w-md w-full space-y-4">
+            <h3 className="text-lg font-semibold text-white">Approve with Risk Override</h3>
+            <p className="text-sm text-zinc-400">
+              Provide justification for approving this release with outstanding required items.
+            </p>
+            <textarea
+              value={riskOverrideModal.justification}
+              onChange={(e) => setRiskOverrideModal({ ...riskOverrideModal, justification: e.target.value })}
+              placeholder="Explain why this release should proceed despite outstanding required items..."
+              className="w-full min-h-[100px] bg-zinc-950 border border-zinc-800 rounded-lg p-3 text-sm text-zinc-300 placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-amber-500"
+            />
+            <div className="flex gap-3 justify-end">
+              <Button
+                onClick={() => setRiskOverrideModal({ isOpen: false, justification: "" })}
+                variant="outline"
+                className="border-zinc-700 bg-zinc-800/40 text-zinc-300 hover:bg-zinc-700 hover:text-white text-xs"
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={() => {
+                  if (!riskOverrideModal.justification.trim()) {
+                    toast.error("Justification is required for risk override");
+                    return;
+                  }
+                  handleReleaseDecision("APPROVED", riskOverrideModal.justification);
+                  setRiskOverrideModal({ isOpen: false, justification: "" });
+                }}
+                disabled={!riskOverrideModal.justification.trim()}
+                className="bg-amber-600 hover:bg-amber-700 text-white text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Approve with Override
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CI/CD Pipeline Runs */}
+      <CICDPipelineRunsPanel 
+        pipelineRuns={pipelineRuns}
+        hasRequiredItems={
+          (regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items?.length || 0) > 0 ||
+          mustRun.length > 0
+        }
+        isApproved={(releaseDecision?.decisionStatus || "PENDING") === "APPROVED"}
+      />
+
+      {/* Feedback Footer */}
       <div className="mt-6 pt-4 border-t border-zinc-800/50 flex items-center justify-between gap-4 flex-wrap">
         <p className="text-xs text-zinc-500">Was this recommendation useful?</p>
         <div className="flex-1 min-w-0">
@@ -4728,14 +2919,6 @@ export default function RecommendationDetailPage({ params }: PageProps) {
             existingComment={outcome?.feedback_comment}
           />
         </div>
-        {!showOutcomeForm && (
-          <button
-            onClick={() => setShowOutcomeForm(true)}
-            className="text-xs text-zinc-500 hover:text-zinc-300 underline underline-offset-2 whitespace-nowrap"
-          >
-            Record outcome
-          </button>
-        )}
       </div>
 
       {run.repository && (

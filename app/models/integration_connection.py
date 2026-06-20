@@ -4,12 +4,12 @@ Integration Connection Model
 Stores connections to external systems (Jira, Azure DevOps, TestRail, Xray, Zephyr, etc.)
 in a provider-agnostic way to support multiple external systems without hardcoding one vendor.
 
-Credentials are encrypted using the workspace secret key from config.
+Credentials are encrypted using Fernet (AES) encryption with a key from CREDENTIAL_ENCRYPTION_KEY environment variable.
 """
 
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, ForeignKey, Text, Boolean
+from sqlalchemy import Column, String, DateTime, ForeignKey, Text, Boolean, Integer
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy import UniqueConstraint, Index
@@ -39,9 +39,12 @@ class IntegrationConnection(Base):
     - NEEDS_REAUTH: Credentials expired or need refresh
     
     Security:
-    - Credentials are encrypted using the workspace secret key
+    - Credentials are encrypted using Fernet (AES) encryption
+    - Encryption key from CREDENTIAL_ENCRYPTION_KEY environment variable
     - Never log plaintext credentials
-    - Credentials stored in encrypted_credentials JSONB field
+    - Credentials stored in encrypted_credentials JSONB field (encrypted string)
+    - credentials_encrypted_at tracks when credentials were last encrypted
+    - credentials_version tracks encryption format version for migrations
     """
     __tablename__ = "integration_connections"
 
@@ -89,12 +92,25 @@ class IntegrationConnection(Base):
         nullable=True
     )  # Base URL for the external system (e.g., "https://company.atlassian.net")
     
-    # Encrypted credentials (JSONB with encrypted fields)
-    # Structure: {"api_key": "encrypted_value", "username": "encrypted_value", ...}
+    # Encrypted credentials (encrypted string, not JSONB)
+    # Stores Fernet-encrypted credential dictionary as a string
+    # Use CredentialEncryptionService to encrypt/decrypt
     encrypted_credentials = Column(
-        JSONB,
+        Text,
         nullable=True
     )
+    
+    # Credential encryption tracking
+    credentials_encrypted_at = Column(
+        DateTime,
+        nullable=True
+    )  # Timestamp when credentials were last encrypted
+    
+    credentials_version = Column(
+        Integer,
+        nullable=False,
+        default=1
+    )  # Encryption format version (for migrations)
     
     # Provider-specific metadata (JSONB)
     # Structure: {"external_project_id": "PROJ-123", "default_test_suite_id": 456, ...}

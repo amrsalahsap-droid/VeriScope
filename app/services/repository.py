@@ -2,24 +2,23 @@ from uuid import UUID
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 from app.models.repository import Repository
+from app.models.user import Workspace
 from app.schemas.repository import RepositoryCreate
 from app.repositories.repository import RepositoryRepository
-from app.repositories.organization import OrganizationRepository
 
 class RepositoryService:
     def __init__(self, db: Session):
         self.db = db
         self.repo_repository = RepositoryRepository(db)
-        self.org_repository = OrganizationRepository(db)
 
     def create_repository(self, repo_in: RepositoryCreate) -> Repository:
-        """Create a repository ensuring org existence and github_repo_id uniqueness."""
-        # Ensure organization exists and is active
-        org = self.org_repository.get_active(repo_in.organization_id)
-        if not org:
+        """Create a repository ensuring workspace existence and github_repo_id uniqueness."""
+        # Ensure workspace exists
+        workspace = self.db.query(Workspace).filter(Workspace.id == repo_in.organization_id).first()
+        if not workspace:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Organization with ID {repo_in.organization_id} not found."
+                detail=f"Workspace with ID {repo_in.organization_id} not found."
             )
 
         # Enforce unique github_repo_id
@@ -31,7 +30,7 @@ class RepositoryService:
             )
 
         db_repo = Repository(
-            organization_id=repo_in.organization_id,
+            workspace_id=repo_in.organization_id,
             github_repo_id=repo_in.github_repo_id,
             name=repo_in.name,
             full_name=repo_in.full_name,

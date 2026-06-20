@@ -17,7 +17,7 @@ class BehaviorEvidence(Base):
     evidence_type = Column(String, nullable=False, index=True)  # ROUTE, PAGE, MODULE, TEST, PR_TITLE, PR_DESCRIPTION, README, CONFIG, MANUAL
     
     # Source identification
-    source_path = Column(String, nullable=True, index=True)  # File path or URL
+    source_path = Column(String, nullable=True)  # File path or URL
     source_name = Column(String, nullable=True)  # Human-readable source name
     
     # Evidence content

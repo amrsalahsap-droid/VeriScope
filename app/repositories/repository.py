@@ -15,7 +15,13 @@ class RepositoryRepository(BaseRepository[Repository]):
         ).first()
 
     def get_by_organization(self, organization_id: UUID) -> List[Repository]:
-        """Fetch all repositories registered under a given organization."""
+        """Fetch all repositories registered under a given organization (compatibility wrapper)."""
         return self.db.query(self.model).filter(
-            self.model.organization_id == organization_id
+            self.model.workspace_id == organization_id
+        ).all()
+
+    def get_by_workspace(self, workspace_id: UUID) -> List[Repository]:
+        """Fetch all repositories registered under a given workspace."""
+        return self.db.query(self.model).filter(
+            self.model.workspace_id == workspace_id
         ).all()

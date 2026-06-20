@@ -36,6 +36,7 @@ class Workspace(Base):
     integration_connections = relationship("IntegrationConnection", back_populates="workspace", cascade="all, delete-orphan")
     external_work_items = relationship("ExternalWorkItem", back_populates="workspace", cascade="all, delete-orphan")
     external_test_cases = relationship("ExternalTestCase", back_populates="workspace", cascade="all, delete-orphan")
+    ci_cd_policy_default = relationship("WorkspaceCICDPolicyDefault", back_populates="workspace", uselist=False, cascade="all, delete-orphan")
 
 
 class WorkspaceMember(Base):

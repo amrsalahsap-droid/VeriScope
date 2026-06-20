@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import React, { useState } from "react";
 import { Brain, Target, Globe, Layers, FileCode, GitBranch, ChevronDown, ChevronUp, AlertTriangle } from "lucide-react";
 import { mapRawLabel, generateBusinessImpact, generateImpactedFlows, generateTechnicalAreas, generateWhyItMatters } from "@/lib/label-mapper";
 

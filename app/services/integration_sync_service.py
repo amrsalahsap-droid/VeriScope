@@ -20,10 +20,13 @@ from app.models.external_work_item import ExternalWorkItem
 from app.models.external_test_case_detailed import ExternalTestCase
 from app.models.pull_request import PullRequest
 from app.models.repository import Repository
+from app.models.manual_test_execution import ManualTestExecution
+from app.models.manual_execution_sync_event import ManualExecutionSyncEvent
 from app.services.pr_work_item_linker import PRWorkItemLinker
 from app.services.jira_connector import JiraConnector
 from app.services.azure_devops_connector import AzureDevOpsConnector
 from app.services.testrail_connector import TestRailConnector
+from app.services.provider_sync.provider_registry import ProviderRegistry
 from app.services.work_item_behavior_mapper import WorkItemBehaviorMapper
 from app.services.external_test_case_scenario_mapper import ExternalTestCaseScenarioMapper
 
@@ -577,3 +580,448 @@ class IntegrationSyncService:
             self.db.add(test_case)
             self.db.commit()
             return test_case
+    
+    def sync_manual_execution_to_provider(
+        self,
+        execution_id: uuid.UUID
+    ) -> Dict[str, Any]:
+        """
+        Sync manual test execution result to external provider (TestRail).
+        
+        Flow:
+        1. Find execution
+        2. Find linked ExternalTestCase
+        3. Find IntegrationConnection
+        4. Get connector
+        5. Push result
+        6. Update execution sync fields
+        7. Create sync event audit trail
+        
+        Args:
+            execution_id: ManualTestExecution ID
+            
+        Returns:
+            Dictionary with sync result
+        """
+        # Find execution
+        execution = self.db.query(ManualTestExecution).filter(
+            ManualTestExecution.id == execution_id
+        ).first()
+        
+        if not execution:
+            return {
+                'success': False,
+                'status': 'FAILED',
+                'error': f'Execution {execution_id} not found'
+            }
+        
+        # Find linked ExternalTestCase
+        external_test_case = self.db.query(ExternalTestCase).filter(
+            ExternalTestCase.id == execution.external_test_case_id
+        ).first()
+        
+        if not external_test_case:
+            return {
+                'success': False,
+                'status': 'FAILED',
+                'error': f'External test case {execution.external_test_case_id} not found'
+            }
+        
+        # Check provider sync capability via registry (replaces hardcoded TESTRAIL guard)
+        registry = ProviderRegistry()
+        provider = external_test_case.provider
+
+        if not registry.is_execution_sync_supported(provider):
+            cap = registry.get_capability(provider)
+            if cap is None:
+                error_msg = f'Provider {provider} is not registered in the sync framework'
+            else:
+                error_msg = (
+                    f'Provider {provider} does not support execution sync '
+                    f'(supports_execution_sync=False)'
+                )
+            return {
+                'success': False,
+                'status': 'FAILED',
+                'error': error_msg
+            }
+
+        # Find IntegrationConnection
+        connection = self.db.query(IntegrationConnection).filter(
+            IntegrationConnection.id == external_test_case.integration_connection_id
+        ).first()
+
+        if not connection:
+            return {
+                'success': False,
+                'status': 'FAILED',
+                'error': f'Integration connection {external_test_case.integration_connection_id} not found'
+            }
+
+        # Get sync connector via registry (provider-agnostic)
+        config = connection.config or {}
+        connector = registry.get_connector(provider, config)
+
+        if not connector:
+            return {
+                'success': False,
+                'status': 'FAILED',
+                'error': f'No sync connector available for provider {provider}'
+            }
+        
+        # Prepare test case reference with run_id from provider metadata
+        test_case_reference = {
+            'external_id': external_test_case.external_id,
+            'external_key': external_test_case.external_key,
+            'run_id': connection.provider_metadata.get('default_test_run_id') if connection.provider_metadata else None
+        }
+        
+        # Prepare execution data
+        execution_data = {
+            'outcome': execution.outcome,
+            'notes': execution.notes,
+            'executed_by': execution.executed_by_name,
+            'executed_at': execution.executed_at.isoformat() if execution.executed_at else None
+        }
+        
+        # Sanitize request payload to ensure no credentials are persisted
+        from app.services.security.credential_encryption_service import get_credential_encryption_service
+        try:
+            encryption_service = get_credential_encryption_service()
+            sanitized_request_payload = encryption_service.redact({
+                'test_case_reference': test_case_reference,
+                'execution': execution_data
+            })
+        except Exception:
+            # If encryption service fails, still sanitize with basic redaction
+            sanitized_request_payload = {
+                'test_case_reference': test_case_reference,
+                'execution': execution_data
+            }
+        
+        # Create sync event record (PENDING)
+        sync_event = ManualExecutionSyncEvent(
+            id=uuid.uuid4(),
+            execution_id=execution_id,
+            provider=connection.provider,
+            status='PENDING',
+            request_payload=sanitized_request_payload,
+            response_payload=None,
+            error_message=None,
+            external_run_id=None,
+            external_execution_id=None,
+            created_at=datetime.utcnow(),
+            attempt_count=0,
+            max_attempts=3
+        )
+        self.db.add(sync_event)
+        self.db.commit()
+        
+        return {
+            'success': True,
+            'status': 'PENDING',
+            'sync_event_id': str(sync_event.id)
+        }
+    
+    def enqueue_manual_execution_sync(self, execution_id: uuid.UUID) -> Dict[str, Any]:
+        """
+        Enqueue a manual execution for sync (called by manual execution creation).
+        
+        Args:
+            execution_id: ID of the manual execution to sync
+            
+        Returns:
+            Enqueue result
+        """
+        # Get execution
+        execution = self.db.query(ManualTestExecution).filter(
+            ManualTestExecution.id == execution_id
+        ).first()
+        
+        if not execution:
+            logger.error(f"Execution {execution_id} not found for enqueue")
+            return {
+                'success': False,
+                'status': 'FAILED',
+                'error': f'Execution {execution_id} not found'
+            }
+        
+        # Get external test case
+        external_test_case = self.db.query(ExternalTestCase).filter(
+            ExternalTestCase.id == execution.external_test_case_id
+        ).first()
+        
+        if not external_test_case:
+            logger.error(f"External test case {execution.external_test_case_id} not found")
+            return {
+                'success': False,
+                'status': 'FAILED',
+                'error': 'External test case not found'
+            }
+        
+        # Get connection
+        connection = self.db.query(IntegrationConnection).filter(
+            IntegrationConnection.id == external_test_case.integration_connection_id
+        ).first()
+        
+        if not connection:
+            logger.error(f"Integration connection {external_test_case.integration_connection_id} not found")
+            return {
+                'success': False,
+                'status': 'FAILED',
+                'error': 'Integration connection not found'
+            }
+        
+        # Check if provider supports execution sync
+        from app.services.provider_sync.provider_registry import ProviderRegistry
+        registry = ProviderRegistry()
+        if not registry.is_execution_sync_supported(connection.provider):
+            logger.info(f"Provider {connection.provider} does not support execution sync, skipping enqueue")
+            return {
+                'success': True,
+                'status': 'SKIPPED',
+                'error': 'Provider does not support execution sync'
+            }
+        
+        # Prepare test case reference
+        test_case_reference = {
+            'external_id': external_test_case.external_id,
+            'external_key': external_test_case.external_key,
+            'run_id': connection.provider_metadata.get('default_test_run_id') if connection.provider_metadata else None
+        }
+        
+        # Prepare execution data
+        execution_data = {
+            'outcome': execution.outcome,
+            'notes': execution.notes,
+            'executed_by': execution.executed_by_name,
+            'executed_at': execution.executed_at.isoformat() if execution.executed_at else None
+        }
+        
+        # Sanitize request payload
+        from app.services.security.credential_encryption_service import get_credential_encryption_service
+        try:
+            encryption_service = get_credential_encryption_service()
+            sanitized_request_payload = encryption_service.redact({
+                'test_case_reference': test_case_reference,
+                'execution': execution_data
+            })
+        except Exception:
+            sanitized_request_payload = {
+                'test_case_reference': test_case_reference,
+                'execution': execution_data
+            }
+        
+        # Create sync event record (PENDING)
+        sync_event = ManualExecutionSyncEvent(
+            id=uuid.uuid4(),
+            execution_id=execution_id,
+            provider=connection.provider,
+            status='PENDING',
+            request_payload=sanitized_request_payload,
+            response_payload=None,
+            error_message=None,
+            external_run_id=None,
+            external_execution_id=None,
+            created_at=datetime.utcnow(),
+            attempt_count=0,
+            max_attempts=3
+        )
+        self.db.add(sync_event)
+        self.db.commit()
+        
+        logger.info(f"Enqueued sync event {sync_event.id} for execution {execution_id}")
+        
+        return {
+            'success': True,
+            'status': 'PENDING',
+            'sync_event_id': str(sync_event.id)
+        }
+    
+    def process_sync_event(self, sync_event_id: uuid.UUID) -> Dict[str, Any]:
+        """
+        Process a sync event (called by queue worker).
+        
+        Args:
+            sync_event_id: ID of the sync event to process
+            
+        Returns:
+            Sync result
+        """
+        # Get sync event
+        sync_event = self.db.query(ManualExecutionSyncEvent).filter(
+            ManualExecutionSyncEvent.id == sync_event_id
+        ).first()
+        
+        if not sync_event:
+            logger.error(f"Sync event {sync_event_id} not found")
+            return {
+                'success': False,
+                'status': 'FAILED',
+                'error': f'Sync event {sync_event_id} not found'
+            }
+        
+        # Mark as IN_PROGRESS
+        sync_event.status = 'IN_PROGRESS'
+        sync_event.locked_at = datetime.utcnow()
+        self.db.commit()
+        
+        # Get execution
+        execution = self.db.query(ManualTestExecution).filter(
+            ManualTestExecution.id == sync_event.execution_id
+        ).first()
+        
+        if not execution:
+            logger.error(f"Execution {sync_event.execution_id} not found")
+            sync_event.status = 'FAILED'
+            sync_event.last_error = 'Execution not found'
+            sync_event.locked_at = None
+            self.db.commit()
+            return {
+                'success': False,
+                'status': 'FAILED',
+                'error': 'Execution not found'
+            }
+        
+        # Get connection
+        external_test_case = self.db.query(ExternalTestCase).filter(
+            ExternalTestCase.id == execution.external_test_case_id
+        ).first()
+        
+        if not external_test_case:
+            logger.error(f"External test case {execution.external_test_case_id} not found")
+            sync_event.status = 'FAILED'
+            sync_event.last_error = 'External test case not found'
+            sync_event.locked_at = None
+            self.db.commit()
+            return {
+                'success': False,
+                'status': 'FAILED',
+                'error': 'External test case not found'
+            }
+        
+        connection = self.db.query(IntegrationConnection).filter(
+            IntegrationConnection.id == external_test_case.integration_connection_id
+        ).first()
+        
+        if not connection:
+            logger.error(f"Integration connection {external_test_case.integration_connection_id} not found")
+            sync_event.status = 'FAILED'
+            sync_event.last_error = 'Integration connection not found'
+            sync_event.locked_at = None
+            self.db.commit()
+            return {
+                'success': False,
+                'status': 'FAILED',
+                'error': 'Integration connection not found'
+            }
+        
+        # Get sync connector
+        provider = connection.provider
+        registry = ProviderRegistry()
+        config = {}
+        
+        # Decrypt credentials
+        try:
+            encryption_service = get_credential_encryption_service()
+            config = encryption_service.decrypt(connection.encrypted_credentials)
+        except Exception as e:
+            logger.error(f"Failed to decrypt credentials for {provider}: {e}")
+            sync_event.status = 'FAILED'
+            sync_event.last_error = f'Failed to decrypt credentials: {e}'
+            sync_event.locked_at = None
+            self.db.commit()
+            return {
+                'success': False,
+                'status': 'FAILED',
+                'error': f'Failed to decrypt credentials: {e}'
+            }
+        
+        connector = registry.get_connector(provider, config)
+        
+        if not connector:
+            logger.error(f"No sync connector available for provider {provider}")
+            sync_event.status = 'FAILED'
+            sync_event.last_error = f'No sync connector available for provider {provider}'
+            sync_event.locked_at = None
+            self.db.commit()
+            return {
+                'success': False,
+                'status': 'FAILED',
+                'error': f'No sync connector available for provider {provider}'
+            }
+        
+        # Prepare test case reference
+        test_case_reference = {
+            'external_id': external_test_case.external_id,
+            'external_key': external_test_case.external_key,
+            'run_id': connection.provider_metadata.get('default_test_run_id') if connection.provider_metadata else None
+        }
+        
+        # Prepare execution data
+        execution_data = {
+            'outcome': execution.outcome,
+            'notes': execution.notes,
+            'executed_by': execution.executed_by_name,
+            'executed_at': execution.executed_at.isoformat() if execution.executed_at else None
+        }
+        
+        # Push result
+        try:
+            sync_result = connector.push_execution_result(test_case_reference, execution_data)
+            
+            # Sanitize response payload
+            try:
+                encryption_service = get_credential_encryption_service()
+                sanitized_response_payload = encryption_service.redact(sync_result)
+            except Exception:
+                sanitized_response_payload = sync_result
+            
+            # Update sync event
+            sync_event.status = sync_result.get('status', 'FAILED')
+            sync_event.response_payload = sanitized_response_payload
+            sync_event.error_message = sync_result.get('error')
+            sync_event.external_run_id = sync_result.get('external_run_id')
+            sync_event.external_execution_id = sync_result.get('external_execution_id')
+            sync_event.locked_at = None
+            sync_event.locked_by = None
+            
+            if sync_event.status == 'SYNCED':
+                sync_event.completed_at = datetime.utcnow()
+            
+            # Update execution sync fields
+            execution.external_system = connection.provider
+            execution.external_run_id = sync_result.get('external_run_id')
+            execution.external_execution_id = sync_result.get('external_execution_id')
+            execution.sync_status = sync_result.get('status')
+            execution.last_synced_at = datetime.utcnow()
+            
+            self.db.commit()
+            
+            return {
+                'success': sync_result.get('success', False),
+                'status': sync_result.get('status'),
+                'external_run_id': sync_result.get('external_run_id'),
+                'external_execution_id': sync_result.get('external_execution_id'),
+                'error': sync_result.get('error')
+            }
+            
+        except Exception as e:
+            error_msg = f'Failed to sync execution: {str(e)}'
+            logger.error(error_msg)
+            
+            # Update sync event as failed
+            sync_event.status = 'FAILED'
+            sync_event.error_message = error_msg
+            
+            # Update execution sync fields
+            execution.sync_status = 'FAILED'
+            execution.last_synced_at = datetime.utcnow()
+            
+            self.db.commit()
+            
+            return {
+                'success': False,
+                'status': 'FAILED',
+                'error': error_msg
+            }

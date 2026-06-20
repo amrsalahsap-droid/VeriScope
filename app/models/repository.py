@@ -34,6 +34,9 @@ class Repository(Base):
     # Framework and metadata
     framework_hints = Column(JSONB, nullable=True) # ["nextjs", "react", etc.]
 
+    # CI/CD quality gate behavior
+    ci_fail_on_partial = Column(Boolean, nullable=False, default=False)
+
     # Sync health
     last_synced_at = Column(DateTime, nullable=True)
     last_webhook_at = Column(DateTime, nullable=True)
@@ -53,6 +56,14 @@ class Repository(Base):
     def workspace_path(self) -> str:
         """Fallback property for local checkout path compatibility."""
         return ""
+
+    @property
+    def organization_id(self):
+        return self.workspace_id
+
+    @organization_id.setter
+    def organization_id(self, value):
+        self.workspace_id = value
 
     # Constraints
     __table_args__ = (
@@ -84,6 +95,7 @@ class Repository(Base):
     architecture_edges = relationship("ArchitectureEdge", back_populates="repository", cascade="all, delete-orphan")
     releases = relationship("Release", back_populates="repository", cascade="all, delete-orphan")
     regression_suites = relationship("RegressionSuite", back_populates="repository", cascade="all, delete-orphan")
+    pipeline_runs = relationship("PipelineRun", back_populates="repository", cascade="all, delete-orphan")
     # test_assets = relationship("TestAsset", back_populates="repository", cascade="all, delete-orphan")  # Table not yet migrated
 
 

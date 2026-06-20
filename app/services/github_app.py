@@ -664,8 +664,11 @@ class GitHubAppService:
         webhook_delivery_id: Optional[str] = None
     ) -> UUID:
         """Enqueue a background pull request synchronization job with duplicate protection and superseding."""
-        # 1. Retrieve or create PullRequest stub
-        pr = self.db.query(PullRequest).filter(PullRequest.github_pr_id == github_pr_id).first()
+        # 1. Retrieve or create PullRequest stub — scope by repository_id to prevent cross-workspace collision
+        pr = self.db.query(PullRequest).filter(
+            PullRequest.github_pr_id == github_pr_id,
+            PullRequest.repository_id == repository_id
+        ).first()
         if not pr:
             pr = PullRequest(
                 repository_id=repository_id,

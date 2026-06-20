@@ -492,7 +492,7 @@ def test_acknowledge_recommendation_readiness():
         
         response = client.post(url, json=body, headers=headers)
         assert response.status_code == 200
-        assert response.json()["status"] == "success"
+        assert response.json()["status"] == "acknowledged"
 
         # Check DB
         db.refresh(rec_run)

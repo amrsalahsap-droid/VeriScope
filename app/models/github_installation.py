@@ -56,3 +56,11 @@ class GitHubInstallation(Base):
 
     # Relationships
     workspace = relationship("Workspace", back_populates="github_installation")
+
+    @property
+    def organization_id(self):
+        return self.workspace_id
+
+    @organization_id.setter
+    def organization_id(self, value):
+        self.workspace_id = value

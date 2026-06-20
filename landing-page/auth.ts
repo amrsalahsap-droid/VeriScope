@@ -3,6 +3,9 @@ import GitHub from "next-auth/providers/github";
 import { SignJWT, jwtVerify } from "jose";
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
+  session: {
+    strategy: "jwt",
+  },
   providers: [
     GitHub({
       clientId: process.env.AUTH_GITHUB_ID,

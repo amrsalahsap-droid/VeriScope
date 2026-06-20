@@ -187,6 +187,52 @@ class ManualTestCaseCSVImport:
                     )
                     
                     self.db.add(test_case)
+                    
+                    # Phase 6.1: Import linked AC mapping if matching AC exists
+                    if parsed.linked_acceptance_criteria:
+                        from app.models.acceptance_criterion import AcceptanceCriterion
+                        from app.models.manual_test_requirement_mapping import ManualTestRequirementMapping
+                        
+                        ac_refs = [ref.strip() for ref in parsed.linked_acceptance_criteria.split(',') if ref.strip()]
+                        for ac_ref in ac_refs:
+                            ac = None
+                            try:
+                                ac_uuid = uuid.UUID(ac_ref)
+                                ac = self.db.query(AcceptanceCriterion).filter(
+                                    AcceptanceCriterion.id == ac_uuid,
+                                    AcceptanceCriterion.repository_id == repository_id
+                                ).first()
+                            except ValueError:
+                                pass
+                            
+                            if not ac:
+                                try:
+                                    ref_clean = ac_ref.upper().replace("AC-", "").strip()
+                                    source_num = int(ref_clean)
+                                    ac = self.db.query(AcceptanceCriterion).filter(
+                                        AcceptanceCriterion.source_number == source_num,
+                                        AcceptanceCriterion.repository_id == repository_id
+                                    ).first()
+                                except ValueError:
+                                    pass
+                            
+                            if not ac:
+                                ac = self.db.query(AcceptanceCriterion).filter(
+                                    (AcceptanceCriterion.label == ac_ref) | (AcceptanceCriterion.text == ac_ref),
+                                    AcceptanceCriterion.repository_id == repository_id
+                                ).first()
+                                
+                            if ac:
+                                mapping = ManualTestRequirementMapping(
+                                    id=uuid.uuid4(),
+                                    external_test_case_id=test_case.id,
+                                    acceptance_criterion_id=ac.id,
+                                    repository_id=repository_id,
+                                    mapping_source="IMPORTED",
+                                    is_active=True
+                                )
+                                self.db.add(mapping)
+                    
                     result.successful_imports += 1
                     
                 except Exception as e:

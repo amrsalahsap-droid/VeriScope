@@ -1,5 +1,6 @@
 "use client";
 
+import React from "react";
 import RecommendationReadinessGate from "@/components/recommendations/recommendation-readiness-gate";
 
 interface RecommendationCheckpointModalProps {

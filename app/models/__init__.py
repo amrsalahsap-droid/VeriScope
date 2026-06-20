@@ -88,6 +88,25 @@ from app.models.architecture_edge import (
 from app.models.release import Release, ReleaseType, ReleaseStatus
 from app.models.regression_suite import RegressionSuite, SuiteType, SuiteStatus, RegressionScopeItem, ScopeOverride
 from app.models.test_asset import TestAsset
+from app.models.risk_review import RiskReview
+from app.models.release_decision import ReleaseDecision
+from app.models.release_decision_history import ReleaseDecisionHistory
+from app.models.manual_test_execution import ManualTestExecution
+from app.models.manual_test_requirement_mapping import ManualTestRequirementMapping
+from app.models.pipeline_run import PipelineRun, PipelineRunStatus, QualityGateStatus, TriggerSource
+from app.models.pipeline_execution_job import PipelineExecutionJob, PipelineJobStatus
+from app.models.ci_token import RepositoryCIToken
+from app.models.ci_token_audit import CITokenAuditEvent, AuditEventType, ActorType
+from app.models.governance_role_assignment import GovernanceRoleAssignment, GovernanceRole, ScopeType
+from app.models.governance_notification import GovernanceNotification, NotificationType, NotificationSeverity, NotificationStatus
+from app.models.governance_notification_preference import GovernanceNotificationPreference
+from app.models.workspace_governance_audit_event import WorkspaceGovernanceAuditEvent
+from app.models.workspace_ci_cd_policy_default import WorkspaceCICDPolicyDefault
+from app.models.ci_cd_policy_exception import CICDPolicyException
+from app.models.ci_cd_governance_review_snapshot import CICDGovernanceReviewSnapshot
+from app.models.governance_access_review import GovernanceAccessReview
+from app.models.governance_access_review_item import GovernanceAccessReviewItem
+
 
 
 __all__ = [
@@ -179,4 +198,33 @@ __all__ = [
     "RegressionScopeItem",
     "ScopeOverride",
     "TestAsset",
+    "RiskReview",
+    "ReleaseDecision",
+    "ReleaseDecisionHistory",
+    "ManualTestExecution",
+    "ManualTestRequirementMapping",
+    "PipelineRun",
+    "PipelineRunStatus",
+    "QualityGateStatus",
+    "TriggerSource",
+    "PipelineExecutionJob",
+    "PipelineJobStatus",
+    "RepositoryCIToken",
+    "CITokenAuditEvent",
+    "AuditEventType",
+    "ActorType",
+    "GovernanceRoleAssignment",
+    "GovernanceRole",
+    "ScopeType",
+    "GovernanceNotification",
+    "NotificationType",
+    "NotificationSeverity",
+    "NotificationStatus",
+    "GovernanceNotificationPreference",
+    "WorkspaceGovernanceAuditEvent",
+    "WorkspaceCICDPolicyDefault",
+    "CICDPolicyException",
+    "CICDGovernanceReviewSnapshot",
+    "GovernanceAccessReview",
+    "GovernanceAccessReviewItem",
 ]

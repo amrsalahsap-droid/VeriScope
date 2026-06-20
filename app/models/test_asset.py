@@ -53,11 +53,11 @@ class TestAsset(Base):
     repository_id = Column(UUID(as_uuid=True), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False, index=True)
     
     # Links to test assets (one of these should be set)
-    test_case_id = Column(UUID(as_uuid=True), ForeignKey("test_cases.id", ondelete="SET NULL"), nullable=True, index=True)
-    external_test_case_id = Column(UUID(as_uuid=True), ForeignKey("external_test_cases.id", ondelete="SET NULL"), nullable=True, index=True)
+    test_case_id = Column(UUID(as_uuid=True), ForeignKey("test_cases.id", ondelete="SET NULL"), nullable=True)
+    external_test_case_id = Column(UUID(as_uuid=True), ForeignKey("external_test_cases.id", ondelete="SET NULL"), nullable=True)
     
     # Display identity
-    stable_identity = Column(String, nullable=True, index=True)
+    stable_identity = Column(String, nullable=True)
     display_name = Column(String, nullable=False)
     
     # Classification

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import React, { useState, useEffect } from "react";
 import { useParams } from "next/navigation";
 import { 
   ArrowLeft, 
@@ -17,6 +17,9 @@ import {
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import Link from "next/link";
+import ProviderCapabilityCard from "@/components/ProviderCapabilityCard";
+import IntegrationHealthPanel from "@/components/IntegrationHealthPanel";
+import IntegrationSyncActivityFeed from "@/components/IntegrationSyncActivityFeed";
 
 export const dynamic = "force-dynamic";
 
@@ -28,6 +31,36 @@ interface IntegrationConnection {
     base_url?: string;
     username?: string;
   } | null;
+}
+
+interface ProviderCapability {
+  provider: string;
+  supportsExecutionSync: boolean;
+  supportsBidirectionalSync: boolean;
+  supportsTestImport: boolean;
+  supportsWorkItemImport: boolean;
+  supportsWebhooks: boolean;
+}
+
+interface HealthStatus {
+  provider: string;
+  health: 'HEALTHY' | 'DISCONNECTED' | 'CONFIGURATION_REQUIRED' | 'AUTHENTICATION_FAILED' | 'SYNC_FAILURES_PRESENT';
+  isConnected: boolean;
+  lastSyncStatus: string | null;
+  lastSyncError: string | null;
+  missingConfiguration: string | null;
+}
+
+interface SyncActivity {
+  id: string;
+  provider: string;
+  executionId: string;
+  status: string;
+  error: string | null;
+  externalRunId: string | null;
+  externalExecutionId: string | null;
+  createdAt: string | null;
+  lastSyncedAt: string | null;
 }
 
 const PROVIDERS = [
@@ -96,18 +129,18 @@ const PROVIDERS = [
 export default function IntegrationsPage() {
   const params = useParams();
   const repositoryId = params.repositoryId as string;
-  
+
   const [connections, setConnections] = useState<IntegrationConnection[]>([]);
+  const [providerCapabilities, setProviderCapabilities] = useState<ProviderCapability[]>([]);
+  const [healthStatuses, setHealthStatuses] = useState<HealthStatus[]>([]);
+  const [syncActivities, setSyncActivities] = useState<SyncActivity[]>([]);
   const [loading, setLoading] = useState(true);
   const [testingConnection, setTestingConnection] = useState<string | null>(null);
   const [connectingProvider, setConnectingProvider] = useState<string | null>(null);
+  const [retryingProvider, setRetryingProvider] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
   const [selectedProvider, setSelectedProvider] = useState<any>(null);
   const [formData, setFormData] = useState<Record<string, string>>({});
-
-  useEffect(() => {
-    loadIntegrations();
-  }, [repositoryId]);
 
   const loadIntegrations = async () => {
     try {
@@ -123,6 +156,50 @@ export default function IntegrationsPage() {
       setLoading(false);
     }
   };
+
+  const loadCapabilities = async () => {
+    try {
+      const response = await fetch(`/api/repositories/${repositoryId}/integrations/providers`);
+      if (response.ok) {
+        const data = await response.json();
+        setProviderCapabilities(data);
+      }
+    } catch (error) {
+      // Non-blocking: capabilities are decorative, not critical
+      console.warn("Failed to load provider capabilities:", error);
+    }
+  };
+
+  const loadHealth = async () => {
+    try {
+      const response = await fetch(`/api/repositories/${repositoryId}/integrations/health`);
+      if (response.ok) {
+        const data = await response.json();
+        setHealthStatuses(data);
+      }
+    } catch (error) {
+      console.warn("Failed to load integration health:", error);
+    }
+  };
+
+  const loadSyncActivity = async () => {
+    try {
+      const response = await fetch(`/api/repositories/${repositoryId}/integrations/sync-activity?limit=20`);
+      if (response.ok) {
+        const data = await response.json();
+        setSyncActivities(data);
+      }
+    } catch (error) {
+      console.warn("Failed to load sync activity:", error);
+    }
+  };
+
+  useEffect(() => {
+    loadIntegrations();
+    loadCapabilities();
+    loadHealth();
+    loadSyncActivity();
+  }, [repositoryId]);
 
   const handleTestConnection = async (provider: string) => {
     setTestingConnection(provider);
@@ -193,6 +270,32 @@ export default function IntegrationsPage() {
       }
     } catch (error) {
       toast.error(`Failed to disconnect ${provider}`);
+    }
+  };
+
+  const handleRetryFailedSyncs = async (provider: string) => {
+    if (!confirm(`Retry all failed ${provider} syncs?`)) return;
+    
+    setRetryingProvider(provider);
+    try {
+      const response = await fetch(`/api/repositories/${repositoryId}/integrations/retry-failed-syncs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider })
+      });
+
+      if (response.ok) {
+        const result = await response.json();
+        toast.success(`Retried ${result.retriedCount} ${provider} syncs${result.failedCount > 0 ? `, ${result.failedCount} failed` : ''}`);
+        loadSyncActivity();
+        loadHealth();
+      } else {
+        toast.error(`Failed to retry ${provider} syncs`);
+      }
+    } catch (error) {
+      toast.error(`Failed to retry ${provider} syncs`);
+    } finally {
+      setRetryingProvider(null);
     }
   };
 
@@ -344,6 +447,130 @@ export default function IntegrationsPage() {
           );
         })}
       </div>
+
+      {/* Phase 7.4: Provider Capability Dashboard */}
+      {providerCapabilities.length > 0 && (
+        <div className="space-y-4">
+          <div>
+            <h2 className="text-lg font-semibold text-white">Provider Capabilities</h2>
+            <p className="text-sm text-zinc-400 mt-1">
+              Detailed capability information for each provider
+            </p>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {providerCapabilities.map((cap) => {
+              const provider = PROVIDERS.find(p => p.id === cap.provider);
+              if (!provider) return null;
+              const connection = getConnection(cap.provider);
+              return (
+                <ProviderCapabilityCard
+                  key={cap.provider}
+                  provider={cap.provider}
+                  providerName={provider.name}
+                  isConnected={connection?.is_connected || false}
+                  supportsExecutionSync={cap.supportsExecutionSync}
+                  supportsTestImport={cap.supportsTestImport}
+                  supportsWorkItemImport={cap.supportsWorkItemImport}
+                  supportsWebhooks={cap.supportsWebhooks}
+                  supportsBidirectionalSync={cap.supportsBidirectionalSync}
+                  icon={provider.icon}
+                />
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Phase 7.4: Integration Health Panel */}
+      {healthStatuses.length > 0 && (
+        <IntegrationHealthPanel 
+          healthStatuses={healthStatuses}
+          onRetryFailedSyncs={handleRetryFailedSyncs}
+          retryingProvider={retryingProvider}
+        />
+      )}
+
+      {/* Phase 7.4: Sync Activity Feed */}
+      {syncActivities.length > 0 && (
+        <IntegrationSyncActivityFeed
+          activities={syncActivities}
+          onProviderFilterChange={(provider) => {
+            // Reload sync activity with filter
+            const url = provider 
+              ? `/api/repositories/${repositoryId}/integrations/sync-activity?provider=${provider}&limit=20`
+              : `/api/repositories/${repositoryId}/integrations/sync-activity?limit=20`;
+            fetch(url)
+              .then(res => res.json())
+              .then(data => setSyncActivities(data))
+              .catch(err => console.warn("Failed to load filtered sync activity:", err));
+          }}
+        />
+      )}
+
+      {/* Provider Capability Matrix */}
+      {providerCapabilities.length > 0 && (
+        <div className="space-y-4">
+          <div>
+            <h2 className="text-lg font-semibold text-white">Sync Capability Matrix</h2>
+            <p className="text-sm text-zinc-400 mt-1">
+              Which providers support execution result synchronization in the current phase.
+            </p>
+          </div>
+          <div className="bg-zinc-900/10 border border-zinc-900 rounded-xl overflow-hidden">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-zinc-800">
+                  <th className="text-left px-6 py-3 text-zinc-400 font-medium">Provider</th>
+                  <th className="text-left px-6 py-3 text-zinc-400 font-medium">Execution Sync</th>
+                  <th className="text-left px-6 py-3 text-zinc-400 font-medium">Bidirectional Sync</th>
+                </tr>
+              </thead>
+              <tbody>
+                {providerCapabilities.map((cap, idx) => (
+                  <tr
+                    key={cap.provider}
+                    className={`border-b border-zinc-900 ${
+                      idx === providerCapabilities.length - 1 ? "border-b-0" : ""
+                    }`}
+                  >
+                    <td className="px-6 py-3 font-medium text-zinc-200">
+                      {PROVIDERS.find(p => p.id === cap.provider)?.name || cap.provider}
+                    </td>
+                    <td className="px-6 py-3">
+                      {cap.supportsExecutionSync ? (
+                        <span className="inline-flex items-center gap-1.5 text-green-400 text-xs font-medium">
+                          <CheckCircle className="w-3.5 h-3.5" />
+                          Supported
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1.5 text-zinc-500 text-xs font-medium">
+                          {["XRAY", "ZEPHYR"].includes(cap.provider) ? (
+                            <>
+                              <Clock className="w-3.5 h-3.5" />
+                              Planned
+                            </>
+                          ) : (
+                            <>
+                              <XCircle className="w-3.5 h-3.5" />
+                              Not Supported
+                            </>
+                          )}
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-6 py-3">
+                      <span className="inline-flex items-center gap-1.5 text-zinc-500 text-xs font-medium">
+                        <XCircle className="w-3.5 h-3.5" />
+                        Not Supported
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       {/* Connection Modal */}
       {showModal && selectedProvider && (

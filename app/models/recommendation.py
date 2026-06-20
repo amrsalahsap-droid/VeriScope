@@ -94,6 +94,12 @@ class RecommendationRun(Base):
     stale_since = Column(DateTime, nullable=True)
     stale_input_types = Column(JSONB, nullable=True)
 
+    # Requirement Evidence Graph Snapshot (for audit/debug)
+    requirement_evidence_snapshot_json = Column(JSONB, nullable=True)
+    ac_traceability_snapshot_json = Column(JSONB, nullable=True)
+    missing_test_mapping_snapshot_json = Column(JSONB, nullable=True)
+    execution_mapping_snapshot_json = Column(JSONB, nullable=True)
+
     # Relationships
     repository = relationship("Repository", back_populates="recommendation_runs")
     pull_request = relationship("PullRequest")
@@ -101,6 +107,7 @@ class RecommendationRun(Base):
     pr_sync_job = relationship("PullRequestSyncJob")
     tests = relationship("RecommendationTest", back_populates="recommendation_run", cascade="all, delete-orphan")
     recommended_tests = relationship("RecommendedTest", back_populates="recommendation_run", cascade="all, delete-orphan")
+    pipeline_runs = relationship("PipelineRun", back_populates="recommendation_run", cascade="all, delete-orphan")
     outcome = relationship("RecommendationOutcome", back_populates="recommendation_run", uselist=False, cascade="all, delete-orphan")
     reasoning_entries = relationship("RecommendationReasoningEntry", back_populates="recommendation_run", cascade="all, delete-orphan")
     input_snapshot = relationship("RecommendationInputSnapshot", back_populates="recommendation_run", uselist=False, cascade="all, delete-orphan")

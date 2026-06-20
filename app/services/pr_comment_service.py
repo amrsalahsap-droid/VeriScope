@@ -346,7 +346,7 @@ class PRCommentService:
 
         repo = pr.repository
         installation = self.db.query(GitHubInstallation).filter(
-            GitHubInstallation.organization_id == repo.organization_id
+            GitHubInstallation.workspace_id == repo.workspace_id
         ).first()
 
         # ── 2. Ensure comment state exists ───────────────────
@@ -892,7 +892,7 @@ class PRCommentService:
 
         repo = pr.repository
         installation = self.db.query(GitHubInstallation).filter(
-            GitHubInstallation.organization_id == repo.organization_id
+            GitHubInstallation.workspace_id == repo.workspace_id
         ).first()
 
         if not installation or not self.client.app_id or not self.client.private_key:

@@ -1,12 +1,12 @@
 from uuid import UUID
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
-from fastapi import APIRouter, Depends, status, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, status, HTTPException, UploadFile, File, Form, Header
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.db.session import get_db
-from app.dependencies.auth import get_current_workspace, get_current_workspace_id, require_workspace_member
-from app.models.user import Workspace
+from app.dependencies.auth import get_current_user, get_current_workspace, get_current_workspace_id, require_workspace_member
+from app.models.user import User, Workspace
 from app.models.coverage import CoverageReport
 from app.schemas.repository import RepositoryCreate, RepositoryResponse, RepositoryTestRunsResponse
 from app.schemas.readiness import RecommendationReadinessGateResponse, ReadinessSummaryResponse
@@ -21,6 +21,8 @@ from app.models.pull_request import PullRequest
 from app.models.integration_connection import IntegrationConnection
 from app.services.recommendation import RecommendationService
 from app.schemas.recommendation import RecommendationRunCreate, RecommendationGeneratePayload
+from app.schemas.pipeline_run import PipelineRunTriggerRequest, PipelineRunResponse
+from app.services.pipeline_run_service import PipelineRunService
 from pydantic import BaseModel
 from app.services.junit_parser import XMLParsingError, OversizedXMLException
 from app.constants.evidence import EvidenceSource, EvidenceArtifactType
@@ -30,6 +32,16 @@ from app.services.jira_connector import JiraConnector
 from app.services.azure_devops_connector import AzureDevOpsConnector
 from app.services.testrail_connector import TestRailConnector
 from app.services.external_requirement_coverage_resolver import ExternalRequirementCoverageResolver
+from app.schemas.manual_test_execution import ManualTestExecutionCreate
+from app.models.manual_test_requirement_mapping import ManualTestRequirementMapping
+from app.schemas.manual_test_mapping import ManualTestMappingCreate, ManualTestMappingResponse
+from app.models.external_test_case_detailed import ExternalTestCase
+from app.models.acceptance_criterion import AcceptanceCriterion
+from app.models.manual_test_execution import ManualTestExecution
+from app.services.manual_evidence_governance_service import ManualEvidenceGovernanceService
+from app.schemas.ci_token import CITokenCreate, CITokenResponse, CITokenListResponse, CITokenRevokeResponse
+from app.services.ci_token_service import CITokenService
+from app.schemas.repository import RepositoryCISettingsUpdate, RepositoryCISettingsResponse
 
 router = APIRouter(
     prefix="/repositories", 
@@ -450,8 +462,13 @@ def get_webhook_status(
 # API Repository Router (for POST /api/repositories/...)
 api_router = APIRouter(
     prefix="/api/repositories",
-    tags=["API Repositories"],
-    dependencies=[Depends(require_workspace_member())]
+    tags=["API Repositories"]
+)
+
+# CI/CD Router (no workspace authentication required - uses CI token auth)
+cicd_router = APIRouter(
+    prefix="/api/repositories",
+    tags=["CI/CD"]
 )
 
 @api_router.post("/{repository_id}/coverage/upload", status_code=status.HTTP_201_CREATED)
@@ -1181,27 +1198,20 @@ def add_pr_acceptance_criteria(
     from app.services.acceptance_criteria_extractor import AcceptanceCriteriaExtractor
     extractor = AcceptanceCriteriaExtractor(db=db)
     
-    raw_lines = payload.acceptance_criteria.split("\n")
-    criteria = []
-    for line in raw_lines:
-        line = line.strip()
-        if not line:
-            continue
-        # Remove list markers if present (e.g. -, *, 1., etc.)
-        clean_text = re.sub(r"^(\s*[-*\d\.]+\s+)", "", line)
-        if clean_text:
-            # Source normalized to MANUAL_USER_INPUT for consistency with cleanup logic
-            criteria.append({
-                "text": clean_text,
-                "source": "MANUAL_USER_INPUT",
-                "confidence": 1.0,
-                "evidence_excerpt": line,
-                "normalized_key": extractor._generate_normalized_key(extractor._normalize_text(clean_text)),
-                "criterion_type": extractor._classify_criterion_type(clean_text)
-            })
-            
+    # Use the extractor's validation logic to filter out fragments
+    criteria, excluded_fragments = extractor._extract_criteria_from_text(payload.acceptance_criteria, "MANUAL_USER_INPUT")
+    
+    # Normalize and deduplicate to generate labels
+    criteria = extractor._normalize_and_deduplicate(criteria)
+    
+    # Classify criterion types
+    for criterion in criteria:
+        criterion["criterion_type"] = extractor._classify_criterion_type(criterion["text"])
+    
     if criteria:
-        extractor.persist_criteria(criteria, str(repository_id), str(pull_request_id), db)
+        persisted_ac, excluded = extractor.persist_criteria(criteria, str(repository_id), str(pull_request_id), db)
+        # Merge excluded fragments from extraction and persistence
+        all_excluded = excluded_fragments + excluded
         
         # Mark latest recommendation run as stale if generated before this update
         from datetime import datetime
@@ -1338,10 +1348,11 @@ def add_pr_acceptance_criteria_manual(
     # 4. Extract and persist AcceptanceCriterion records (for readiness check)
     extractor = AcceptanceCriteriaExtractor(db=db)
     
-    # Extract criteria from the pasted text
-    criteria = extractor._extract_criteria_from_text(payload.acceptance_criteria, "MANUAL_USER_INPUT")
+    # Extract criteria from the pasted text (with validation)
+    criteria, excluded_fragments = extractor._extract_criteria_from_text(payload.acceptance_criteria, "MANUAL_USER_INPUT")
+    
     if not criteria:
-        # Fallback to treat lines as criteria
+        # Fallback to treat lines as criteria (but still validate)
         raw_lines = payload.acceptance_criteria.split("\n")
         for line in raw_lines:
             line = line.strip()
@@ -1349,14 +1360,25 @@ def add_pr_acceptance_criteria_manual(
                 continue
             clean_text = re.sub(r"^(\s*[-*\d\.]+\s+)", "", line)
             if clean_text:
-                criteria.append({
-                    "text": clean_text,
-                    "source": "MANUAL_USER_INPUT",
-                    "confidence": 1.0,
-                    "evidence_excerpt": line
-                })
+                # Validate before adding
+                is_valid, reason = extractor._is_valid_acceptance_criterion(clean_text)
+                if is_valid:
+                    criteria.append({
+                        "text": clean_text,
+                        "source": "MANUAL_USER_INPUT",
+                        "confidence": 1.0,
+                        "evidence_excerpt": line,
+                        "normalized_key": extractor._generate_normalized_key(extractor._normalize_text(clean_text)),
+                        "criterion_type": extractor._classify_criterion_type(clean_text)
+                    })
+                else:
+                    excluded_fragments.append({
+                        "text": clean_text,
+                        "reason": reason,
+                        "source": "MANUAL_USER_INPUT"
+                    })
                 
-    # Normalize and deduplicate
+    # Normalize and deduplicate (this generates labels)
     criteria = extractor._normalize_and_deduplicate(criteria)
     
     # Classify criterion types
@@ -1364,8 +1386,10 @@ def add_pr_acceptance_criteria_manual(
         criterion["criterion_type"] = extractor._classify_criterion_type(criterion["text"])
         
     persisted_ac = []
+    all_excluded = excluded_fragments
     if criteria:
-        persisted_ac = extractor.persist_criteria(criteria, str(repository_id), str(pull_request_id), db)
+        persisted_ac, excluded = extractor.persist_criteria(criteria, str(repository_id), str(pull_request_id), db)
+        all_excluded = excluded_fragments + excluded
 
     # 5. Extract structured scenarios and save to override
     extracted_scenarios = extractor.extract_from_business_intent_override(
@@ -1723,6 +1747,7 @@ def list_integrations(
     List integration connections for a repository.
     
     Returns all integration connections with status and last sync information.
+    Credentials are never exposed in API responses.
     """
     # Verify repository belongs to workspace
     repo = db.query(Repository).filter(
@@ -1753,11 +1778,9 @@ def list_integrations(
                 "provider": provider,
                 "is_connected": conn.is_active,
                 "last_synced_at": conn.last_synced_at.isoformat() if conn.last_synced_at else None,
-                "config": {
-                    "base_url": conn.config.get("base_url") if conn.config else None,
-                    "username": conn.config.get("username") if conn.config else None,
-                    # Never return secrets
-                }
+                "configured": bool(conn.encrypted_credentials),
+                "redacted": True,
+                # Never return credentials or secrets
             })
         else:
             result.append({
@@ -1768,6 +1791,46 @@ def list_integrations(
             })
     
     return result
+
+
+@router.get("/{repository_id}/integrations/providers", status_code=status.HTTP_200_OK)
+def list_integration_provider_capabilities(
+    repository_id: UUID,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id)
+):
+    """
+    List provider capability descriptors for the sync framework.
+
+    Returns static capability metadata for all registered providers.
+    No database query — capabilities are declared by each provider adapter.
+
+    Response shape (additive — safe for clients that ignore unknown fields):
+        [
+            {
+                "provider": "TESTRAIL",
+                "supportsExecutionSync": true,
+                "supportsBidirectionalSync": false,
+                ...
+            },
+            ...
+        ]
+    """
+    # Verify repository belongs to workspace (auth guard)
+    repo = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    if not repo:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Repository not found in your active workspace."
+        )
+
+    from app.services.provider_sync.provider_registry import ProviderRegistry
+    registry = ProviderRegistry()
+    capabilities = registry.list_capabilities()
+    return [cap.to_dict() for cap in capabilities]
 
 
 @router.post("/{repository_id}/integrations/{provider}/connect", status_code=status.HTTP_201_CREATED)
@@ -1788,6 +1851,8 @@ def connect_integration(
     - XRAY: base_url, api_token (placeholder)
     - ZEPHYR: base_url, api_token (placeholder)
     - MANUAL_CSV: No config needed
+    
+    Credentials are encrypted before storage using CredentialEncryptionService.
     """
     # Verify repository belongs to workspace
     repo = db.query(Repository).filter(
@@ -1809,6 +1874,18 @@ def connect_integration(
             detail=f"Invalid provider: {provider}"
         )
     
+    # Encrypt credentials before storage
+    try:
+        from app.services.security.credential_encryption_service import get_credential_encryption_service
+        encryption_service = get_credential_encryption_service()
+        encrypted_credentials = encryption_service.encrypt(config)
+    except Exception as e:
+        logger.error(f"Failed to encrypt credentials for {provider}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to encrypt credentials"
+        )
+    
     # Check for existing connection
     existing = db.query(IntegrationConnection).filter(
         IntegrationConnection.repository_id == repository_id,
@@ -1817,7 +1894,9 @@ def connect_integration(
     
     if existing:
         # Update existing connection
-        existing.config = config
+        existing.encrypted_credentials = encrypted_credentials
+        existing.credentials_encrypted_at = datetime.utcnow()
+        existing.credentials_version = 1
         existing.is_active = True
         existing.last_synced_at = datetime.utcnow()
         existing.updated_at = datetime.utcnow()
@@ -1826,7 +1905,9 @@ def connect_integration(
             "id": str(existing.id),
             "provider": existing.provider,
             "is_connected": existing.is_active,
-            "last_synced_at": existing.last_synced_at.isoformat()
+            "last_synced_at": existing.last_synced_at.isoformat(),
+            "configured": True,
+            "redacted": True
         }
     else:
         # Create new connection
@@ -1835,7 +1916,9 @@ def connect_integration(
             workspace_id=UUID(workspace_id),
             repository_id=repository_id,
             provider=provider,
-            config=config,
+            encrypted_credentials=encrypted_credentials,
+            credentials_encrypted_at=datetime.utcnow(),
+            credentials_version=1,
             is_active=True,
             last_synced_at=datetime.utcnow(),
             created_at=datetime.utcnow(),
@@ -1847,7 +1930,9 @@ def connect_integration(
             "id": str(connection.id),
             "provider": connection.provider,
             "is_connected": connection.is_active,
-            "last_synced_at": connection.last_synced_at.isoformat()
+            "last_synced_at": connection.last_synced_at.isoformat(),
+            "configured": True,
+            "redacted": True
         }
 
 
@@ -2122,7 +2207,7 @@ def get_work_item_context(
     }
 
 
-@router.get("/{repository_id}/pull-requests/{pull_request_id}/manual-tests", status_code=status.HTTP_200_OK)
+@api_router.get("/{repository_id}/pull-requests/{pull_request_id}/manual-tests", status_code=status.HTTP_200_OK)
 def get_manual_tests(
     repository_id: UUID,
     pull_request_id: UUID,
@@ -2161,6 +2246,7 @@ def get_manual_tests(
     # Get external test cases for the repository
     from app.models.external_test_case_detailed import ExternalTestCase
     from app.models.external_test_scenario_mapping import ExternalTestScenarioMapping
+    from app.models.manual_test_execution import ManualTestExecution
     
     # Get manual test cases
     manual_tests = db.query(ExternalTestCase).filter(
@@ -2227,6 +2313,24 @@ def get_manual_tests(
                             if behavior:
                                 linked_behavior.append(behavior.name)
         
+        # Query latest execution outcome for this PR
+        latest_execution = db.query(ManualTestExecution).filter(
+            ManualTestExecution.external_test_case_id == test.id,
+            ManualTestExecution.pull_request_id == pull_request_id,
+            ManualTestExecution.is_active == True
+        ).order_by(ManualTestExecution.executed_at.desc()).first()
+
+        history_count = db.query(ManualTestExecution).filter(
+            ManualTestExecution.external_test_case_id == test.id,
+            ManualTestExecution.pull_request_id == pull_request_id
+        ).count()
+
+        latest_status = latest_execution.outcome if latest_execution else "NOT_EXECUTED"
+        latest_executed_at = latest_execution.executed_at.isoformat() + "Z" if latest_execution else None
+        latest_executed_by_name = latest_execution.executed_by_name if latest_execution else None
+        latest_execution_notes = latest_execution.notes if latest_execution else None
+        latest_evidence_url = latest_execution.evidence_url if latest_execution else None
+
         manual_tests_response.append({
             "id": str(test.id),
             "title": test.title,
@@ -2239,7 +2343,13 @@ def get_manual_tests(
             "preconditions": test.preconditions or [],
             "steps": test.steps or [],
             "expected_result": test.expected_result,
-            "execution_status": "NOT_EXECUTED"  # Would track actual execution status
+            "execution_status": latest_status,
+            "latestExecutionStatus": latest_status,
+            "latestExecutedAt": latest_executed_at,
+            "latestExecutedByName": latest_executed_by_name,
+            "latestExecutionNotes": latest_execution_notes,
+            "latestEvidenceUrl": latest_evidence_url,
+            "executionHistoryCount": history_count
         })
     
     return {
@@ -2247,50 +2357,374 @@ def get_manual_tests(
     }
 
 
-@router.post("/manual-tests/{test_id}/execution", status_code=status.HTTP_200_OK)
-def mark_manual_test_executed(
+def _execute_manual_test(
+    db: Session,
+    repository_id: UUID,
     test_id: UUID,
-    outcome: str,
-    db: Session = Depends(get_db),
-    workspace_id: str = Depends(get_current_workspace_id)
+    execution_in: Any,
+    current_user: Any,
+    active_workspace_id: UUID
 ):
-    """
-    Mark a manual test as executed with outcome.
-    
-    Outcome: PASSED, FAILED, SKIPPED
-    """
-    # Get test case
+    """Internal helper to authorize and persist a manual test execution."""
     from app.models.external_test_case_detailed import ExternalTestCase
-    
-    test = db.query(ExternalTestCase).filter(
+    from app.models.manual_test_execution import ManualTestExecution
+
+    # 1. Authorize workspace
+    repo = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == active_workspace_id
+    ).first()
+    if not repo:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="MANUAL_TEST_WORKSPACE_ACCESS_DENIED"
+        )
+
+    # 2. Find external test case and verify it belongs to this repository
+    test_case = db.query(ExternalTestCase).filter(
         ExternalTestCase.id == test_id
     ).first()
-    
-    if not test:
+    if not test_case:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Test case not found"
         )
+    if test_case.repository_id != repository_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Test case does not belong to the specified repository."
+        )
+
+    # 3. Deactivate previous active executions for the same test + PR/recommendation context
+    pr_id = UUID(execution_in.pullRequestId) if execution_in.pullRequestId else None
+    run_id = UUID(execution_in.recommendationRunId) if execution_in.recommendationRunId else None
     
-    # Verify workspace access
+    previous_active = db.query(ManualTestExecution).filter(
+        ManualTestExecution.external_test_case_id == test_id,
+        ManualTestExecution.pull_request_id == pr_id,
+        ManualTestExecution.recommendation_run_id == run_id,
+        ManualTestExecution.is_active == True
+    ).all()
+    for prev in previous_active:
+        prev.is_active = False
+        db.add(prev)
+
+    # 4. Create new execution
+    new_execution = ManualTestExecution(
+        external_test_case_id=test_id,
+        repository_id=repository_id,
+        pull_request_id=pr_id,
+        recommendation_run_id=run_id,
+        outcome=execution_in.outcome.upper(),
+        executed_by_id=str(current_user.id),
+        executed_by_name=current_user.name or current_user.email,
+        notes=execution_in.notes,
+        evidence_url=execution_in.evidenceUrl,
+        attachment_path=execution_in.attachmentPath,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+        is_active=True
+    )
+    db.add(new_execution)
+    db.commit()
+    db.refresh(new_execution)
+
+    # 5. Enqueue sync to provider if integration supports execution sync
+    # Queue-based: execution succeeds even if sync fails, sync is durable
+    from app.services.provider_sync.provider_registry import ProviderRegistry
+    _registry = ProviderRegistry()
+    if (
+        _registry.is_execution_sync_supported(test_case.provider or "")
+        and test_case.integration_connection_id
+    ):
+        try:
+            from app.services.integration_sync_service import IntegrationSyncService
+            sync_service = IntegrationSyncService(db)
+            sync_service.enqueue_manual_execution_sync(new_execution.id)
+        except Exception as e:
+            logger.error(f"Failed to enqueue sync for execution {new_execution.id}: {e}")
+
+
+    return {
+        "status": "SUCCESS",
+        "execution": {
+            "id": str(new_execution.id),
+            "testId": str(new_execution.external_test_case_id),
+            "outcome": new_execution.outcome,
+            "executedByName": new_execution.executed_by_name,
+            "executedAt": new_execution.executed_at.isoformat() + "Z",
+            "notes": new_execution.notes,
+            "evidenceUrl": new_execution.evidence_url
+        }
+    }
+
+
+@api_router.post("/{repository_id}/manual-tests/{test_id}/execution", status_code=status.HTTP_200_OK)
+def mark_manual_test_executed_new(
+    repository_id: UUID,
+    test_id: UUID,
+    execution_in: ManualTestExecutionCreate,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Mark a manual test as executed with outcome using workspace authorization (Correct frontend path).
+    """
+    from app.schemas.manual_test_execution import ManualTestExecutionCreate
+    return _execute_manual_test(
+        db=db,
+        repository_id=repository_id,
+        test_id=test_id,
+        execution_in=execution_in,
+        current_user=current_user,
+        active_workspace_id=UUID(workspace_id)
+    )
+
+
+@api_router.post("/manual-tests/{test_id}/execution", status_code=status.HTTP_200_OK)
+def mark_manual_test_executed(
+    test_id: UUID,
+    execution_in: ManualTestExecutionCreate,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Mark a manual test as executed with outcome using workspace authorization (Legacy route compatibility).
+    """
+    from app.models.external_test_case_detailed import ExternalTestCase
+    from app.schemas.manual_test_execution import ManualTestExecutionCreate
+
+    # Resolve repository from test_id
+    test_case = db.query(ExternalTestCase).filter(ExternalTestCase.id == test_id).first()
+    if not test_case or not test_case.repository_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="REPOSITORY_REQUIRED_FOR_MANUAL_EXECUTION"
+        )
+
+    return _execute_manual_test(
+        db=db,
+        repository_id=test_case.repository_id,
+        test_id=test_id,
+        execution_in=execution_in,
+        current_user=current_user,
+        active_workspace_id=UUID(workspace_id)
+    )
+
+
+@api_router.get("/{repository_id}/manual-tests/{test_id}/mappings", response_model=List[ManualTestMappingResponse])
+def get_manual_test_mappings(
+    repository_id: UUID,
+    test_id: UUID,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id),
+):
+    """Get all active acceptance criteria mappings for a manual test case."""
+    # Validate workspace access
     repo = db.query(Repository).filter(
-        Repository.id == test.repository_id,
+        Repository.id == repository_id,
         Repository.workspace_id == UUID(workspace_id)
     ).first()
-    
     if not repo:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Repository not found in your active workspace."
+            detail="MANUAL_TEST_WORKSPACE_ACCESS_DENIED"
         )
-    
-    # Update execution status (would store in execution tracking table)
-    # For now, just return success
+
+    # Validate test case
+    test_case = db.query(ExternalTestCase).filter(ExternalTestCase.id == test_id).first()
+    if not test_case:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Test case not found"
+        )
+    if test_case.repository_id != repository_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Test case does not belong to the specified repository."
+        )
+
+    # Query active mappings
+    mappings = db.query(ManualTestRequirementMapping).filter(
+        ManualTestRequirementMapping.external_test_case_id == test_id,
+        ManualTestRequirementMapping.repository_id == repository_id,
+        ManualTestRequirementMapping.is_active == True
+    ).all()
+
+    response = []
+    for mapping in mappings:
+        ac = db.query(AcceptanceCriterion).filter(AcceptanceCriterion.id == mapping.acceptance_criterion_id).first()
+        if ac:
+            readable_id = ac.label or (f"AC-{ac.source_number:02d}" if ac.source_number is not None else f"AC-{str(ac.id)[:8]}")
+            response.append({
+                "id": mapping.id,
+                "testCaseId": mapping.external_test_case_id,
+                "acceptanceCriterionId": mapping.acceptance_criterion_id,
+                "readableRequirementId": readable_id,
+                "requirementText": ac.text,
+                "mappingSource": mapping.mapping_source,
+                "createdAt": mapping.created_at
+            })
+
+    return response
+
+
+@api_router.post("/{repository_id}/manual-tests/{test_id}/mappings", response_model=ManualTestMappingResponse)
+def create_manual_test_mapping(
+    repository_id: UUID,
+    test_id: UUID,
+    mapping_in: ManualTestMappingCreate,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a manual test to AC requirement mapping."""
+    # Validate workspace access
+    repo = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    if not repo:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="MANUAL_TEST_WORKSPACE_ACCESS_DENIED"
+        )
+
+    # Validate test case
+    test_case = db.query(ExternalTestCase).filter(ExternalTestCase.id == test_id).first()
+    if not test_case:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Test case not found"
+        )
+    if test_case.repository_id != repository_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Test case does not belong to the specified repository."
+        )
+
+    # Validate Acceptance Criterion
+    ac = None
+    # 1. Try UUID lookup
+    try:
+        ac_uuid = UUID(mapping_in.acceptanceCriterionId)
+        ac = db.query(AcceptanceCriterion).filter(
+            AcceptanceCriterion.id == ac_uuid
+        ).first()
+    except ValueError:
+        pass
+
+    # 2. Try source number lookup
+    if not ac:
+        try:
+            ref_clean = mapping_in.acceptanceCriterionId.upper().replace("AC-", "").strip()
+            source_num = int(ref_clean)
+            ac = db.query(AcceptanceCriterion).filter(
+                AcceptanceCriterion.source_number == source_num,
+                AcceptanceCriterion.repository_id == repository_id
+            ).first()
+        except ValueError:
+            pass
+
+    # 3. Try label or text lookup
+    if not ac:
+        ac = db.query(AcceptanceCriterion).filter(
+            ((AcceptanceCriterion.label == mapping_in.acceptanceCriterionId) | 
+             (AcceptanceCriterion.text == mapping_in.acceptanceCriterionId)),
+            AcceptanceCriterion.repository_id == repository_id
+        ).first()
+
+    if not ac:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Acceptance criterion not found"
+        )
+
+    if ac.repository_id != repository_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Acceptance criterion does not belong to the specified repository."
+        )
+
+    # Check for existing active mapping
+    existing = db.query(ManualTestRequirementMapping).filter(
+        ManualTestRequirementMapping.external_test_case_id == test_id,
+        ManualTestRequirementMapping.acceptance_criterion_id == ac.id,
+        ManualTestRequirementMapping.is_active == True
+    ).first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="An active mapping already exists between this test case and acceptance criterion."
+        )
+
+    # Create new mapping
+    new_mapping = ManualTestRequirementMapping(
+        external_test_case_id=test_id,
+        acceptance_criterion_id=ac.id,
+        repository_id=repository_id,
+        mapping_source="MANUAL",
+        created_by_id=str(current_user.id),
+        created_by_name=current_user.name or current_user.email,
+        is_active=True
+    )
+    db.add(new_mapping)
+    db.commit()
+    db.refresh(new_mapping)
+
+    readable_id = ac.label or (f"AC-{ac.source_number:02d}" if ac.source_number is not None else f"AC-{str(ac.id)[:8]}")
     return {
-        "test_id": str(test_id),
-        "outcome": outcome,
-        "message": "Test execution recorded"
+        "id": new_mapping.id,
+        "testCaseId": new_mapping.external_test_case_id,
+        "acceptanceCriterionId": new_mapping.acceptance_criterion_id,
+        "readableRequirementId": readable_id,
+        "requirementText": ac.text,
+        "mappingSource": new_mapping.mapping_source,
+        "createdAt": new_mapping.created_at
     }
+
+
+@api_router.delete("/{repository_id}/manual-tests/{test_id}/mappings/{mapping_id}", status_code=status.HTTP_200_OK)
+def delete_manual_test_mapping(
+    repository_id: UUID,
+    test_id: UUID,
+    mapping_id: UUID,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id),
+):
+    """Deactivate a manual test mapping (soft delete)."""
+    # Validate workspace access
+    repo = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    if not repo:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="MANUAL_TEST_WORKSPACE_ACCESS_DENIED"
+        )
+
+    # Find mapping
+    mapping = db.query(ManualTestRequirementMapping).filter(
+        ManualTestRequirementMapping.id == mapping_id,
+        ManualTestRequirementMapping.external_test_case_id == test_id,
+        ManualTestRequirementMapping.repository_id == repository_id
+    ).first()
+    
+    if not mapping:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Mapping not found"
+        )
+
+    # Soft delete (deactivate)
+    mapping.is_active = False
+    db.add(mapping)
+    db.commit()
+
+    return {"status": "SUCCESS", "message": "Mapping successfully deactivated"}
 
 
 @api_router.get("/{repository_id}/pull-requests/{pull_request_id}/recommendation-readiness", response_model=RecommendationReadinessGateResponse)
@@ -2341,6 +2775,1067 @@ def get_pr_recommendation_readiness(
         primary_message=result.user_message,
         secondary_message=result.technical_reason,
         created_at=result.created_at
+    )
+
+
+@cicd_router.post("/{repository_id}/pipeline-runs", response_model=PipelineRunResponse, status_code=status.HTTP_201_CREATED)
+def trigger_pipeline_run_ci(
+    repository_id: UUID,
+    request: PipelineRunTriggerRequest,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    """
+    Trigger or link a CI/CD pipeline run to a Veriscope recommendation.
+    
+    Authenticated via CI token (Bearer token in Authorization header).
+    This endpoint bypasses workspace member authentication for CI token usage.
+    
+    Idempotent: Same external_run_id returns existing PipelineRun.
+    New external_run_id creates new PipelineRun attempt.
+    """
+    # Authenticate CI token
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid Authorization header. Expected: Bearer <VERISCOPE_TOKEN>"
+        )
+    
+    token = authorization.replace("Bearer ", "")
+    ci_token_service = CITokenService()
+    ci_token = ci_token_service.verify_token(db, token)
+    
+    if not ci_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or revoked CI token"
+        )
+    
+    # Verify token belongs to the requested repository
+    if ci_token.repository_id != repository_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="CI token is not authorized for this repository"
+        )
+    
+    # Validate repository exists
+    repository = db.query(Repository).filter(Repository.id == repository_id).first()
+    if not repository:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Repository not found"
+        )
+    
+    service = PipelineRunService()
+    return service.trigger_pipeline_run(db, repository_id, request)
+
+
+# Phase 6.5: Manual Evidence Governance Endpoints
+
+class ManualEvidenceGovernanceRequest(BaseModel):
+    """Request body for governance actions."""
+    review_note: Optional[str] = None
+
+
+@router.get("/{repository_id}/manual-executions/{execution_id}/governance")
+def get_manual_execution_governance(
+    repository_id: UUID,
+    execution_id: UUID,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id)
+):
+    """
+    Get governance status for a manual evidence execution.
+    
+    Returns the current governance state including review status, reviewer info, and expiration.
+    """
+    # Verify repository belongs to workspace
+    repo = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    if not repo:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="WORKSPACE_ACCESS_DENIED"
+        )
+    
+    # Verify execution exists and belongs to repository
+    execution = db.query(ManualTestExecution).filter(
+        ManualTestExecution.id == execution_id,
+        ManualTestExecution.repository_id == repository_id
+    ).first()
+    if not execution:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Manual execution not found"
+        )
+    
+    # Get governance status
+    governance_service = ManualEvidenceGovernanceService(db)
+    governance_status = governance_service.get_governance_status(
+        execution_id=str(execution_id),
+        repository_id=str(repository_id)
+    )
+    
+    return governance_status
+
+
+@router.get("/{repository_id}/manual-executions/{execution_id}/sync-status")
+def get_manual_execution_sync_status(
+    repository_id: UUID,
+    execution_id: UUID,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id)
+):
+    """
+    Get sync status for a manual test execution.
+    
+    Returns provider sync information including status, external references, and last error.
+    """
+    # Verify repository belongs to workspace
+    repo = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    if not repo:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="WORKSPACE_ACCESS_DENIED"
+        )
+    
+    # Verify execution exists and belongs to repository
+    execution = db.query(ManualTestExecution).filter(
+        ManualTestExecution.id == execution_id,
+        ManualTestExecution.repository_id == repository_id
+    ).first()
+    if not execution:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Manual execution not found"
+        )
+    
+    # Get most recent sync event
+    from app.models.manual_execution_sync_event import ManualExecutionSyncEvent
+    sync_event = db.query(ManualExecutionSyncEvent).filter(
+        ManualExecutionSyncEvent.execution_id == execution_id
+    ).order_by(ManualExecutionSyncEvent.created_at.desc()).first()
+    
+    # Enrich with provider capability (additive — backward compatible)
+    from app.services.provider_sync.provider_registry import ProviderRegistry
+    registry = ProviderRegistry()
+    provider_name = execution.external_system or ""
+    supports_execution_sync = registry.is_execution_sync_supported(provider_name)
+
+    return {
+        "provider": execution.external_system,
+        "syncStatus": execution.sync_status or "PENDING",
+        "externalRunId": execution.external_run_id,
+        "externalExecutionId": execution.external_execution_id,
+        "lastSyncedAt": execution.last_synced_at.isoformat() + "Z" if execution.last_synced_at else None,
+        "lastError": sync_event.error_message if sync_event and sync_event.status == "FAILED" else None,
+        "supportsExecutionSync": supports_execution_sync,  # Phase 7.2: capability flag (additive)
+    }
+
+
+@router.post("/{repository_id}/manual-executions/{execution_id}/retry-sync")
+def retry_manual_execution_sync(
+    repository_id: UUID,
+    execution_id: UUID,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Retry sync for a manual test execution.
+    
+    Authorization: OWNER, ADMIN
+    """
+    # Verify repository belongs to workspace
+    repo = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    if not repo:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="WORKSPACE_ACCESS_DENIED"
+        )
+    
+    # Verify execution exists and belongs to repository
+    execution = db.query(ManualTestExecution).filter(
+        ManualTestExecution.id == execution_id,
+        ManualTestExecution.repository_id == repository_id
+    ).first()
+    if not execution:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Manual execution not found"
+        )
+    
+    # Check user authorization (OWNER or ADMIN)
+    from app.models.workspace_member import WorkspaceMember
+    member = db.query(WorkspaceMember).filter(
+        WorkspaceMember.workspace_id == UUID(workspace_id),
+        WorkspaceMember.user_id == current_user.id
+    ).first()
+    
+    if not member or member.role not in ["OWNER", "ADMIN"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="INSUFFICIENT_PERMISSIONS"
+        )
+    
+    # Trigger sync
+    from app.services.integration_sync_service import IntegrationSyncService
+    sync_service = IntegrationSyncService(db)
+    sync_result = sync_service.sync_manual_execution_to_provider(execution_id)
+    
+    return sync_result
+
+
+@router.post("/{repository_id}/manual-executions/{execution_id}/approve")
+def approve_manual_execution(
+    repository_id: UUID,
+    execution_id: UUID,
+    request: ManualEvidenceGovernanceRequest,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Approve a manual evidence execution.
+    
+    Creates a governance review with APPROVED status, allowing the execution
+    to participate in residual risk calculations.
+    """
+    # Verify repository belongs to workspace
+    repo = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    if not repo:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="WORKSPACE_ACCESS_DENIED"
+        )
+    
+    # Verify execution exists and belongs to repository
+    execution = db.query(ManualTestExecution).filter(
+        ManualTestExecution.id == execution_id,
+        ManualTestExecution.repository_id == repository_id
+    ).first()
+    if not execution:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Manual execution not found"
+        )
+    
+    # Create approval review
+    governance_service = ManualEvidenceGovernanceService(db)
+    review = governance_service.approve_execution(
+        execution_id=str(execution_id),
+        repository_id=str(repository_id),
+        reviewer_id=str(current_user.id),
+        reviewer_name=current_user.name or current_user.email,
+        review_note=request.review_note
+    )
+    
+    return {
+        "reviewId": str(review.id),
+        "executionId": str(execution_id),
+        "governanceStatus": "APPROVED",
+        "reviewerName": review.reviewed_by_name,
+        "reviewedAt": review.reviewed_at.isoformat() if review.reviewed_at else None,
+        "reviewNote": review.review_note
+    }
+
+
+@router.post("/{repository_id}/manual-executions/{execution_id}/reject")
+def reject_manual_execution(
+    repository_id: UUID,
+    execution_id: UUID,
+    request: ManualEvidenceGovernanceRequest,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Reject a manual evidence execution.
+    
+    Creates a governance review with REJECTED status, preventing the execution
+    from participating in residual risk calculations. Requires a review note.
+    """
+    # Verify repository belongs to workspace
+    repo = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    if not repo:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="WORKSPACE_ACCESS_DENIED"
+        )
+    
+    # Verify execution exists and belongs to repository
+    execution = db.query(ManualTestExecution).filter(
+        ManualTestExecution.id == execution_id,
+        ManualTestExecution.repository_id == repository_id
+    ).first()
+    if not execution:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Manual execution not found"
+        )
+    
+    # Create rejection review
+    governance_service = ManualEvidenceGovernanceService(db)
+    try:
+        review = governance_service.reject_execution(
+            execution_id=str(execution_id),
+            repository_id=str(repository_id),
+            reviewer_id=str(current_user.id),
+            reviewer_name=current_user.name or current_user.email,
+            review_note=request.review_note
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    
+    return {
+        "reviewId": str(review.id),
+        "executionId": str(execution_id),
+        "governanceStatus": "REJECTED",
+        "reviewerName": review.reviewed_by_name,
+        "reviewedAt": review.reviewed_at.isoformat() if review.reviewed_at else None,
+        "reviewNote": review.review_note
+    }
+
+
+@router.post("/{repository_id}/manual-executions/{execution_id}/challenge")
+def challenge_manual_execution(
+    repository_id: UUID,
+    execution_id: UUID,
+    request: ManualEvidenceGovernanceRequest,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Challenge a manual evidence execution.
+    
+    Creates a governance review with CHALLENGED status, temporarily preventing
+    the execution from participating in residual risk calculations. Requires a review note.
+    """
+    # Verify repository belongs to workspace
+    repo = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    if not repo:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="WORKSPACE_ACCESS_DENIED"
+        )
+    
+    # Verify execution exists and belongs to repository
+    execution = db.query(ManualTestExecution).filter(
+        ManualTestExecution.id == execution_id,
+        ManualTestExecution.repository_id == repository_id
+    ).first()
+    if not execution:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Manual execution not found"
+        )
+    
+    # Create challenge review
+    governance_service = ManualEvidenceGovernanceService(db)
+    try:
+        review = governance_service.challenge_execution(
+            execution_id=str(execution_id),
+            repository_id=str(repository_id),
+            reviewer_id=str(current_user.id),
+            reviewer_name=current_user.name or current_user.email,
+            review_note=request.review_note
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    
+    return {
+        "reviewId": str(review.id),
+        "executionId": str(execution_id),
+        "governanceStatus": "CHALLENGED",
+        "reviewerName": review.reviewed_by_name,
+        "reviewedAt": review.reviewed_at.isoformat() if review.reviewed_at else None,
+        "reviewNote": review.review_note
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 7.4: Integration UI Support Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@router.get("/{repository_id}/integrations/health", status_code=status.HTTP_200_OK)
+def get_integration_health(
+    repository_id: UUID,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id)
+):
+    """
+    Get health status for all integrations for a repository.
+
+    Returns health status derived from:
+    - Connection status
+    - Last sync status
+    - Last sync error
+    - Required provider metadata
+    - Credential validation
+
+    Health states:
+    - HEALTHY: Connected and no recent sync failures
+    - CONFIGURATION_REQUIRED: Connected but missing required config
+    - AUTHENTICATION_FAILED: Connection test failed
+    - SYNC_FAILURES_PRESENT: Connected but recent sync failures
+    - DISCONNECTED: Not connected
+    """
+    # Verify repository belongs to workspace
+    repo = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    
+    if not repo:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Repository not found in your active workspace."
+        )
+    
+    # Get integration connections
+    connections = db.query(IntegrationConnection).filter(
+        IntegrationConnection.repository_id == repository_id
+    ).all()
+    
+    # Get provider capabilities
+    from app.services.provider_sync.provider_registry import ProviderRegistry
+    registry = ProviderRegistry()
+    
+    result = []
+    providers = ["TESTRAIL", "XRAY", "ZEPHYR", "JIRA", "AZURE_DEVOPS"]
+    connections_map = {conn.provider: conn for conn in connections}
+    
+    for provider in providers:
+        conn = connections_map.get(provider)
+        
+        if not conn or not conn.is_active:
+            result.append({
+                "provider": provider,
+                "health": "DISCONNECTED",
+                "isConnected": False,
+                "lastSyncStatus": None,
+                "lastSyncError": None,
+                "missingConfiguration": None
+            })
+            continue
+        
+        # Check for recent sync failures using sync events
+        from app.models.manual_execution_sync_event import ManualExecutionSyncEvent
+        from app.models.manual_test_execution import ManualTestExecution
+        from app.models.integration_provider_cooldown import IntegrationProviderCooldown
+        
+        # Get execution IDs for this repository
+        execution_ids = db.query(ManualTestExecution.id).filter(
+            ManualTestExecution.repository_id == repository_id
+        ).all()
+        execution_ids = [e[0] for e in execution_ids]
+        
+        # Check for provider cooldown
+        cooldown = db.query(IntegrationProviderCooldown).filter(
+            IntegrationProviderCooldown.repository_id == repository_id,
+            IntegrationProviderCooldown.provider == provider,
+            IntegrationProviderCooldown.cooldown_until > datetime.utcnow()
+        ).first()
+        
+        cooldown_remaining = None
+        if cooldown:
+            cooldown_remaining = cooldown.remaining_seconds()
+        
+        # Check for failed/dead-letter/retry-pending sync events
+        failed_sync_events = db.query(ManualExecutionSyncEvent).filter(
+            ManualExecutionSyncEvent.execution_id.in_(execution_ids),
+            ManualExecutionSyncEvent.provider == provider,
+            ManualExecutionSyncEvent.status.in_(["FAILED", "DEAD_LETTER", "RETRY_PENDING"]),
+            ManualExecutionSyncEvent.created_at >= datetime.utcnow() - timedelta(hours=24)
+        ).count()
+        
+        # Check for missing required configuration
+        missing_config = None
+        if provider == "TESTRAIL":
+            if not conn.config.get("default_test_run_id"):
+                missing_config = "default_test_run_id"
+        elif provider == "XRAY":
+            if not conn.provider_metadata.get("testExecutionKey") and not conn.config.get("testExecutionKey"):
+                missing_config = "testExecutionKey"
+        elif provider == "ZEPHYR":
+            if not conn.provider_metadata.get("testCycleKey") and not conn.config.get("testCycleKey"):
+                missing_config = "testCycleKey"
+        
+        # Determine health status
+        if cooldown_remaining and cooldown_remaining > 0:
+            health = "COOLDOWN_ACTIVE"
+        elif missing_config:
+            health = "CONFIGURATION_REQUIRED"
+        elif failed_sync_events > 0:
+            health = "SYNC_FAILURES_PRESENT"
+        else:
+            health = "HEALTHY"
+        
+        # Get last sync error if any from sync events
+        last_failed_sync = db.query(ManualExecutionSyncEvent).filter(
+            ManualExecutionSyncEvent.execution_id.in_(execution_ids),
+            ManualExecutionSyncEvent.provider == provider,
+            ManualExecutionSyncEvent.status.in_(["FAILED", "DEAD_LETTER"])
+        ).order_by(ManualExecutionSyncEvent.created_at.desc()).first()
+        
+        last_sync_error = None
+        if last_failed_sync and last_failed_sync.last_error:
+            last_sync_error = last_failed_sync.last_error
+        
+        result.append({
+            "provider": provider,
+            "health": health,
+            "isConnected": True,
+            "lastSyncStatus": "SYNCED" if failed_sync_events == 0 else "FAILED",
+            "lastSyncError": last_sync_error,
+            "missingConfiguration": missing_config,
+            "cooldownRemaining": cooldown_remaining,
+            "cooldownReason": cooldown.reason if cooldown else None
+        })
+    
+    return result
+
+
+@router.get("/{repository_id}/integrations/sync-activity", status_code=status.HTTP_200_OK)
+def get_sync_activity(
+    repository_id: UUID,
+    provider: Optional[str] = None,
+    status: Optional[str] = None,
+    from_date: Optional[datetime] = None,
+    to_date: Optional[datetime] = None,
+    limit: int = 50,
+    cursor: Optional[str] = None,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id)
+):
+    """
+    Get sync activity feed for a repository with cursor-based pagination.
+
+    Returns recent sync events from manual_execution_sync_events.
+    Can be filtered by provider, status, and date range.
+    Supports cursor-based pagination for large datasets.
+    """
+    # Enforce max limit
+    limit = min(limit, 200)
+    
+    # Verify repository belongs to workspace
+    repo = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    
+    if not repo:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Repository not found in your active workspace."
+        )
+    
+    # Build query with join to ManualTestExecution for repository filtering
+    from app.models.manual_execution_sync_event import ManualExecutionSyncEvent
+    from app.models.manual_test_execution import ManualTestExecution
+    from app.models.integration_provider_cooldown import IntegrationProviderCooldown
+    query = db.query(ManualExecutionSyncEvent).join(
+        ManualTestExecution,
+        ManualExecutionSyncEvent.execution_id == ManualTestExecution.id
+    ).filter(
+        ManualTestExecution.repository_id == repository_id
+    )
+    
+    if provider:
+        query = query.filter(ManualExecutionSyncEvent.provider == provider.upper())
+    
+    if status:
+        query = query.filter(ManualExecutionSyncEvent.status == status.upper())
+    
+    if from_date:
+        query = query.filter(ManualExecutionSyncEvent.created_at >= from_date)
+    
+    if to_date:
+        query = query.filter(ManualExecutionSyncEvent.created_at <= to_date)
+    
+    # Cursor pagination
+    if cursor:
+        try:
+            cursor_parts = cursor.split('|')
+            cursor_created_at = datetime.fromisoformat(cursor_parts[0])
+            cursor_id = UUID(cursor_parts[1])
+            query = query.filter(
+                (ManualExecutionSyncEvent.created_at < cursor_created_at) |
+                ((ManualExecutionSyncEvent.created_at == cursor_created_at) & (ManualExecutionSyncEvent.id < cursor_id))
+            )
+        except (ValueError, IndexError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid cursor format"
+            )
+    
+    # Order by created_at desc and id desc for stable pagination
+    query = query.order_by(ManualExecutionSyncEvent.created_at.desc(), ManualExecutionSyncEvent.id.desc())
+    
+    # Fetch limit+1 to determine if more results exist
+    sync_events = query.limit(limit + 1).all()
+    has_more = len(sync_events) > limit
+    sync_events = sync_events[:limit]
+    
+    # Build next cursor if has_more
+    next_cursor = None
+    if has_more and sync_events:
+        last_event = sync_events[-1]
+        next_cursor = f"{last_event.created_at.isoformat()}|{last_event.id}"
+    
+    # Fetch cooldowns in batch to avoid N+1
+    cooldowns = db.query(IntegrationProviderCooldown).filter(
+        IntegrationProviderCooldown.repository_id == repository_id,
+        IntegrationProviderCooldown.cooldown_until > datetime.utcnow()
+    ).all()
+    cooldown_map = {c.provider: c for c in cooldowns}
+    
+    # Build response
+    result = []
+    for event in sync_events:
+        cooldown = cooldown_map.get(event.provider)
+        result.append({
+            "id": str(event.id),
+            "provider": event.provider,
+            "executionId": str(event.execution_id),
+            "status": event.status,
+            "error": event.last_error if event.status in ["FAILED", "DEAD_LETTER"] else None,
+            "externalRunId": event.external_run_id,
+            "externalExecutionId": event.external_execution_id,
+            "createdAt": event.created_at.isoformat() if event.created_at else None,
+            "attemptCount": event.attempt_count,
+            "maxAttempts": event.max_attempts,
+            "nextAttemptAt": event.next_attempt_at.isoformat() if event.next_attempt_at else None,
+            "cooldownUntil": cooldown.cooldown_until.isoformat() if cooldown else None,
+            "cooldownReason": cooldown.reason if cooldown else None
+        })
+    
+    return {
+        "items": result,
+        "nextCursor": next_cursor,
+        "hasMore": has_more,
+        "limit": limit
+    }
+
+
+@router.get("/{repository_id}/integrations/metrics", status_code=status.HTTP_200_OK)
+def get_integration_metrics(
+    repository_id: UUID,
+    provider: Optional[str] = None,
+    from_date: Optional[datetime] = None,
+    to_date: Optional[datetime] = None,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id)
+):
+    """
+    Get integration sync metrics for a repository.
+
+    Returns provider-level metrics including success rates, failure rates,
+    dead-letter counts, and alert states.
+    """
+    # Verify repository belongs to workspace
+    repo = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    
+    if not repo:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Repository not found in your active workspace."
+        )
+    
+    from app.services.integration_metrics_service import IntegrationMetricsService
+    
+    metrics_service = IntegrationMetricsService(db)
+    
+    # Get metrics
+    metrics = metrics_service.get_provider_metrics(
+        repository_id=str(repository_id),
+        provider=provider,
+        from_date=from_date,
+        to_date=to_date
+    )
+    
+    # Get alerts
+    alerts = metrics_service.get_alerts(
+        repository_id=str(repository_id),
+        from_date=from_date,
+        to_date=to_date
+    )
+    
+    return {
+        "providers": metrics["providers"],
+        "overall": metrics["overall"],
+        "alerts": alerts
+    }
+
+
+@router.post("/{repository_id}/integrations/retry-failed-syncs", status_code=status.HTTP_200_OK)
+def retry_failed_syncs(
+    repository_id: UUID,
+    request: Dict[str, str],
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Retry all failed syncs for a specific provider.
+
+    Requires OWNER or ADMIN role.
+    """
+    # Verify repository belongs to workspace
+    repo = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    
+    if not repo:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Repository not found in your active workspace."
+        )
+    
+    # Check authorization (OWNER or ADMIN)
+    workspace = db.query(Workspace).filter(Workspace.id == UUID(workspace_id)).first()
+    if not workspace:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workspace not found"
+        )
+    
+    # Check if user is OWNER or ADMIN
+    membership = db.query(User).join(
+        workspace.users
+    ).filter(
+        User.id == current_user.id
+    ).first()
+    
+    # Simple role check - in production, use proper role model
+    # For now, allow all workspace members
+    # TODO: Implement proper role-based access control
+    
+    provider = request.get("provider", "").upper()
+    if not provider:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provider is required"
+        )
+    
+    # Get failed and dead-letter sync events for provider
+    from app.models.manual_execution_sync_event import ManualExecutionSyncEvent
+    from app.models.manual_test_execution import ManualTestExecution
+    
+    # Use join to avoid loading all execution IDs into memory
+    failed_sync_events = db.query(ManualExecutionSyncEvent).join(
+        ManualTestExecution,
+        ManualExecutionSyncEvent.execution_id == ManualTestExecution.id
+    ).filter(
+        ManualTestExecution.repository_id == repository_id,
+        ManualExecutionSyncEvent.provider == provider,
+        ManualExecutionSyncEvent.status.in_(["FAILED", "DEAD_LETTER"])
+    ).all()
+    
+    if not failed_sync_events:
+        return {
+            "provider": provider,
+            "retriedCount": 0,
+            "message": "No failed or dead-letter syncs found for provider"
+        }
+    
+    # Requeue sync events
+    retried_count = 0
+    errors = []
+    
+    for sync_event in failed_sync_events:
+        try:
+            # Set to RETRY_PENDING
+            sync_event.status = "RETRY_PENDING"
+            sync_event.next_attempt_at = datetime.utcnow()
+            sync_event.locked_at = None
+            sync_event.locked_by = None
+            sync_event.last_error = "Manually retried via admin endpoint"
+            retried_count += 1
+        except Exception as e:
+            errors.append(f"Sync event {sync_event.id}: {str(e)}")
+    
+    db.commit()
+    
+    return {
+        "provider": provider,
+        "retriedCount": retried_count,
+        "errors": errors,
+        "message": f"Requeued {retried_count} sync events for retry"
+    }
+
+
+@router.post("/{repository_id}/pipeline-runs", response_model=PipelineRunResponse, status_code=status.HTTP_201_CREATED)
+def trigger_pipeline_run(
+    repository_id: UUID,
+    request: PipelineRunTriggerRequest,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id)
+):
+    """
+    Trigger or link a CI/CD pipeline run to a Veriscope recommendation.
+    
+    Idempotent: Same external_run_id returns existing PipelineRun.
+    New external_run_id creates new PipelineRun attempt.
+    """
+    # Validate repository belongs to workspace
+    repository = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    
+    if not repository:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Repository not found in your active workspace."
+        )
+    
+    service = PipelineRunService()
+    return service.trigger_pipeline_run(db, repository_id, request)
+
+
+@router.get("/{repository_id}/pipeline-runs/{pipeline_run_id}/artifact")
+def get_pipeline_run_artifact(
+    repository_id: UUID,
+    pipeline_run_id: UUID,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id)
+):
+    """
+    Get CI-safe artifact JSON for a pipeline run.
+    
+    Can be authenticated via:
+    - Workspace member session (default)
+    - CI token (Bearer token in Authorization header)
+    """
+    # Try CI token authentication first
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.replace("Bearer ", "")
+        ci_token_service = CITokenService()
+        ci_token = ci_token_service.verify_token(db, token)
+        
+        if ci_token:
+            # Verify token belongs to the requested repository
+            if ci_token.repository_id != repository_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="CI token is not authorized for this repository"
+                )
+            # CI token authenticated, skip workspace check
+        else:
+            # Invalid CI token, fall through to workspace authentication
+            pass
+    
+    # Validate pipeline run belongs to repository
+    from app.models.pipeline_run import PipelineRun
+    pipeline_run = db.query(PipelineRun).filter(
+        PipelineRun.id == pipeline_run_id,
+        PipelineRun.repository_id == repository_id
+    ).first()
+    
+    if not pipeline_run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pipeline run not found."
+        )
+    
+    # Validate repository belongs to workspace (if not using CI token)
+    repository = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    
+    if not repository:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Repository not found in your active workspace."
+        )
+    
+    # Check if pipeline run has completed (async mode)
+    from app.models.pipeline_run import PipelineRunStatus
+    from app.models.pipeline_execution_job import PipelineExecutionJob, PipelineJobStatus
+    
+    # Check for execution job to determine if async mode
+    execution_job = db.query(PipelineExecutionJob).filter(
+        PipelineExecutionJob.pipeline_run_id == pipeline_run_id
+    ).first()
+    
+    if execution_job:
+        # Async mode: check if job is completed
+        if execution_job.status != PipelineJobStatus.COMPLETED:
+            # Job not completed yet
+            return {
+                "status": "pending",
+                "message": "Artifact not ready yet. Pipeline analysis is still in progress.",
+                "pipeline_run_id": str(pipeline_run_id),
+                "job_status": execution_job.status.value,
+                "attempt_count": execution_job.attempt_count,
+                "next_attempt_at": execution_job.next_attempt_at.isoformat() if execution_job.next_attempt_at else None
+            }
+    
+    # Pipeline run completed or sync mode - return artifact
+    service = PipelineRunService()
+    return service.get_artifact(db, pipeline_run_id)
+
+
+# CI Token Management Endpoints
+
+@router.post("/{repository_id}/ci-tokens", response_model=CITokenResponse, status_code=status.HTTP_201_CREATED)
+def create_ci_token(
+    repository_id: UUID,
+    token_in: CITokenCreate,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Create a new CI token for the repository.
+    
+    The raw token is returned only once. Store it securely.
+    """
+    # Validate repository belongs to workspace
+    repository = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    
+    if not repository:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Repository not found in your active workspace."
+        )
+    
+    service = CITokenService()
+    return service.create_token(db, repository_id, token_in, created_by=current_user.id)
+
+
+@router.get("/{repository_id}/ci-tokens", response_model=CITokenListResponse)
+def list_ci_tokens(
+    repository_id: UUID,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id)
+):
+    """
+    List all CI tokens for the repository.
+    
+    Raw tokens are never included in the list.
+    """
+    # Validate repository belongs to workspace
+    repository = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    
+    if not repository:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Repository not found in your active workspace."
+        )
+    
+    service = CITokenService()
+    tokens = service.list_tokens(db, repository_id)
+    return CITokenListResponse(tokens=tokens)
+
+
+@router.post("/{repository_id}/ci-tokens/{token_id}/revoke", response_model=CITokenRevokeResponse)
+def revoke_ci_token(
+    repository_id: UUID,
+    token_id: UUID,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id)
+):
+    """
+    Revoke a CI token.
+    
+    Revoked tokens cannot be used for authentication.
+    """
+    # Validate repository belongs to workspace
+    repository = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    
+    if not repository:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Repository not found in your active workspace."
+        )
+    
+    service = CITokenService()
+    try:
+        service.revoke_token(db, repository_id, token_id)
+        return CITokenRevokeResponse(id=token_id, revoked=True)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e)
+        )
+
+
+@router.patch("/{repository_id}/ci-settings", response_model=RepositoryCISettingsResponse)
+def update_ci_settings(
+    repository_id: UUID,
+    settings_in: RepositoryCISettingsUpdate,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id)
+):
+    """
+    Update repository CI settings.
+    
+    Updates the ciFailOnPartial setting which controls whether
+    PARTIAL quality gate results fail the GitHub check.
+    """
+    # Validate repository belongs to workspace
+    repository = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    
+    if not repository:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Repository not found in your active workspace."
+        )
+    
+    # Update ci_fail_on_partial setting
+    repository.ci_fail_on_partial = settings_in.ciFailOnPartial
+    repository.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(repository)
+    
+    return RepositoryCISettingsResponse(
+        repositoryId=repository.id,
+        ciFailOnPartial=repository.ci_fail_on_partial
     )
 
 

@@ -19,6 +19,7 @@ def compile_array_sqlite(element, compiler, **kw):
 
 from app.db.base import Base
 import app.models  # noqa — ensures all models are registered on Base
+import app.models.integration_provider_cooldown  # noqa — ensure cooldown model is registered
 
 @pytest.fixture(scope="function")
 def db_session():

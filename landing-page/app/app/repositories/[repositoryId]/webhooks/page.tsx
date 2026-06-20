@@ -29,6 +29,13 @@ interface WebhookStatus {
   webhook_status: "ACTIVE" | "INACTIVE" | "UNKNOWN";
   last_webhook_at: string | null;
   recent_events: WebhookEvent[];
+  installation_status?: string;
+  github_account?: string;
+  permissions_summary?: string;
+  publishing_enabled?: boolean;
+  pr_comments_enabled?: boolean;
+  last_sync_time?: string | null;
+  rate_limit_state?: string;
 }
 
 function formatDate(dateStr: string | null): string {
@@ -220,9 +227,60 @@ export default function WebhooksPage({ params }: PageProps) {
             </Button>
           </div>
         </div>
-        <div className="flex items-center gap-3 text-sm text-zinc-400">
-          <Clock className="w-4 h-4 text-zinc-500" />
-          <span>Last webhook received: {formatRelativeTime(webhookStatus?.last_webhook_at || null)}</span>
+        <div className="space-y-2 text-sm text-zinc-400">
+          <div className="flex items-center gap-3">
+            <Clock className="w-4 h-4 text-zinc-500" />
+            <span>Last webhook received: {formatRelativeTime(webhookStatus?.last_webhook_at || null)}</span>
+          </div>
+          {webhookStatus?.installation_status && (
+            <div className="flex items-center gap-3">
+              <Github className="w-4 h-4 text-zinc-500" />
+              <span>Installation: {webhookStatus.installation_status}</span>
+            </div>
+          )}
+          {webhookStatus?.github_account && (
+            <div className="flex items-center gap-3">
+              <Github className="w-4 h-4 text-zinc-500" />
+              <span>Account: {webhookStatus.github_account}</span>
+            </div>
+          )}
+          {webhookStatus?.rate_limit_state && webhookStatus.rate_limit_state !== "normal" && (
+            <div className="flex items-center gap-3">
+              <AlertCircle className="w-4 h-4 text-amber-500" />
+              <span className="text-amber-400">Rate Limit: {webhookStatus.rate_limit_state}</span>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* GitHub App Integration Details */}
+      <div className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5">
+        <h3 className="text-sm font-medium text-zinc-300 mb-4">GitHub App Integration</h3>
+        <div className="grid sm:grid-cols-2 gap-4 text-sm">
+          <div>
+            <p className="text-zinc-500 mb-1">Installation Status</p>
+            <p className="text-zinc-200">{webhookStatus?.installation_status || "Not available yet"}</p>
+          </div>
+          <div>
+            <p className="text-zinc-500 mb-1">GitHub Account</p>
+            <p className="text-zinc-200">{webhookStatus?.github_account || "Not connected"}</p>
+          </div>
+          <div>
+            <p className="text-zinc-500 mb-1">Permissions</p>
+            <p className="text-zinc-200">{webhookStatus?.permissions_summary || "Not available yet"}</p>
+          </div>
+          <div>
+            <p className="text-zinc-500 mb-1">Last Sync</p>
+            <p className="text-zinc-200">{formatRelativeTime(webhookStatus?.last_sync_time || null)}</p>
+          </div>
+          <div>
+            <p className="text-zinc-500 mb-1">Publishing Enabled</p>
+            <p className="text-zinc-200">{webhookStatus?.publishing_enabled ? "Yes" : "No"}</p>
+          </div>
+          <div>
+            <p className="text-zinc-500 mb-1">PR Comments Enabled</p>
+            <p className="text-zinc-200">{webhookStatus?.pr_comments_enabled ? "Yes" : "No"}</p>
+          </div>
         </div>
       </div>
 

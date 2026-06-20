@@ -44,3 +44,12 @@ class RepositoryTestRunItem(BaseModel):
 
 class RepositoryTestRunsResponse(BaseModel):
     test_runs: List[RepositoryTestRunItem]
+
+class RepositoryCISettingsUpdate(BaseModel):
+    """Request schema for updating repository CI settings."""
+    ciFailOnPartial: bool = Field(..., description="Whether to fail CI when Quality Gate is PARTIAL")
+
+class RepositoryCISettingsResponse(BaseModel):
+    """Response schema for repository CI settings."""
+    repositoryId: UUID
+    ciFailOnPartial: bool

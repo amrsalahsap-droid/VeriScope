@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     # Architecture V2 Feature Flag
     USE_ARCHITECTURE_V2: bool = False
 
+    # Business Context Feature Flag
+    BUSINESS_CONTEXT_ENABLED: bool = True
+
+    # CI/CD Pipeline Configuration
+    CI_FAIL_ON_PARTIAL: bool = False  # Default: PARTIAL quality gate does not fail CI
+    PIPELINE_TRIGGER_TIMEOUT_SECONDS: int = 30  # Timeout for pipeline trigger endpoint
+
     model_config = {
         "env_file": ".env",
         "extra": "ignore"

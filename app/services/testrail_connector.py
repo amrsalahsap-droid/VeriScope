@@ -11,6 +11,7 @@ from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 
 from app.services.test_management_connector import TestManagementConnector
+from app.constants.test_management import map_veriscope_to_testrail_outcome
 
 
 logger = logging.getLogger("veriscope.testrail_connector")
@@ -404,6 +405,159 @@ class TestRailConnector(TestManagementConnector):
             return "PARTIALLY_AUTOMATED"
         else:
             return "UNKNOWN"
+    
+    def push_execution_result(
+        self,
+        test_case_reference: Dict[str, Any],
+        execution: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Push execution result to TestRail.
+        
+        Args:
+            test_case_reference: Test case reference with external_id, external_key
+            execution: Execution data with outcome, notes, executed_by, executed_at
+            
+        Returns:
+            Dictionary with sync result including external_run_id, external_execution_id
+        """
+        try:
+            # Map Veriscope outcome to TestRail status
+            veriscope_outcome = execution.get('outcome', 'PASSED')
+            testrail_status = map_veriscope_to_testrail_outcome(veriscope_outcome)
+            
+            # Resolve TestRail case ID
+            testrail_case_id = test_case_reference.get('external_id')
+            if not testrail_case_id:
+                raise ValueError("TestRail case ID not found in test case reference")
+            
+            # Resolve target run ID from provider metadata or request
+            # For MVP, we'll require run_id to be passed in test_case_reference
+            run_id = test_case_reference.get('run_id')
+            if not run_id:
+                raise ValueError("TestRail run ID not found - cannot push result without target run")
+            
+            # Prepare TestRail API payload
+            payload = {
+                'status_id': self._get_status_id_from_name(testrail_status),
+                'comment': execution.get('notes', ''),
+                'elapsed': None,  # Could be calculated from execution time
+                'assignedto_id': None,  # Could map executed_by
+            }
+            
+            # Make API call to add result
+            response = self.client.post(
+                f"{self.base_url}/index.php?/api/v2/add_result_for_case/{run_id}/{testrail_case_id}",
+                auth=(self.username, self.api_key),
+                headers={"Content-Type": "application/json"},
+                json=payload
+            )
+            
+            if response.status_code == 200:
+                result_data = response.json()
+                return {
+                    'success': True,
+                    'external_run_id': str(run_id),
+                    'external_execution_id': str(result_data.get('id', '')),
+                    'status': 'SYNCED',
+                    'error': None,
+                    'httpStatus': None,
+                    'retryAfterSeconds': None,
+                    'errorType': None
+                }
+            else:
+                error_msg = f"TestRail API error: {response.status_code} - {response.text}"
+                logger.error(error_msg)
+                
+                # Extract retry-after header if present
+                retry_after = response.headers.get('Retry-After')
+                retry_after_seconds = None
+                if retry_after:
+                    try:
+                        retry_after_seconds = int(retry_after)
+                    except ValueError:
+                        pass
+                
+                # Classify error type based on status code
+                error_type = self._classify_error(response.status_code, response.text)
+                
+                return {
+                    'success': False,
+                    'external_run_id': None,
+                    'external_execution_id': None,
+                    'status': 'FAILED',
+                    'error': error_msg,
+                    'httpStatus': response.status_code,
+                    'retryAfterSeconds': retry_after_seconds,
+                    'errorType': error_type
+                }
+                
+        except Exception as e:
+            error_msg = f"Failed to push execution result to TestRail: {str(e)}"
+            logger.error(error_msg)
+            return {
+                'success': False,
+                'external_run_id': None,
+                'external_execution_id': None,
+                'status': 'FAILED',
+                'error': error_msg,
+                'httpStatus': None,
+                'retryAfterSeconds': None,
+                'errorType': 'UNKNOWN_FAILURE'
+            }
+    
+    def _classify_error(self, status_code: int, response_text: str) -> str:
+        """
+        Classify error type based on HTTP status code and response text.
+        
+        Args:
+            status_code: HTTP status code
+            response_text: Response body text
+            
+        Returns:
+            Error type string (RATE_LIMITED, AUTHENTICATION_FAILED, etc.)
+        """
+        if status_code == 429:
+            return 'RATE_LIMITED'
+        elif status_code in (401, 403):
+            return 'AUTHENTICATION_FAILED'
+        elif status_code == 404:
+            return 'PERMANENT_PROVIDER_FAILURE'
+        elif status_code >= 500:
+            return 'TEMPORARY_PROVIDER_FAILURE'
+        elif status_code == 400:
+            # Check if it's a configuration error
+            if any(keyword in response_text.lower() for keyword in [
+                'missing', 'required', 'invalid', 'configuration', 'config'
+            ]):
+                return 'CONFIGURATION_ERROR'
+        
+        return 'UNKNOWN_FAILURE'
+    
+    def _get_status_id_from_name(self, status_name: str) -> int:
+        """
+        Get TestRail status ID from status name.
+        
+        TestRail uses numeric status IDs:
+        - 1: Passed
+        - 2: Blocked
+        - 3: Untested
+        - 4: Retest
+        - 5: Failed
+        
+        Args:
+            status_name: Status name (passed, failed, blocked, retest)
+            
+        Returns:
+            Status ID as integer
+        """
+        status_map = {
+            'passed': 1,
+            'blocked': 2,
+            'retest': 4,
+            'failed': 5
+        }
+        return status_map.get(status_name.lower(), 5)  # Default to failed if unknown
     
     def close(self):
         """Close the HTTP client."""

@@ -15,6 +15,7 @@ class EvidenceSource(str, Enum):
     GITHUB_ACTIONS = "GITHUB_ACTIONS"
     CI_ARTIFACT = "CI_ARTIFACT"
     TEST_MANAGEMENT_IMPORT = "TEST_MANAGEMENT_IMPORT"
+    MANUAL = "MANUAL"
 
 
 class EvidenceArtifactType(str, Enum):
@@ -43,7 +44,7 @@ class TestManagementProvider(str, Enum):
 
 
 # Type aliases for use in function signatures
-EvidenceSourceLiteral = Literal["MANUAL_UPLOAD", "GITHUB_ACTIONS", "CI_ARTIFACT", "TEST_MANAGEMENT_IMPORT"]
+EvidenceSourceLiteral = Literal["MANUAL_UPLOAD", "GITHUB_ACTIONS", "CI_ARTIFACT", "TEST_MANAGEMENT_IMPORT", "MANUAL"]
 EvidenceArtifactTypeLiteral = Literal["JUNIT_XML", "LCOV", "COBERTURA", "UNKNOWN"]
 EvidenceHealthStatusLiteral = Literal["HEALTHY", "DEGRADED", "INVALID", "UNSUPPORTED"]
 TestManagementProviderLiteral = Literal["TESTRAIL", "XRAY", "ZEPHYR", "JIRA", "MANUAL"]

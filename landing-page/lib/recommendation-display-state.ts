@@ -1,5 +1,7 @@
 // ── Recommendation Display State Resolver ─────────────────────────────────────────────
 
+import { mapBackendHealthToDisplay, applyGuardrails, extractCanonicalHealth, type BackendEvidenceHealth } from "./recommendation-health-state";
+
 export interface DisplayStateInput {
   snapshotAvailable: boolean;
   confidenceAtGeneration: string | null;
@@ -12,10 +14,11 @@ export interface DisplayStateInput {
   completenessScore: number;
   missingEvidence: string[];
   criticalGaps: boolean;
+  regressionEvidence?: any;
 }
 
 export interface DisplayStateOutput {
-  healthState: "Failed" | "Legacy" | "Stale Inputs" | "Ready" | "Ready With Optional Gaps" | "Limited Evidence" | "Needs Review";
+  healthState: "Failed" | "Legacy" | "Stale Inputs" | "Ready" | "Ready With Optional Gaps" | "Limited Evidence" | "Needs Review" | "Ready With Traceability Issues";
   healthLabel: string;
   confidenceLabel: string;
   evidenceStatusLabel: string;
@@ -40,7 +43,8 @@ export function resolveRecommendationDisplayState(input: DisplayStateInput): Dis
     generationStatus,
     completenessScore,
     missingEvidence,
-    criticalGaps
+    criticalGaps,
+    regressionEvidence
   } = input;
 
   // Health state resolution
@@ -113,6 +117,24 @@ export function resolveRecommendationDisplayState(input: DisplayStateInput): Dis
     evidenceStatusLabel = confidenceAtGeneration === "MEDIUM" ? "Partially Sufficient" : "Insufficient";
     primaryMessage = "Recommendation has limited evidence.";
     secondaryMessage = "Add more evidence to improve confidence.";
+  }
+
+  // Override health values if regressionEvidence from backend is present
+  const canonicalHealth = extractCanonicalHealth(regressionEvidence);
+  if (canonicalHealth) {
+    const mapped = mapBackendHealthToDisplay(canonicalHealth);
+    const withGuardrails = applyGuardrails(mapped, {
+      requiredBeforeReleaseCount: 0, // Display state doesn't have guardrail context
+      releaseDecisionStatus: null,
+      hasCriticalGaps: criticalGaps,
+      regressionScopeFailed: false,
+      hasBlockingConsistencyWarnings: false,
+    });
+    
+    healthState = withGuardrails.state as DisplayStateOutput["healthState"];
+    healthLabel = withGuardrails.state;
+    primaryMessage = withGuardrails.reason;
+    secondaryMessage = withGuardrails.reason; // Use reason as secondary message for consistency
   }
 
   // Banner visibility rules

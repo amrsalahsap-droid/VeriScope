@@ -185,6 +185,19 @@ class RecommendationReportGenerator:
         # 9. Confidence Breakdown
         confidence_breakdown = RecommendationQualityEvaluator.evaluate_quality(recommended_tests)
 
+        # 10. Governance Summary
+        from app.models.risk_review import RiskReview
+        all_reviews = db.query(RiskReview).filter(RiskReview.recommendation_run_id == run.id).all()
+        active_reviews = [r for r in all_reviews if r.is_active]
+        governance_summary = {
+            "activeReviews": len(active_reviews),
+            "activeAccepted": sum(1 for r in active_reviews if r.review_status == "ACCEPTED"),
+            "activeOverridden": sum(1 for r in active_reviews if r.review_status == "OVERRIDDEN"),
+            "activeNeedsDiscussion": sum(1 for r in active_reviews if r.review_status == "NEEDS_DISCUSSION"),
+            "resetEvents": sum(1 for r in all_reviews if r.review_status == "RESET"),
+            "totalHistoryEvents": len(all_reviews)
+        }
+
         testing_types = impact.get("recommended_testing_types") or []
         testing_types = [tt.upper() for tt in testing_types] if testing_types else ["REGRESSION", "UNIT"]
 
@@ -222,6 +235,7 @@ class RecommendationReportGenerator:
             "missing_coverage": missing_coverage,
             "evidence_gaps": evidence_gaps,
             "confidence_breakdown": confidence_breakdown,
+            "governance_summary": governance_summary,
             "created_at": run.created_at.isoformat() + "Z" if run.created_at else None,
         }
         return report_data

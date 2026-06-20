@@ -47,6 +47,18 @@ class RecommendationReadinessService:
         Returns:
             RecommendationReadinessAssessment with detailed analysis
         """
+        from uuid import UUID
+        if isinstance(repository_id, str):
+            try:
+                repository_id = UUID(repository_id)
+            except ValueError:
+                pass
+        if isinstance(pull_request_id, str) and pull_request_id:
+            try:
+                pull_request_id = UUID(pull_request_id)
+            except ValueError:
+                pass
+
         logger.info(f"Assessing readiness for repo {repository_id}, pr {pull_request_id}")
         
         # 1. Assess signals in detail (Task 2)
@@ -557,6 +569,18 @@ class RecommendationReadinessService:
         return assessment
 
     def _assess_signals_details(self, repository_id: str, pull_request_id: Optional[str]) -> Dict[str, dict]:
+        from uuid import UUID
+        if isinstance(repository_id, str):
+            try:
+                repository_id = UUID(repository_id)
+            except ValueError:
+                pass
+        if isinstance(pull_request_id, str) and pull_request_id:
+            try:
+                pull_request_id = UUID(pull_request_id)
+            except ValueError:
+                pass
+
         from app.models.architecture_node import ArchitectureNode
         from app.models.architecture_edge import ArchitectureEdge
         from app.models.acceptance_criterion import AcceptanceCriterion

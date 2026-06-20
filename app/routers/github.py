@@ -1819,8 +1819,12 @@ def sync_pull_requests(
 
         # Upsert PR stub and execute sync synchronously
         try:
-            # 1. Retrieve or create PullRequest stub
-            pr_record = db.query(PullRequest).filter(PullRequest.github_pr_id == github_pr_id).first()
+            # 1. Retrieve or create PullRequest stub — must scope by repository_id
+            # to prevent cross-repository/cross-workspace collision on the same github_pr_id
+            pr_record = db.query(PullRequest).filter(
+                PullRequest.github_pr_id == github_pr_id,
+                PullRequest.repository_id == repo.id
+            ).first()
             if not pr_record:
                 pr_record = PullRequest(
                     repository_id=repo.id,
@@ -1871,10 +1875,15 @@ def sync_pull_requests(
             db.refresh(sync_job)
 
             # 3. Execute sync synchronously
-            service.execute_pull_request_sync_job(pr_record.id, github_installation_id, sync_job.id)
-            
-            # Refresh db session to get updated details
-            db.refresh(pr_record)
+            try:
+                service.execute_pull_request_sync_job(pr_record.id, github_installation_id, sync_job.id)
+                
+                # Refresh db session to get updated details
+                db.refresh(pr_record)
+            except Exception as sync_error:
+                logger.error(f"PR sync execution failed for PR #{number}: {sync_error}")
+                # Continue to next PR even if sync fails
+                continue
         except Exception as e:
             logger.warning(f"PR sync failed for PR #{number}: {e}")
             continue
@@ -1885,12 +1894,17 @@ def sync_pull_requests(
         ).scalar() or 0
         synced_files_total += files_count
 
-        synced_prs.append({
-            "number": number,
-            "title": title,
-            "state": state.upper(),
-            "changed_files_count": files_count,
-        })
+        # Only count as successfully synced if files were actually persisted
+        if files_count > 0 or pr_record.sync_integrity_status == "FULL_SUCCESS":
+            synced_prs.append({
+                "number": number,
+                "title": title,
+                "state": state.upper(),
+                "changed_files_count": files_count,
+            })
+        else:
+            # PR was fetched but sync failed - log this but don't count as synced
+            logger.warning(f"PR #{number} fetched but sync failed or incomplete. Files persisted: {files_count}, Sync status: {pr_record.sync_integrity_status}")
 
     # Close stale open PRs in DB if they are no longer in open_prs from GitHub
     fetched_gh_ids = {pr_data.get("id") for pr_data in open_prs}
@@ -2595,8 +2609,11 @@ async def webhook_handler(
                 gh_created_at = datetime.fromisoformat(gh_created_at_str.replace("Z", "+00:00")).replace(tzinfo=None) if gh_created_at_str else datetime.utcnow()
                 gh_updated_at = datetime.fromisoformat(gh_updated_at_str.replace("Z", "+00:00")).replace(tzinfo=None) if gh_updated_at_str else datetime.utcnow()
                 
-                # Deduplicate based on PR specific ordering
-                existing_pr = db.query(PullRequest).filter(PullRequest.github_pr_id == github_pr_id).first()
+                # Deduplicate based on PR specific ordering — scope by repository_id to prevent cross-workspace collision
+                existing_pr = db.query(PullRequest).filter(
+                    PullRequest.github_pr_id == github_pr_id,
+                    PullRequest.repository_id == db_repo.id
+                ).first()
                 
                 if existing_pr:
                     # Event ordering check: reject or reschedule if incoming update is older than or equal to what we processed

@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, ForeignKey, Integer, BigInteger, Boolean, UniqueConstraint
+from sqlalchemy import Column, String, DateTime, ForeignKey, Integer, BigInteger, Boolean, UniqueConstraint, Index
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from app.db.base import Base
@@ -11,7 +11,7 @@ class PullRequest(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     repository_id = Column(UUID(as_uuid=True), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False, index=True)
-    github_pr_id = Column(BigInteger, unique=True, index=True, nullable=False)
+    github_pr_id = Column(BigInteger, index=True, nullable=False)
     number = Column(Integer, nullable=False)
     title = Column(String, nullable=False)
     author = Column(String, nullable=False)
@@ -48,6 +48,10 @@ class PullRequest(Base):
     last_processed_delivery_id = Column(String, nullable=True)
     reconciliation_required = Column(Boolean, nullable=False, default=False)
 
+    __table_args__ = (
+        UniqueConstraint("repository_id", "github_pr_id", name="uq_pull_request_repo_github_pr_id"),
+    )
+
     # Relationships
     repository = relationship("Repository", back_populates="pull_requests")
     commits = relationship("PullRequestCommit", back_populates="pull_request", cascade="all, delete-orphan")
@@ -56,6 +60,7 @@ class PullRequest(Base):
     snapshots = relationship("PullRequestSnapshot", back_populates="pull_request", cascade="all, delete-orphan")
     acceptance_criteria = relationship("AcceptanceCriterion", back_populates="pull_request", cascade="all, delete-orphan")
     work_item_links = relationship("PullRequestWorkItemLink", back_populates="pull_request", cascade="all, delete-orphan")
+    pipeline_runs = relationship("PipelineRun", back_populates="pull_request", cascade="all, delete-orphan")
 
 
 class PullRequestCommit(Base):
