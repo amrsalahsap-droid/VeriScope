@@ -28,3 +28,15 @@ Welcome to the Workspace Governance Operational Readiness documentation. Below i
     * Validation checklists and details on remaining known blockers.
 12. **[Admin Quick Reference](file:///c:/Users/amrsa/Downloads/veriscope/docs/governance/admin-quick-reference.md)**
     * Quick reference cheat-sheet for common administrative actions.
+13. **[Final Governance Consolidation](file:///c:/Users/amrsa/Downloads/veriscope/docs/governance/final-governance-consolidation.md)**
+    * Consolidated inventory of Workspace Governance capabilities and final readiness status.
+14. **[Pre-RC Gap Register](file:///c:/Users/amrsa/Downloads/veriscope/docs/governance/pre-rc-gap-register.md)**
+    * Outstanding validation blockers tracking.
+15. **[Governance Route Register](file:///c:/Users/amrsa/Downloads/veriscope/docs/governance/governance-route-register.md)**
+    * Detailed mappings of workspace endpoints, authentication, and compatibility routes.
+16. **[Governance Audit Event Register](file:///c:/Users/amrsa/Downloads/veriscope/docs/governance/governance-audit-event-register.md)**
+    * Complete database logging schema, triggers, and safety verification maps.
+17. **[Governance Safety Invariants](file:///c:/Users/amrsa/Downloads/veriscope/docs/governance/governance-safety-invariants.md)**
+    * Safety invariants, boundaries, constraints, and validation checkpoints.
+18. **[Pre-RC Execution Plan](file:///c:/Users/amrsa/Downloads/veriscope/docs/governance/pre-rc-execution-plan.md)**
+    * Sequential roadmap to complete live integration validation and reach RC readiness.
