@@ -74,6 +74,40 @@ export default function OrganizationGovernancePage({ params }: { params: { organ
   const [repositories, setRepositories] = useState<RepositoryCompliance[]>([]);
   const [exceptions, setExceptions] = useState<PolicyException[]>([]);
   const [snapshots, setSnapshots] = useState<GovernanceReviewSnapshot[]>([]);
+
+  // Remediation states
+  const [remediationSummary, setRemediationSummary] = useState<any>({
+    total: 0, pending_confirmation: 0, confirmed: 0, executed: 0, failed: 0, cancelled: 0
+  });
+  const [remediationActions, setRemediationActions] = useState<any[]>([]);
+  const [remediationLoading, setRemediationLoading] = useState<boolean>(false);
+  const [selectedAction, setSelectedAction] = useState<any>(null);
+  const [confirmText, setConfirmText] = useState<string>("");
+  
+  // Bulk remediation states
+  const [bulkRemediationType, setBulkRemediationType] = useState<string>("expired_role_cleanup");
+  const [bulkRemediationReason, setBulkRemediationReason] = useState<string>("");
+  const [bulkPreviewItems, setBulkPreviewItems] = useState<any[]>([]);
+  const [bulkExecutionResults, setBulkExecutionResults] = useState<any[]>([]);
+  const [bulkRemediationLoading, setBulkRemediationLoading] = useState<boolean>(false);
+  const [showBulkRemediationConfirm, setShowBulkRemediationConfirm] = useState<boolean>(false);
+  
+  // Create manual remediation action states
+  const [showCreateAction, setShowCreateAction] = useState<boolean>(false);
+  const [createActionType, setCreateActionType] = useState<string>("REVOKE_ROLE");
+  const [createActionTargetUserId, setCreateActionTargetUserId] = useState<string>("");
+  const [createActionTargetRole, setCreateActionTargetRole] = useState<string>("");
+  const [createActionTargetAssignmentId, setCreateActionTargetAssignmentId] = useState<string>("");
+  const [createActionTargetExceptionId, setCreateActionTargetExceptionId] = useState<string>("");
+  const [createActionTargetPolicyId, setCreateActionTargetPolicyId] = useState<string>("");
+  const [createActionRepoId, setCreateActionRepoId] = useState<string>("");
+  const [createActionConfirmationMessage, setCreateActionConfirmationMessage] = useState<string>("");
+  const [createActionSourceType, setCreateActionSourceType] = useState<string>("MANUAL");
+  const [createActionSourceId, setCreateActionSourceId] = useState<string>("");
+  
+  // Filter states for remediation action table
+  const [filterRemediationStatus, setFilterRemediationStatus] = useState<string>("ALL");
+  const [filterRemediationType, setFilterRemediationType] = useState<string>("ALL");
   const [loading, setLoading] = useState(true);
   const [selectedRepositories, setSelectedRepositories] = useState<string[]>([]);
   const [bulkOperation, setBulkOperation] = useState<string>("APPLY_PRESET");
@@ -169,6 +203,16 @@ export default function OrganizationGovernancePage({ params }: { params: { organ
         setDashboard(dashboardData);
       }
 
+      // Load repositories
+      const reposResponse = await fetch(`/api/organizations/${params.organizationId}/cicd/governance/repositories`);
+      if (reposResponse.ok) {
+        const reposData = await reposResponse.json();
+        setRepositories(reposData);
+      }
+
+      // Load remediation actions data
+      loadRemediationData();
+
       // Load exceptions
       const exceptionsResponse = await fetch(`/api/organizations/${params.organizationId}/cicd/governance/exceptions`);
       if (exceptionsResponse.ok) {
@@ -233,6 +277,196 @@ export default function OrganizationGovernancePage({ params }: { params: { organ
       console.error('Failed to load governance data:', err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadRemediationData = async () => {
+    try {
+      setRemediationLoading(true);
+      const summaryRes = await fetch(`/api/organizations/${params.organizationId}/cicd/governance/remediation/summary`);
+      if (summaryRes.ok) {
+        const summaryData = await summaryRes.json();
+        setRemediationSummary(summaryData);
+      }
+      
+      const actionsRes = await fetch(`/api/organizations/${params.organizationId}/cicd/governance/remediation/actions`);
+      if (actionsRes.ok) {
+        const actionsData = await actionsRes.json();
+        setRemediationActions(actionsData);
+      }
+    } catch (err) {
+      console.error("Failed to load remediation data:", err);
+    } finally {
+      setRemediationLoading(false);
+    }
+  };
+
+  const handleCreateRemediationAction = async (payload: any) => {
+    try {
+      const response = await fetch(`/api/organizations/${params.organizationId}/cicd/governance/remediation/actions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (response.ok) {
+        setShowCreateAction(false);
+        loadRemediationData();
+        // Reset creation inputs
+        setCreateActionTargetUserId("");
+        setCreateActionTargetRole("");
+        setCreateActionTargetAssignmentId("");
+        setCreateActionTargetExceptionId("");
+        setCreateActionTargetPolicyId("");
+        setCreateActionRepoId("");
+        setCreateActionConfirmationMessage("");
+        setCreateActionSourceType("MANUAL");
+        setCreateActionSourceId("");
+      } else {
+        const data = await response.json();
+        alert(`Failed to create remediation action: ${data.detail || 'Unknown error'}`);
+      }
+    } catch (err) {
+      console.error("Error creating remediation action:", err);
+    }
+  };
+
+  const handlePreviewRemediationAction = async (actionId: string) => {
+    try {
+      const response = await fetch(`/api/organizations/${params.organizationId}/cicd/governance/remediation/actions/${actionId}/preview`, {
+        method: 'POST'
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setSelectedAction(data);
+        loadRemediationData();
+      } else {
+        const data = await response.json();
+        alert(`Failed to generate preview: ${data.detail || 'Unknown error'}`);
+      }
+    } catch (err) {
+      console.error("Error previewing remediation action:", err);
+    }
+  };
+
+  const handleConfirmRemediationAction = async (actionId: string) => {
+    if (confirmText !== "CONFIRM") {
+      alert("Please type CONFIRM exactly to proceed.");
+      return;
+    }
+    try {
+      const response = await fetch(`/api/organizations/${params.organizationId}/cicd/governance/remediation/actions/${actionId}/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm_text: confirmText })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setSelectedAction(data);
+        setConfirmText("");
+        loadRemediationData();
+      } else {
+        const data = await response.json();
+        alert(`Failed to confirm action: ${data.detail || 'Unknown error'}`);
+      }
+    } catch (err) {
+      console.error("Error confirming remediation action:", err);
+    }
+  };
+
+  const handleExecuteRemediationAction = async (actionId: string) => {
+    try {
+      const response = await fetch(`/api/organizations/${params.organizationId}/cicd/governance/remediation/actions/${actionId}/execute`, {
+        method: 'POST'
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setSelectedAction(data);
+        loadRemediationData();
+        loadRoleAssignments();
+        loadGovernanceData();
+      } else {
+        alert(`Failed to execute remediation action: ${data.detail || 'Unknown error'}`);
+      }
+    } catch (err) {
+      console.error("Error executing remediation action:", err);
+    }
+  };
+
+  const handleCancelRemediationAction = async (actionId: string) => {
+    try {
+      const response = await fetch(`/api/organizations/${params.organizationId}/cicd/governance/remediation/actions/${actionId}/cancel`, {
+        method: 'POST'
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setSelectedAction(null);
+        loadRemediationData();
+      } else {
+        const data = await response.json();
+        alert(`Failed to cancel action: ${data.detail || 'Unknown error'}`);
+      }
+    } catch (err) {
+      console.error("Error cancelling remediation action:", err);
+    }
+  };
+
+  const handlePreviewBulkRemediation = async () => {
+    try {
+      setBulkRemediationLoading(true);
+      const response = await fetch(`/api/organizations/${params.organizationId}/cicd/governance/remediation/bulk/preview`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bulk_type: bulkRemediationType, reason: bulkRemediationReason })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setBulkPreviewItems(data);
+        setBulkExecutionResults([]);
+      } else {
+        const data = await response.json();
+        alert(`Failed to preview bulk remediation: ${data.detail || 'Unknown error'}`);
+      }
+    } catch (err) {
+      console.error("Error previewing bulk remediation:", err);
+    } finally {
+      setBulkRemediationLoading(false);
+    }
+  };
+
+  const handleExecuteBulkRemediation = async () => {
+    if (bulkPreviewItems.length === 0) {
+      alert("No items to remediate.");
+      return;
+    }
+    try {
+      setBulkRemediationLoading(true);
+      const executionItems = bulkPreviewItems.map(item => ({
+        item_id: item.item_id,
+        action_type: item.action_type,
+        target_id: item.target_id
+      }));
+      
+      const response = await fetch(`/api/organizations/${params.organizationId}/cicd/governance/remediation/bulk/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: executionItems, reason: bulkRemediationReason })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setBulkExecutionResults(data);
+        setBulkPreviewItems([]);
+        setShowBulkRemediationConfirm(false);
+        loadRemediationData();
+        loadRoleAssignments();
+        loadGovernanceData();
+      } else {
+        const data = await response.json();
+        alert(`Failed to execute bulk remediation: ${data.detail || 'Unknown error'}`);
+      }
+    } catch (err) {
+      console.error("Error executing bulk remediation:", err);
+    } finally {
+      setBulkRemediationLoading(false);
     }
   };
   
@@ -2417,9 +2651,37 @@ export default function OrganizationGovernancePage({ params }: { params: { organ
                             </div>
                           )}
                           {item.review_status !== 'PENDING' && (
-                            <div className="mt-2 text-sm text-muted-foreground">
-                              Decision: {item.review_status} by {item.reviewed_by} on {new Date(item.reviewed_at).toLocaleString()}
-                              {item.decision_reason && ` - ${item.decision_reason}`}
+                            <div className="mt-2 text-sm text-muted-foreground flex flex-col gap-2">
+                              <div>
+                                Decision: {item.review_status} by {item.reviewed_by} on {new Date(item.reviewed_at).toLocaleString()}
+                                {item.decision_reason && ` - ${item.decision_reason}`}
+                              </div>
+                              {(item.review_status === 'REVOKE_RECOMMENDED' || item.review_status === 'CHANGE_SCOPE_RECOMMENDED') && (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  className="w-fit"
+                                  onClick={() => {
+                                    setCreateActionType(item.review_status === 'REVOKE_RECOMMENDED' ? 'REVOKE_ROLE' : 'CHANGE_ROLE_SCOPE');
+                                    setCreateActionTargetUserId(item.user_id);
+                                    setCreateActionTargetRole(item.role);
+                                    // Find role assignment id by matching user and role if possible
+                                    const matchingAssign = roleAssignments.find(
+                                      ra => ra.user_id === item.user_id && ra.role === item.role
+                                    );
+                                    if (matchingAssign) {
+                                      setCreateActionTargetAssignmentId(matchingAssign.id);
+                                    }
+                                    setCreateActionSourceType("ACCESS_REVIEW_ITEM");
+                                    setCreateActionSourceId(item.id);
+                                    setShowCreateAction(true);
+                                    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+                                  }}
+                                >
+                                  <Shield className="w-4 h-4 mr-2 text-red-500" />
+                                  Initiate Remediation Workflow
+                                </Button>
+                              )}
                             </div>
                           )}
                         </div>
@@ -2497,6 +2759,644 @@ export default function OrganizationGovernancePage({ params }: { params: { organ
                 </div>
               ) : (
                 <p className="text-sm text-muted-foreground">Loading security signals...</p>
+              )}
+            </CardContent>
+          </Card>
+
+          {/* Governance Remediation Actions */}
+          <Card>
+            <CardHeader>
+              <div className="flex items-center justify-between">
+                <div>
+                  <CardTitle>Governance Remediation Center</CardTitle>
+                  <CardDescription>Controlled manual workflows for executing policy and role remediations</CardDescription>
+                </div>
+                <Button onClick={() => setShowCreateAction(!showCreateAction)}>
+                  <Shield className="w-4 h-4 mr-2" />
+                  {showCreateAction ? "Hide Form" : "Create Remediation"}
+                </Button>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              {/* Summary Cards */}
+              <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
+                <div className="p-3 border rounded text-center">
+                  <div className="text-xs text-muted-foreground">Total Actions</div>
+                  <div className="text-xl font-bold">{remediationSummary.total}</div>
+                </div>
+                <div className="p-3 border rounded text-center bg-gray-50">
+                  <div className="text-xs text-muted-foreground">Pending Preview</div>
+                  <div className="text-xl font-bold text-blue-600">
+                    {remediationSummary.draft || 0}
+                  </div>
+                </div>
+                <div className="p-3 border rounded text-center bg-yellow-50/50">
+                  <div className="text-xs text-muted-foreground">Pending Confirm</div>
+                  <div className="text-xl font-bold text-yellow-600">
+                    {remediationSummary.pending_confirmation}
+                  </div>
+                </div>
+                <div className="p-3 border rounded text-center bg-yellow-50">
+                  <div className="text-xs text-muted-foreground">Confirmed</div>
+                  <div className="text-xl font-bold text-orange-600">
+                    {remediationSummary.confirmed}
+                  </div>
+                </div>
+                <div className="p-3 border rounded text-center bg-green-50">
+                  <div className="text-xs text-muted-foreground">Executed</div>
+                  <div className="text-xl font-bold text-green-600">
+                    {remediationSummary.executed}
+                  </div>
+                </div>
+                <div className="p-3 border rounded text-center bg-red-50">
+                  <div className="text-xs text-muted-foreground">Failed</div>
+                  <div className="text-xl font-bold text-red-600">
+                    {remediationSummary.failed}
+                  </div>
+                </div>
+              </div>
+
+              {/* Action Creator Form */}
+              {showCreateAction && (
+                <div className="p-4 border rounded bg-muted/30 space-y-4">
+                  <h3 className="font-semibold text-sm">Create Manual Remediation Action</h3>
+                  
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-xs font-medium">Remediation Action Type</label>
+                      <select
+                        className="w-full p-2 border rounded mt-1 text-sm bg-white"
+                        value={createActionType}
+                        onChange={(e) => {
+                          setCreateActionType(e.target.value);
+                          setCreateActionTargetAssignmentId("");
+                          setCreateActionTargetExceptionId("");
+                          setCreateActionRepoId("");
+                        }}
+                      >
+                        <option value="REVOKE_ROLE">Revoke Role Assignment</option>
+                        <option value="CHANGE_ROLE_SCOPE">Change Role Assignment Scope</option>
+                        <option value="EXTEND_ROLE_EXPIRY">Extend Role Expiry Date</option>
+                        <option value="DISABLE_STALE_ROLE">Disable Stale Role Assignment</option>
+                        <option value="REMOVE_REPOSITORY_POLICY_OVERRIDE">Remove Repository Policy Override</option>
+                        <option value="REVOKE_POLICY_EXCEPTION">Revoke Policy Exception</option>
+                        <option value="EXPIRE_POLICY_EXCEPTION">Expire Policy Exception</option>
+                      </select>
+                    </div>
+
+                    {(createActionType === "REVOKE_ROLE" || createActionType === "CHANGE_ROLE_SCOPE" || createActionType === "EXTEND_ROLE_EXPIRY" || createActionType === "DISABLE_STALE_ROLE") && (
+                      <div>
+                        <label className="text-xs font-medium">Select Target Role Assignment</label>
+                        <select
+                          className="w-full p-2 border rounded mt-1 text-sm bg-white"
+                          value={createActionTargetAssignmentId}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setCreateActionTargetAssignmentId(val);
+                            const match = roleAssignments.find(ra => ra.id === val);
+                            if (match) {
+                              setCreateActionTargetUserId(match.user_id);
+                              setCreateActionTargetRole(match.role);
+                              setCreateActionRepoId(match.repository_id || "");
+                            }
+                          }}
+                        >
+                          <option value="">-- Choose active role --</option>
+                          {roleAssignments.map(ra => (
+                            <option key={ra.id} value={ra.id}>
+                              User: {ra.user_id.slice(0, 8)}... | {ra.role} | {ra.scope_type} {ra.repository_id ? `(Repo: ${ra.repository_id.slice(0, 8)}...)` : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+
+                    {(createActionType === "REVOKE_POLICY_EXCEPTION" || createActionType === "EXPIRE_POLICY_EXCEPTION") && (
+                      <div>
+                        <label className="text-xs font-medium">Select Target Exception</label>
+                        <select
+                          className="w-full p-2 border rounded mt-1 text-sm bg-white"
+                          value={createActionTargetExceptionId}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setCreateActionTargetExceptionId(val);
+                            const match = exceptions.find(ex => ex.id === val);
+                            if (match) {
+                              setCreateActionRepoId(match.repository_id);
+                            }
+                          }}
+                        >
+                          <option value="">-- Choose approved policy exception --</option>
+                          {exceptions.filter(ex => ex.status === 'APPROVED').map(ex => (
+                            <option key={ex.id} value={ex.id}>
+                              Repo: {ex.repository_id.slice(0, 8)}... | Reason: {ex.reason.slice(0, 30)}...
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+
+                    {createActionType === "REMOVE_REPOSITORY_POLICY_OVERRIDE" && (
+                      <div>
+                        <label className="text-xs font-medium">Select Target Repository Policy</label>
+                        <select
+                          className="w-full p-2 border rounded mt-1 text-sm bg-white"
+                          value={createActionRepoId}
+                          onChange={(e) => {
+                            setCreateActionRepoId(e.target.value);
+                            setCreateActionTargetPolicyId(e.target.value); // Maps to repo id or override policy id
+                          }}
+                        >
+                          <option value="">-- Choose repository override policy --</option>
+                          {repositories.filter(repo => repo.policy_source === "REPOSITORY_OVERRIDE").map(repo => (
+                            <option key={repo.repository_id} value={repo.repository_id}>
+                              {repo.repository_name} (Preset: {repo.current_preset || "CUSTOM"})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+
+                    {createActionType === "CHANGE_ROLE_SCOPE" && (
+                      <div>
+                        <label className="text-xs font-medium">New Scope Role (Optional)</label>
+                        <select
+                          className="w-full p-2 border rounded mt-1 text-sm bg-white"
+                          value={createActionTargetRole}
+                          onChange={(e) => setCreateActionTargetRole(e.target.value)}
+                        >
+                          <option value="GOVERNANCE_OWNER">Governance Owner</option>
+                          <option value="POLICY_ADMIN">Policy Admin</option>
+                          <option value="EXCEPTION_APPROVER">Exception Approver</option>
+                          <option value="REPOSITORY_POLICY_MANAGER">Repository Policy Manager</option>
+                          <option value="GOVERNANCE_VIEWER">Governance Viewer</option>
+                        </select>
+                      </div>
+                    )}
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-medium">Custom Confirmation Details / Rationale</label>
+                    <input
+                      type="text"
+                      className="w-full p-2 border rounded mt-1 text-sm bg-white"
+                      placeholder="Why is this remediation action necessary?"
+                      value={createActionConfirmationMessage}
+                      onChange={(e) => setCreateActionConfirmationMessage(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="flex gap-2">
+                    <Button
+                      size="sm"
+                      onClick={() => {
+                        const payload: any = {
+                          source_type: createActionSourceType,
+                          source_id: createActionSourceId || undefined,
+                          action_type: createActionType,
+                          confirmation_message: createActionConfirmationMessage || undefined
+                        };
+                        if (createActionTargetAssignmentId) payload.target_assignment_id = createActionTargetAssignmentId;
+                        if (createActionTargetExceptionId) payload.target_exception_id = createActionTargetExceptionId;
+                        if (createActionTargetPolicyId) payload.target_policy_id = createActionTargetPolicyId;
+                        if (createActionRepoId) payload.repository_id = createActionRepoId;
+                        if (createActionTargetUserId) payload.target_user_id = createActionTargetUserId;
+                        if (createActionTargetRole) payload.target_role = createActionTargetRole;
+
+                        handleCreateRemediationAction(payload);
+                      }}
+                      disabled={
+                        (createActionType.includes("ROLE") && !createActionTargetAssignmentId) ||
+                        (createActionType.includes("EXCEPTION") && !createActionTargetExceptionId) ||
+                        (createActionType === "REMOVE_REPOSITORY_POLICY_OVERRIDE" && !createActionRepoId)
+                      }
+                    >
+                      Create Draft Action
+                    </Button>
+                    <Button size="sm" variant="outline" onClick={() => setShowCreateAction(false)}>
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
+              )}
+
+              {/* Actions List Filters */}
+              <div className="flex gap-2 items-center">
+                <Filter className="w-4 h-4 text-muted-foreground" />
+                <select
+                  className="p-1.5 border rounded text-xs bg-white"
+                  value={filterRemediationStatus}
+                  onChange={(e) => setFilterRemediationStatus(e.target.value)}
+                >
+                  <option value="ALL">All Statuses</option>
+                  <option value="DRAFT">Draft</option>
+                  <option value="PENDING_CONFIRMATION">Pending Confirmation</option>
+                  <option value="CONFIRMED">Confirmed</option>
+                  <option value="EXECUTED">Executed</option>
+                  <option value="FAILED">Failed</option>
+                  <option value="CANCELLED">Cancelled</option>
+                </select>
+
+                <select
+                  className="p-1.5 border rounded text-xs bg-white"
+                  value={filterRemediationType}
+                  onChange={(e) => setFilterRemediationType(e.target.value)}
+                >
+                  <option value="ALL">All Action Types</option>
+                  <option value="REVOKE_ROLE">Revoke Role</option>
+                  <option value="CHANGE_ROLE_SCOPE">Change Scope</option>
+                  <option value="EXTEND_ROLE_EXPIRY">Extend Expiry</option>
+                  <option value="DISABLE_STALE_ROLE">Disable Stale Role</option>
+                  <option value="REMOVE_REPOSITORY_POLICY_OVERRIDE">Remove Policy Override</option>
+                  <option value="REVOKE_POLICY_EXCEPTION">Revoke Exception</option>
+                  <option value="EXPIRE_POLICY_EXCEPTION">Expire Exception</option>
+                </select>
+              </div>
+
+              {/* Actions Table */}
+              <div className="border rounded overflow-hidden">
+                <table className="w-full text-left text-sm">
+                  <thead className="bg-muted text-xs font-semibold uppercase text-muted-foreground border-b">
+                    <tr>
+                      <th className="p-3">Action Details</th>
+                      <th className="p-3">Type</th>
+                      <th className="p-3">Status</th>
+                      <th className="p-3">Requested</th>
+                      <th className="p-3 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y">
+                    {remediationActions.filter(a => {
+                      if (filterRemediationStatus !== "ALL" && a.status !== filterRemediationStatus) return false;
+                      if (filterRemediationType !== "ALL" && a.action_type !== filterRemediationType) return false;
+                      return true;
+                    }).length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="p-6 text-center text-muted-foreground">
+                          No remediation actions found matching filters.
+                        </td>
+                      </tr>
+                    ) : (
+                      remediationActions.filter(a => {
+                        if (filterRemediationStatus !== "ALL" && a.status !== filterRemediationStatus) return false;
+                        if (filterRemediationType !== "ALL" && a.action_type !== filterRemediationType) return false;
+                        return true;
+                      }).map((action) => (
+                        <tr key={action.id} className="hover:bg-muted/30">
+                          <td className="p-3">
+                            <div className="font-semibold text-xs">{action.action_type}</div>
+                            <div className="text-xs text-muted-foreground mt-0.5">
+                              {action.target_user_id && `Target User: ${action.target_user_id.slice(0, 8)}...`}
+                              {action.target_role && ` | Target Role: ${action.target_role}`}
+                              {action.repository_id && ` | Repo: ${action.repository_id.slice(0, 8)}...`}
+                            </div>
+                          </td>
+                          <td className="p-3">
+                            <Badge variant="outline" className="text-[10px]">
+                              {action.source_type}
+                            </Badge>
+                          </td>
+                          <td className="p-3">
+                            <Badge
+                              variant={
+                                action.status === "EXECUTED" ? "default" :
+                                action.status === "FAILED" ? "destructive" :
+                                action.status === "PENDING_CONFIRMATION" ? "secondary" : "outline"
+                              }
+                              className="text-[10px]"
+                            >
+                              {action.status}
+                            </Badge>
+                          </td>
+                          <td className="p-3 text-xs text-muted-foreground">
+                            {new Date(action.requested_at).toLocaleDateString()}
+                          </td>
+                          <td className="p-3 text-right">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => setSelectedAction(action)}
+                            >
+                              Inspect
+                            </Button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Action Inspector Drawer / Modal */}
+              {selectedAction && (
+                <Card className="border-2 border-primary bg-muted/10">
+                  <CardHeader className="pb-2">
+                    <div className="flex items-center justify-between">
+                      <CardTitle className="text-sm font-bold flex items-center gap-2">
+                        <Shield className="w-4 h-4 text-primary" />
+                        Remediation Action Inspector
+                      </CardTitle>
+                      <Button size="sm" variant="ghost" onClick={() => setSelectedAction(null)}>
+                        <X className="w-4 h-4" />
+                      </Button>
+                    </div>
+                  </CardHeader>
+                  <CardContent className="space-y-4 text-xs">
+                    <div className="grid grid-cols-2 gap-4 border-b pb-3">
+                      <div>
+                        <div className="font-semibold text-muted-foreground">Action Type</div>
+                        <div className="font-medium mt-0.5">{selectedAction.action_type}</div>
+                      </div>
+                      <div>
+                        <div className="font-semibold text-muted-foreground">Status</div>
+                        <div className="font-medium mt-0.5">
+                          <Badge variant="outline">{selectedAction.status}</Badge>
+                        </div>
+                      </div>
+                      <div>
+                        <div className="font-semibold text-muted-foreground">Requested By</div>
+                        <div className="font-medium mt-0.5">{selectedAction.requested_by}</div>
+                      </div>
+                      <div>
+                        <div className="font-semibold text-muted-foreground">Requested At</div>
+                        <div className="font-medium mt-0.5">
+                          {new Date(selectedAction.requested_at).toLocaleString()}
+                        </div>
+                      </div>
+                    </div>
+
+                    {selectedAction.confirmation_message && (
+                      <div className="p-2 border bg-amber-50 border-amber-200 text-amber-900 rounded">
+                        <strong>Confirmation Note:</strong> {selectedAction.confirmation_message}
+                      </div>
+                    )}
+
+                    {selectedAction.failure_reason && (
+                      <div className="p-2 border bg-red-50 border-red-200 text-red-900 rounded">
+                        <strong>Execution Failure Reason:</strong> {selectedAction.failure_reason}
+                      </div>
+                    )}
+
+                    {/* Impact Preview Data */}
+                    {selectedAction.impact_preview_json && Object.keys(selectedAction.impact_preview_json).length > 0 && (
+                      <div className="space-y-2 border-t pt-3">
+                        <h4 className="font-bold text-muted-foreground uppercase text-[10px]">Impact Preview</h4>
+                        <div className="p-3 border rounded bg-white font-mono space-y-2">
+                          <div className="grid grid-cols-2 border-b pb-1 mb-1 font-bold text-muted-foreground">
+                            <div>Property</div>
+                            <div>Value</div>
+                          </div>
+                          {Object.entries(selectedAction.impact_preview_json).map(([key, val]: [string, any]) => (
+                            <div key={key} className="grid grid-cols-2 border-b pb-1 last:border-0">
+                              <div className="text-muted-foreground">{key}</div>
+                              <div>{typeof val === 'object' ? JSON.stringify(val) : String(val)}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Safety warnings */}
+                    <div className="p-3 border bg-blue-50/50 border-blue-200 text-blue-800 rounded space-y-1">
+                      <div className="font-bold flex items-center gap-1">
+                        <AlertTriangle className="w-3.5 h-3.5 text-blue-600" />
+                        Configuration Safety Disclaimer
+                      </div>
+                      <p>
+                        This manual workflow only mutates the target configuration parameters (e.g. role access, exception expiry, policy presets). It does not alter historical quality gate evidence, recommendations health indexes, or GitHub checks publishing logs.
+                      </p>
+                    </div>
+
+                    {/* Stage Buttons */}
+                    <div className="flex gap-2 border-t pt-3 justify-end">
+                      {selectedAction.status === "DRAFT" && (
+                        <>
+                          <Button
+                            size="sm"
+                            onClick={() => handlePreviewRemediationAction(selectedAction.id)}
+                          >
+                            Generate Impact Preview
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="destructive"
+                            onClick={() => handleCancelRemediationAction(selectedAction.id)}
+                          >
+                            Cancel Action
+                          </Button>
+                        </>
+                      )}
+
+                      {selectedAction.status === "PENDING_CONFIRMATION" && (
+                        <div className="w-full space-y-3">
+                          <div className="p-3 border bg-yellow-50/50 border-yellow-200 text-yellow-800 rounded space-y-2">
+                            <div className="font-bold">Explicit intent confirmation required</div>
+                            <p>Please type <strong>CONFIRM</strong> in the box below to authorize this configuration change.</p>
+                            <input
+                              type="text"
+                              className="w-full p-2 border border-yellow-300 rounded text-sm bg-white"
+                              placeholder="Type CONFIRM"
+                              value={confirmText}
+                              onChange={(e) => setConfirmText(e.target.value)}
+                            />
+                          </div>
+                          <div className="flex gap-2 justify-end">
+                            <Button
+                              size="sm"
+                              disabled={confirmText !== "CONFIRM"}
+                              onClick={() => handleConfirmRemediationAction(selectedAction.id)}
+                            >
+                              Confirm Action
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => handleCancelRemediationAction(selectedAction.id)}
+                            >
+                              Cancel Action
+                            </Button>
+                          </div>
+                        </div>
+                      )}
+
+                      {selectedAction.status === "CONFIRMED" && (
+                        <>
+                          <Button
+                            size="sm"
+                            className="bg-green-600 hover:bg-green-700 text-white"
+                            onClick={() => handleExecuteRemediationAction(selectedAction.id)}
+                          >
+                            Execute Remediation Now
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => handleCancelRemediationAction(selectedAction.id)}
+                          >
+                            Cancel Action
+                          </Button>
+                        </>
+                      )}
+
+                      {(selectedAction.status === "EXECUTED" || selectedAction.status === "FAILED" || selectedAction.status === "CANCELLED") && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => setSelectedAction(null)}
+                        >
+                          Close Details
+                        </Button>
+                      )}
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
+            </CardContent>
+          </Card>
+
+          {/* Bulk Governance Remediation */}
+          <Card>
+            <CardHeader>
+              <CardTitle>Bulk Remediation Board</CardTitle>
+              <CardDescription>Run automated filters to find stale/expired records and remediate in isolated batch pipelines</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div>
+                <label className="text-sm font-medium">Bulk Remediation Strategy</label>
+                <select
+                  className="w-full p-2 border rounded mt-1 bg-white text-sm"
+                  value={bulkRemediationType}
+                  onChange={(e) => {
+                    setBulkRemediationType(e.target.value);
+                    setBulkPreviewItems([]);
+                    setBulkExecutionResults([]);
+                  }}
+                >
+                  <option value="expired_role_cleanup">Expired Workspace Role Cleanup</option>
+                  <option value="expired_exception_cleanup">Expired Policy Exceptions Cleanup</option>
+                  <option value="policy_drift_remediation">Active Policy Drift Alignment</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="text-sm font-medium">Reason for Bulk Remediation</label>
+                <input
+                  type="text"
+                  className="w-full p-2 border rounded mt-1 text-sm bg-white"
+                  placeholder="e.g. Regular governance audit cleanup"
+                  value={bulkRemediationReason}
+                  onChange={(e) => setBulkRemediationReason(e.target.value)}
+                />
+              </div>
+
+              <div className="flex gap-2">
+                <Button
+                  variant="outline"
+                  onClick={handlePreviewBulkRemediation}
+                  disabled={bulkRemediationLoading}
+                >
+                  {bulkRemediationLoading ? "Scanning..." : "Identify Targets"}
+                </Button>
+
+                {bulkPreviewItems.length > 0 && (
+                  <Button
+                    onClick={() => setShowBulkRemediationConfirm(true)}
+                    disabled={bulkRemediationLoading}
+                  >
+                    Remediate Batch ({bulkPreviewItems.length} items)
+                  </Button>
+                )}
+              </div>
+
+              {/* Bulk Preview List */}
+              {bulkPreviewItems.length > 0 && (
+                <div className="space-y-2 border-t pt-3">
+                  <h4 className="font-bold text-xs">Identified Targets ({bulkPreviewItems.length})</h4>
+                  <div className="border rounded overflow-hidden max-h-60 overflow-y-auto">
+                    <table className="w-full text-left text-xs bg-white">
+                      <thead className="bg-muted text-muted-foreground border-b font-semibold">
+                        <tr>
+                          <th className="p-2">Target ID</th>
+                          <th className="p-2">Action Type</th>
+                          <th className="p-2">Details</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y">
+                        {bulkPreviewItems.map((item, index) => (
+                          <tr key={index} className="hover:bg-muted/10">
+                            <td className="p-2 font-mono">{item.target_id.slice(0, 8)}...</td>
+                            <td className="p-2">{item.action_type}</td>
+                            <td className="p-2 text-muted-foreground">{item.details}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {/* Bulk Execution Results */}
+              {bulkExecutionResults.length > 0 && (
+                <div className="space-y-2 border-t pt-3">
+                  <h4 className="font-bold text-xs text-green-700">Bulk Execution Results</h4>
+                  <div className="border rounded overflow-hidden max-h-60 overflow-y-auto">
+                    <table className="w-full text-left text-xs bg-white">
+                      <thead className="bg-muted text-muted-foreground border-b font-semibold">
+                        <tr>
+                          <th className="p-2">Item ID</th>
+                          <th className="p-2">Status</th>
+                          <th className="p-2">Result Details</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y font-mono">
+                        {bulkExecutionResults.map((res, index) => (
+                          <tr key={index} className={res.success ? "bg-green-50/30 hover:bg-green-50/50" : "bg-red-50/30 hover:bg-red-50/50"}>
+                            <td className="p-2">{res.item_id}</td>
+                            <td className="p-2">
+                              <Badge variant={res.success ? "default" : "destructive"} className="text-[10px]">
+                                {res.status}
+                              </Badge>
+                            </td>
+                            <td className="p-2 text-muted-foreground font-sans">
+                              {res.success ? "Success" : `Failed: ${res.failure_reason}`}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {/* Bulk Confirmation Modal Dialog */}
+              {showBulkRemediationConfirm && (
+                <div className="p-4 border border-yellow-300 bg-yellow-50 rounded space-y-3 text-xs">
+                  <div className="font-bold flex items-center gap-1 text-yellow-800">
+                    <AlertTriangle className="w-4 h-4 text-yellow-600" />
+                    Warning: Bulk Write Confirmation Required
+                  </div>
+                  <p className="text-yellow-700">
+                    You are about to execute <strong>{bulkPreviewItems.length}</strong> manual remediation actions in a batch. Each item runs in an isolated sub-transaction: failed items will fail gracefully and write detailed audit failures without affecting successful items.
+                  </p>
+                  <p className="text-yellow-700 font-semibold">
+                    Workspace safety limits (e.g. preventing owner lockout) will be strictly evaluated. Evidence files, recommendation builds, and check suite runs are preserved.
+                  </p>
+                  <div className="flex gap-2">
+                    <Button
+                      size="sm"
+                      onClick={handleExecuteBulkRemediation}
+                    >
+                      Proceed with Batch Execution
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => setShowBulkRemediationConfirm(false)}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
               )}
             </CardContent>
           </Card>

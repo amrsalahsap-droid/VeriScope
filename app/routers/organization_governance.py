@@ -180,6 +180,31 @@ def get_organization_compliance_dashboard(
     )
 
 
+@router.get("/repositories", response_model=List[RepositoryCompliance])
+def list_repositories_compliance(
+    workspace_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission("governance.policy.view"))
+) -> List[RepositoryCompliance]:
+    """Get compliance status and scores for all repositories in the workspace."""
+    workspace = db.query(Workspace).filter(Workspace.id == workspace_id).first()
+    if not workspace:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+        
+    repositories = db.query(Repository).filter(
+        Repository.workspace_id == workspace_id,
+        Repository.is_active == True
+    ).all()
+    
+    bulk_service = CICDPolicyBulkOperationService()
+    results = []
+    for repo in repositories:
+        compliance = bulk_service.calculate_repository_compliance(db, repo.id, workspace_id)
+        results.append(RepositoryCompliance(**compliance))
+        
+    return results
+
+
 @router.get("/repositories/{repository_id}/compliance", response_model=RepositoryCompliance)
 def get_repository_compliance(
     workspace_id: uuid.UUID,
