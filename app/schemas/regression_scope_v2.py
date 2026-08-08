@@ -13,11 +13,13 @@ from enum import Enum
 class ScopeGroup(str, Enum):
     """Scope group categories."""
     REQUIRED = "REQUIRED"
+    REVIEW_NEEDED = "REVIEW_NEEDED"
     RECOMMENDED = "RECOMMENDED"
     OPTIONAL = "OPTIONAL"
     SAFE_TO_SKIP = "SAFE_TO_SKIP"
     EXCLUDED_ALREADY_VERIFIED = "EXCLUDED_ALREADY_VERIFIED"
     EXCLUDED_ALREADY_PASSED_TESTS = "EXCLUDED_ALREADY_PASSED_TESTS"
+    DEFERRED_COVERAGE_DEBT = "DEFERRED_COVERAGE_DEBT"
 
 
 class ScopeItemType(str, Enum):
@@ -66,6 +68,7 @@ class ScopeMode(str, Enum):
     TARGETED = "targeted"
     RISK_BASED = "risk_based"
     FULL = "full"
+    FULL_SUITE = "full_suite"
 
 
 class ScopeSource(str, Enum):
@@ -104,7 +107,7 @@ class ScopeItem(BaseModel):
     evidence_references: List[str] = Field(default_factory=list, description="References to evidence")
     test_references: List[str] = Field(default_factory=list, description="References to tests")
     can_auto_execute: bool = Field(..., description="Whether this item can be auto-executed")
-    execution_status: Optional[str] = Field(None, description="Current execution status")
+    execution_status: Optional[str] = Field(None, description="Current execution status (PASSED, FAILED, NOT_RUN, SKIPPED)")
     estimated_effort: Optional[str] = Field(None, description="Estimated effort for manual items")
     is_required_for_release: bool = Field(..., description="Whether this item is required for release")
     is_manual_only: bool = Field(..., description="Whether this item is manual-only")
@@ -117,6 +120,21 @@ class ScopeItem(BaseModel):
     residual_risk_band: Optional[str] = Field(None, description="Risk band after manual evidence adjustment")
     risk_adjustment_reason: Optional[str] = Field(None, description="Human-readable explanation of risk adjustment")
     risk_adjustment_delta: Optional[int] = Field(None, description="Number of risk bands adjusted (-1, 0, or +1)")
+    # Release action classification fields
+    release_action: Optional[str] = Field(None, description="Action required before release (NONE, RE_RUN, FIX_OR_RERUN, RUN_OR_CREATE_TEST, MANUAL_REVIEW, NOT_RELEASE_BLOCKING)")
+    freshness_status: Optional[str] = Field(None, description="Evidence freshness status (FRESH, STALE, UNKNOWN)")
+    mapping_status: Optional[str] = Field(None, description="Mapping confidence status (VERIFIED, UNVERIFIED, LOW_CONFIDENCE)")
+    # Safe to Skip evidence
+    skip_evidence: Optional[Dict[str, Any]] = Field(None, description="Evidence explaining why this item is safe to skip")
+    # Mapping confidence fields
+    mapping_type: Optional[str] = Field(None, description="Mapping type (e.g. DIRECT_VERIFIED, FUZZY_MATCHED, MULTI_AC_SINGLE_TEST, NO_EXECUTABLE_TEST, REVIEW_NEEDED, UNMAPPED)")
+    mapping_confidence: Optional[float] = Field(None, description="Mapping confidence score (0-1.0)")
+    mapping_reason: Optional[str] = Field(None, description="Explanation for mapping assignment")
+    linked_test_count: Optional[int] = Field(None, description="Number of linked tests")
+    linked_tests: Optional[List[str]] = Field(None, description="List of linked tests")
+    test_run_commit_sha: Optional[str] = Field(None, description="Test run commit SHA for freshness proof")
+    pull_request_head_sha: Optional[str] = Field(None, description="Pull request head commit SHA for freshness proof")
+    reason_code: Optional[str] = Field(None, description="Reason code explaining bucket assignment")
 
 
 class ScopeGroupSummary(BaseModel):
@@ -132,6 +150,8 @@ class ExecutionPlan(BaseModel):
     recommended_count: int = Field(..., description="Number of recommended items")
     optional_count: int = Field(..., description="Number of optional items")
     safe_to_skip_count: int = Field(..., description="Number of safe-to-skip items")
+    review_needed_count: int = Field(default=0, description="Number of review-needed items")
+    deferred_coverage_debt_count: int = Field(default=0, description="Number of deferred coverage debt items")
     total_executable_count: int = Field(..., description="Total executable items")
     estimated_execution_reduction: float = Field(..., description="Estimated execution reduction percentage")
     confidence_level: float = Field(..., description="Confidence level (0-100)")
@@ -177,6 +197,94 @@ class ScopeGovernance(BaseModel):
     release_decision_status: Optional[str] = Field(None, description="Release decision status")
 
 
+class ScopeIntegrityReport(BaseModel):
+    """Scope integrity validation report."""
+    integrity_status: str = Field(..., description="PASS or FAIL")
+    integrity_errors: List[str] = Field(default_factory=list, description="Errors list")
+    integrity_warnings: List[str] = Field(default_factory=list, description="Warnings list")
+    total_unique_logical_items: int = Field(..., description="Total unique logical items")
+    bucket_sum: int = Field(..., description="Sum of all bucket items counts")
+    duplicate_identities: List[str] = Field(default_factory=list, description="List of duplicate identities")
+
+
+class TraceabilitySummary(BaseModel):
+    """Summary of requirement traceability from the evidence graph."""
+    total_requirements: int = Field(..., description="Total number of requirements in the domain")
+    covered: int = Field(..., description="Number of requirements with fresh passing tests (ALREADY_VERIFIED)")
+    missing: int = Field(..., description="Number of requirements without evidence (REQUIRED)")
+    not_mapped: int = Field(..., description="Number of requirements without database_ac_id (no traceability link)")
+    partial: int = Field(..., description="Number of requirements with partial evidence")
+
+
+class ReleaseDecision(BaseModel):
+    """Unified release decision derived from the active mode's ReleaseActionScope."""
+    verdict: str = Field(..., description="Release verdict: SAFE_TO_RELEASE, REVIEW_RECOMMENDED, DO_NOT_RELEASE")
+    reason: str = Field(..., description="Human-readable explanation of the decision")
+    required_count: int = Field(..., description="Number of REQUIRED items")
+    recommended_count: int = Field(..., description="Number of RECOMMENDED items")
+    already_verified_count: int = Field(..., description="Number of ALREADY_VERIFIED items")
+    source_mode: str = Field(..., description="The mode used to generate this decision")
+
+
+class ChangedRule(BaseModel):
+    """Represents a validation rule that was added or modified in the PR."""
+    rule_name: str = Field(..., description="Name of the rule (e.g., minLength, uppercase)")
+    rule_type: str = Field(..., description="Type of rule (validation, business logic, security)")
+    file_path: str = Field(..., description="File where the rule was changed")
+    line_number: Optional[int] = Field(None, description="Line number where the rule appears")
+
+
+class ChangeSummary(BaseModel):
+    """Semantic diff summary for a changed file."""
+    file_path: str = Field(..., description="Path to the changed file")
+    changed_functions: List[str] = Field(default_factory=list, description="Function names that were added/modified")
+    changed_rules: List[ChangedRule] = Field(default_factory=list, description="Validation rules added/modified")
+    new_conditionals: int = Field(default=0, description="Count of new if/else/switch branches")
+    changed_constants: List[str] = Field(default_factory=list, description="New/changed constants (messages, limits)")
+    affected_domain_terms: List[str] = Field(default_factory=list, description="Domain terms affected (password, token, etc.)")
+
+
+class CoverageGap(BaseModel):
+    """Represents a coverage gap in changed code."""
+    file_path: str = Field(..., description="File with uncovered code")
+    uncovered_branches: List[str] = Field(default_factory=list, description="Human-readable descriptions of uncovered branches")
+    related_requirement_ids: List[str] = Field(default_factory=list, description="Requirements linked to this gap")
+    risk: str = Field(..., description="Risk level: HIGH, MEDIUM, LOW")
+    gap_type: str = Field(..., description="Type of gap: NEW_BRANCH, UNCOVERED_FUNCTION, SHALLOW_COVERAGE")
+
+
+class DetailedScenario(BaseModel):
+    precondition: str = Field(..., description="Precondition for the test scenario")
+    test_input: str = Field(..., description="Specific test input details")
+    expected_result: str = Field(..., description="Expected test result")
+    test_layer: str = Field(..., description="Validation layer (e.g. API, UI, E2E)")
+
+
+class EvidenceItem(BaseModel):
+    requirement_id: str = Field(..., description="Requirement ID")
+    requirement_title: str = Field(..., description="Requirement title")
+    verifying_test: str = Field(..., description="Verifying test name")
+    test_status: str = Field(..., description="Test status (e.g., PASSED, FAILED, SKIPPED)")
+    test_freshness: str = Field(..., description="Test freshness (e.g., FRESH, STALE)")
+    impact_reason: str = Field(..., description="Impact reason")
+    final_bucket: str = Field(..., description="Final bucket classification, e.g. ALREADY_VERIFIED")
+
+
+class MissingTestRecommendation(BaseModel):
+    """Represents a recommended missing test."""
+    id: str = Field(..., description="Unique identifier for the recommendation")
+    title: str = Field(..., description="Human-readable title of the recommended test")
+    source: str = Field(..., description="Source: REQUIREMENT_GAP, COVERAGE_GAP, RISK_HEURISTIC")
+    priority: int = Field(..., description="Priority: 1 (critical) to 5 (low)")
+    risk_rationale: str = Field(..., description="Explanation of why this test is needed")
+    suggested_test_scenario: str = Field(..., description="Short description of test steps")
+    detailed_scenario: Optional[DetailedScenario] = Field(None, description="Detailed scenario details")
+    linked_requirement_id: Optional[str] = Field(None, description="Linked requirement ID if applicable")
+    linked_file: Optional[str] = Field(None, description="Linked file if applicable")
+    linked_code_change: Optional[str] = Field(None, description="Linked code change description if applicable")
+    estimated_effort: str = Field(..., description="Estimated effort: LOW, MEDIUM, HIGH")
+
+
 class ScopeDiagnostics(BaseModel):
     """Diagnostic information for the scope."""
     generation_timestamp: datetime = Field(..., description="When the scope was generated")
@@ -184,6 +292,8 @@ class ScopeDiagnostics(BaseModel):
     rules_applied: List[str] = Field(default_factory=list, description="Rules applied during generation")
     warnings: List[str] = Field(default_factory=list, description="Warnings during generation")
     errors: List[str] = Field(default_factory=list, description="Errors during generation")
+    # Phase 5.10: Change impact engine diagnostics
+    change_impact_diagnostics: Optional[Any] = Field(None, description="Change impact engine diagnostics")
 
 
 class RegressionScopeV2(BaseModel):
@@ -200,6 +310,13 @@ class RegressionScopeV2(BaseModel):
     optimization_metrics: ScopeOptimizationMetrics = Field(..., description="Optimization metrics")
     governance: ScopeGovernance = Field(..., description="Governance information")
     diagnostics: ScopeDiagnostics = Field(..., description="Diagnostic information")
+    integrity: Optional[ScopeIntegrityReport] = Field(None, description="Scope integrity validation report")
+    # Phase 7: Unified view fields
+    traceability_summary: Optional[TraceabilitySummary] = Field(None, description="Traceability summary from evidence graph")
+    release_decision: Optional[ReleaseDecision] = Field(None, description="Unified release decision")
+    # Phase 8: Gap analysis and missing test recommendations
+    recommendations: List[MissingTestRecommendation] = Field(default_factory=list, description="Recommended missing tests for additional safety")
+    evidence_items: List[EvidenceItem] = Field(default_factory=list, description="Evidence details for verifying tests")
 
 
 class RegressionScopeV2Request(BaseModel):
@@ -214,5 +331,6 @@ class RegressionScopeV2Response(BaseModel):
     """Response for regression scope V2 endpoint."""
     status: str = Field(..., description="Response status")
     scope: Optional[RegressionScopeV2] = Field(None, description="Regression scope V2")
+    mode: Optional[ScopeMode] = Field(None, description="The mode used to generate this scope")
     error_code: Optional[str] = Field(None, description="Error code if failed")
     message: Optional[str] = Field(None, description="Error message if failed")

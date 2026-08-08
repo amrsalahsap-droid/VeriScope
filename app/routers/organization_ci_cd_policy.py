@@ -144,16 +144,20 @@ def update_organization_default_policy(
     db.refresh(org_default)
     
     # Log audit event
-    from app.services.ci_cd_policy_audit_service import CICDPolicyAuditService
-    CICDPolicyAuditService.log_policy_updated(
-        db=db,
-        repository_id=None,
-        before_policy={},
-        after_policy=payload.dict(exclude_none=True),
-        changed_fields=list(payload.dict(exclude_none=True).keys()),
+    from app.models.workspace_governance_audit_event import WorkspaceGovernanceAuditEvent
+    audit_event = WorkspaceGovernanceAuditEvent(
+        workspace_id=workspace_id,
         actor_id=current_user.id,
-        actor_type="USER"
+        event_type="WORKSPACE_POLICY_DEFAULT_UPDATED",
+        reason="Workspace default policy updated",
+        audit_metadata={
+            "before_policy": {},
+            "after_policy": payload.dict(exclude_none=True),
+            "changed_fields": list(payload.dict(exclude_none=True).keys())
+        }
     )
+    db.add(audit_event)
+    db.commit()
     
     return OrganizationDefaultPolicyResponse(
         id=org_default.id,

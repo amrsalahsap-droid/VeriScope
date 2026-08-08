@@ -177,6 +177,9 @@ class PipelineExecutionWorker:
             if pull_request and repository.owner and repository.full_name:
                 self._publish_pr_comment(db, repository, pipeline_run, pull_request, job)
             
+            # Generate and store recommendation report artifact
+            self._generate_recommendation_artifact(db, repository, pipeline_run, recommendation_run)
+            
             # Mark job as completed
             self.mark_completed(db, job, pipeline_run)
             return True
@@ -384,8 +387,19 @@ class PipelineExecutionWorker:
         """Publish final GitHub status/check."""
         try:
             ci_fail_on_partial = repository.ci_fail_on_partial if hasattr(repository, 'ci_fail_on_partial') else False
+            
+            # Resolve GitHub installation token dynamically
+            github_token = "test"  # Fallback
+            if repository.installation_id:
+                try:
+                    from app.services.github_api_client import GitHubApiClient
+                    github_client = GitHubApiClient()
+                    github_token = github_client.get_installation_token(repository.installation_id)
+                except Exception as e:
+                    logger.error(f"Failed to resolve GitHub installation token: {e}")
+            
             github_service = GitHubCheckService(
-                github_token="test",  # Will be mocked in tests
+                github_token=github_token,
                 ci_fail_on_partial=ci_fail_on_partial
             )
             
@@ -424,8 +438,19 @@ class PipelineExecutionWorker:
         """Create or update PR comment with quality gate result."""
         try:
             ci_fail_on_partial = repository.ci_fail_on_partial if hasattr(repository, 'ci_fail_on_partial') else False
+            
+            # Resolve GitHub installation token dynamically
+            github_token = "test"  # Fallback
+            if repository.installation_id:
+                try:
+                    from app.services.github_api_client import GitHubApiClient
+                    github_client = GitHubApiClient()
+                    github_token = github_client.get_installation_token(repository.installation_id)
+                except Exception as e:
+                    logger.error(f"Failed to resolve GitHub installation token: {e}")
+            
             github_service = GitHubCheckService(
-                github_token="test",  # Will be mocked in tests
+                github_token=github_token,
                 ci_fail_on_partial=ci_fail_on_partial
             )
             
@@ -439,7 +464,10 @@ class PipelineExecutionWorker:
                 regression_scope_summary=response.regression_scope.dict(),
                 summary_text=response.summary,
                 recommendation_url=f"https://veriscope.app/recommendations/{response.recommendation_run_id}" if response.recommendation_run_id else None,
-                artifact_url=f"https://veriscope.app/api/pipeline-runs/{pipeline_run.id}/artifact"
+                artifact_url=f"https://veriscope.app/api/pipeline-runs/{pipeline_run.id}/artifact",
+                recommendation_health=response.recommendation_health,
+                release_decision=response.release_decision,
+                changed_files=response.changed_files
             )
             
             owner, repo = repository.full_name.split('/', 1)
@@ -453,3 +481,62 @@ class PipelineExecutionWorker:
             # Log error but don't fail job
             import logging
             logging.getLogger("veriscope.worker").error(f"Failed to publish PR comment: {e}")
+    
+    def _generate_recommendation_artifact(
+        self,
+        db: Session,
+        repository: Repository,
+        pipeline_run: PipelineRun,
+        recommendation_run: Optional[RecommendationRun]
+    ):
+        """Generate and store recommendation report artifact."""
+        try:
+            if not recommendation_run:
+                logger.warning("No recommendation run available, skipping artifact generation")
+                return
+            
+            from app.services.pipeline_run_service import PipelineRunService
+            response = PipelineRunService._build_response(db, pipeline_run)
+            
+            # Build artifact content
+            artifact_content = {
+                "summary": response.summary,
+                "release_decision": response.release_decision,
+                "quality_gate": response.quality_gate,
+                "required_before_release": response.required_before_release,
+                "regression_scope": response.regression_scope.dict(),
+                "recommendation_health": response.recommendation_health,
+                "changed_files": response.changed_files,
+                "recommendation_run_id": str(response.recommendation_run_id) if response.recommendation_run_id else None,
+                "pipeline_run_id": str(response.pipeline_run_id),
+                "commit_sha": pipeline_run.commit_sha,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+            # Store artifact in database
+            from app.models.artifact import RawArtifact
+            import json
+            
+            artifact = RawArtifact(
+                id=uuid.uuid4(),
+                artifact_type="RECOMMENDATION_REPORT",
+                repository_id=repository.id,
+                storage_path=f"recommendation_reports/{pipeline_run.id}.json",
+                artifact_metadata={
+                    "recommendation_run_id": str(recommendation_run.id),
+                    "pipeline_run_id": str(pipeline_run.id),
+                    "commit_sha": pipeline_run.commit_sha
+                },
+                created_at=datetime.utcnow()
+            )
+            
+            db.add(artifact)
+            db.flush()
+            
+            logger.info(f"Generated recommendation report artifact: {artifact.id}")
+            
+        except Exception as e:
+            # Log error but don't fail job
+            import logging
+            logging.getLogger("veriscope.worker").error(f"Failed to generate recommendation artifact: {e}")
+

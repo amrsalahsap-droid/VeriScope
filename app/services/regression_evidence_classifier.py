@@ -126,6 +126,7 @@ class RequirementNode:
     notes: List[str] = field(default_factory=list)
     source_hash: Optional[str] = None
     source_number: Optional[int] = None  # Phase 6.4: Add source_number for manual evidence matching
+    database_ac_id: Optional[str] = None  # Phase 6: Add database AC ID for evidence overlay cross-reference
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -160,7 +161,7 @@ class RequirementNode:
 
 @dataclass
 class TestNode:
-    """Represents an existing automated/manual test or suggested missing test."""
+    """Represents one existing automated/manual test or suggested missing test."""
     test_id: str
     title: str
     normalized_title: str = ""
@@ -173,6 +174,7 @@ class TestNode:
     scenario_signature_hash: str = ""
     properties: Dict[str, Any] = field(default_factory=dict)
     acceptance_criterion_metadata: Optional[Dict[str, Any]] = None
+    declared_ac_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -188,6 +190,7 @@ class TestNode:
             "scenario_signature_hash": self.scenario_signature_hash,
             "properties": self.properties,
             "acceptance_criterion_metadata": self.acceptance_criterion_metadata,
+            "declared_ac_id": self.declared_ac_id,
         }
 
 
@@ -206,6 +209,7 @@ class ExecutionNode:
     mapped_requirement_ids: List[str] = field(default_factory=list)
     properties: Dict[str, Any] = field(default_factory=dict)
     acceptance_criterion_metadata: Optional[Dict[str, Any]] = None
+    declared_ac_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -221,6 +225,7 @@ class ExecutionNode:
             "mapped_requirement_ids": self.mapped_requirement_ids,
             "properties": self.properties,
             "acceptance_criterion_metadata": self.acceptance_criterion_metadata,
+            "declared_ac_id": self.declared_ac_id,
         }
 
 
@@ -594,6 +599,8 @@ class RequirementMatcher:
         """Normalize title for comparison."""
         # Lowercase
         normalized = title.lower()
+        # Remove leading numbering/prefixes like "7.", "AC-07", "07 -", "1 -"
+        normalized = re.sub(r'^(?:ac[- ]*\d+|\d+)[-.\s]*', '', normalized, flags=re.IGNORECASE)
         # Remove punctuation
         normalized = re.sub(r'[^\w\s-]', ' ', normalized)
         # Replace underscores/hyphens with spaces
@@ -636,6 +643,68 @@ class RequirementMatcher:
             "penalties": [],
             "signals": []
         }
+
+        # Check if the test case has a declared_ac_id value
+        declared_ac_id = getattr(test, "declared_ac_id", None)
+        if not declared_ac_id and test.acceptance_criterion_metadata:
+            declared_ac_id = test.acceptance_criterion_metadata.get("acceptance_criterion_id") or test.acceptance_criterion_metadata.get("ac_id")
+
+        if declared_ac_id is not None:
+            from app.db.session import SessionLocal
+            from app.models.acceptance_criterion import AcceptanceCriterion
+            from sqlalchemy import func, or_
+            
+            matched_ac = None
+            try:
+                with SessionLocal() as db:
+                    curr_ac = db.query(AcceptanceCriterion).filter(AcceptanceCriterion.id == requirement.requirement_id).first()
+                    if curr_ac:
+                        repo_id = curr_ac.repository_id
+                        val = str(declared_ac_id).lower()
+                        
+                        model_cols = [c.name for c in AcceptanceCriterion.__table__.columns]
+                        filters = []
+                        if "normalized_key" in model_cols:
+                            filters.append(func.lower(AcceptanceCriterion.normalized_key) == val)
+                            filters.append(func.lower(AcceptanceCriterion.normalized_key).contains(val))
+                        if "external_id" in model_cols:
+                            filters.append(func.lower(AcceptanceCriterion.external_id) == val)
+                            filters.append(func.lower(AcceptanceCriterion.external_id).contains(val))
+                        if "label" in model_cols:
+                            filters.append(func.lower(AcceptanceCriterion.label) == val)
+                            filters.append(func.lower(AcceptanceCriterion.label).contains(val))
+                        if "text" in model_cols:
+                            filters.append(func.lower(AcceptanceCriterion.text) == val)
+                            filters.append(func.lower(AcceptanceCriterion.text).contains(val))
+                            
+                        matched_ac = db.query(AcceptanceCriterion).filter(
+                            AcceptanceCriterion.repository_id == repo_id,
+                            or_(*filters)
+                        ).first()
+            except Exception:
+                pass
+                
+            if matched_ac:
+                if str(matched_ac.id) == str(requirement.requirement_id):
+                    diagnostics["signals"].append("Direct ID match")
+                    diagnostics["layer_scores"]["direct_id"] = 1.0
+                    diagnostics["mapping_type"] = "DIRECT_AC_ID"
+                    return 1.0, diagnostics
+                else:
+                    return 0.0, diagnostics
+            else:
+                # Fallback to local python object matching if database query failed or returned None
+                val = str(declared_ac_id).lower()
+                if (val == requirement.requirement_id.lower() or
+                    val in requirement.requirement_id.lower() or
+                    val == requirement.readable_id.lower() or
+                    val in requirement.readable_id.lower() or
+                    val == requirement.title.lower() or
+                    val in requirement.title.lower()):
+                    diagnostics["signals"].append("Direct ID match")
+                    diagnostics["layer_scores"]["direct_id"] = 1.0
+                    diagnostics["mapping_type"] = "DIRECT_AC_ID"
+                    return 1.0, diagnostics
 
         total_score = 0.0
 

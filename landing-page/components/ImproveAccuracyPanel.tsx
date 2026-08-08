@@ -17,7 +17,7 @@ import {
   CheckCircle2
 } from "lucide-react";
 import { toast } from "sonner";
-import PasteAcceptanceCriteriaModal from "./recommendations/paste-acceptance-criteria-modal";
+import BusinessRequirementsModal from "./requirements/business-requirements-modal";
 
 interface AccuracyAction {
   id: string;
@@ -59,11 +59,11 @@ export function ImproveAccuracyPanel({
   const generateActions = (): AccuracyAction[] => {
     const actions: AccuracyAction[] = [];
 
-    // Paste Acceptance Criteria - Always available
+    // Manage Business Requirements - Always available
     if (missingSignals.includes("acceptance_criteria")) {
       actions.push({
         id: "paste_acceptance_criteria",
-        title: "Paste Acceptance Criteria",
+        title: "Manage Business Requirements",
         description: "Add business requirements and acceptance criteria to improve scenario precision",
         benefit: "Better scenario precision and requirement coverage",
         estimatedGain: "+12%",
@@ -430,11 +430,11 @@ export function ImproveAccuracyPanel({
           </div>
         </div>
       </div>
-      <PasteAcceptanceCriteriaModal
+      <BusinessRequirementsModal
         isOpen={isPasteModalOpen}
         onClose={() => setIsPasteModalOpen(false)}
         onSuccess={(updatedReadiness, recommendationStale) => {
-          toast.success("Acceptance Criteria Added", {
+          toast.success("Business Requirements Added", {
             description: "Regenerate recommendation to include requirement coverage."
           });
           onActionComplete?.("paste_acceptance_criteria");

@@ -153,11 +153,18 @@ class PipelineRunService:
         
         # Initialize GitHub check service if we have repository integration
         github_service = None
-        if repository.owner and repository.full_name:
-            github_service = GitHubCheckService(
-                github_token="test",  # Will be mocked in tests
-                ci_fail_on_partial=repository.ci_fail_on_partial if hasattr(repository, 'ci_fail_on_partial') else False
-            )
+        if repository.owner and repository.full_name and repository.installation_id:
+            try:
+                from app.services.github_api_client import GitHubApiClient
+                github_client = GitHubApiClient()
+                github_token = github_client.get_installation_token(repository.installation_id)
+                github_service = GitHubCheckService(
+                    github_token=github_token,
+                    ci_fail_on_partial=repository.ci_fail_on_partial if hasattr(repository, 'ci_fail_on_partial') else False
+                )
+            except Exception as e:
+                import logging
+                logging.getLogger("veriscope.pipeline").error(f"Failed to resolve GitHub installation token: {e}")
         
         # Publish GitHub pending status/check
         if github_service and repository.owner and repository.full_name:

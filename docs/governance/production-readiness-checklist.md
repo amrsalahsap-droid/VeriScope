@@ -49,11 +49,37 @@
 * [ ] Operations guides, runbooks, and troubleshooting guide published.
 * [ ] Escalation paths and response playbooks configured.
 
+### 12. Outcome Learning Readiness
+* [x] Database migrations applied for outcome events, labels, and summaries.
+* [x] Idempotency and deduplication signatures verified for webhook events.
+* [x] Recursive secret scrub filters verified for metadata JSON.
+* [x] Strict linking rules verify zero recommendation run mutations.
+* [x] RBAC boundaries and isolation rules prevent unauthorized access to analytics and labels.
+* [x] Real HTTP validation test script executes successfully against running instance.
+* [x] OUTCOME_LEARNING_EXPORT_CREATED audit event marked NOT_APPLICABLE (export endpoint deferred to a future reporting/export phase).
+
 ---
 
 ## Known Blockers
-The following phases and validations must be completed before marking the CI/CD module Release Candidate (RC) ready:
-1. **Phase 8.6D real GitHub RC validation**: Pending verification of webhook events and status checks with live GitHub app setups.
-2. **Phase 8.11D RBAC actual HTTP proof**: Pending end-to-end integration tests using full HTTP endpoints for authorization roles.
-3. **Phase 8.12 notification live validation**: Pending live validation of email SMTP server connections and dashboard updates under high-load cycles.
-4. **CI/CD Module Status**: Blocked from being marked Release Candidate ready until the above blockers are resolved.
+All Phase 8 and Phase 9 (Outcome Learning) blockers are resolved. Phase 9 implementation and E2E verification are complete.
+
+> [!NOTE]
+> `OUTCOME_LEARNING_EXPORT_CREATED` is NOT_APPLICABLE in Phase 9 because Phase 9 does not implement an outcome-learning export endpoint. Export support is deferred to a future reporting/export phase. No export action exists, so no export-created audit event is emitted in Phase 9.
+
+### 13. Phase 10 Production Deployment Readiness
+* [ ] Secret safety scan completed with zero REAL_SECRET findings.
+* [ ] Production HTTP smoke tests pass against running backend with PostgreSQL.
+* [ ] Worker queue readiness verified (Redis connectivity, RQ worker active, test job execution).
+* [ ] GitHub App production readiness verified (installation resolution, API calls, webhook signature validation).
+* [ ] Database migration at head (verified via alembic current).
+* [ ] Environment configuration checklist complete (production values, no localhost/test URLs, no default secrets).
+* [ ] Deployment documentation complete (migration runbook, worker queue runbook, GitHub App runbook, rollback plan, incident response).
+* [ ] Inline fallback disabled in production mode (verified in code).
+
+---
+
+## Phase 10 Status
+Phase 10 deployment readiness verification is in progress. Verification scripts and deployment documentation have been created. Manual verification and execution of verification tests are required before final decision.
+
+> [!NOTE]
+> Phase 10 verification requires running infrastructure (PostgreSQL, Redis/RQ, GitHub App) to execute real HTTP tests. If running infrastructure is not available, verification will use simulation/fallback mode, resulting in Option B (READY WITH ACCEPTED RISKS) instead of Option A (RC READY).

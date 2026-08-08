@@ -98,54 +98,60 @@ class BehaviorEvidenceAggregator:
             for evidence in route_evidences:
                 unified = self._convert_route_evidence(evidence)
                 if unified:
-                    if unified.source_identifier not in evidence_by_behavior:
-                        evidence_by_behavior[unified.source_identifier] = []
-                    evidence_by_behavior[unified.source_identifier].append(unified)
+                    b_name = evidence.behavior
+                    if b_name not in evidence_by_behavior:
+                        evidence_by_behavior[b_name] = []
+                    evidence_by_behavior[b_name].append(unified)
         
         # Process test evidences
         if test_evidences:
             for evidence in test_evidences:
                 unified = self._convert_test_evidence(evidence)
                 if unified:
-                    if unified.source_identifier not in evidence_by_behavior:
-                        evidence_by_behavior[unified.source_identifier] = []
-                    evidence_by_behavior[unified.source_identifier].append(unified)
+                    b_name = evidence.behavior
+                    if b_name not in evidence_by_behavior:
+                        evidence_by_behavior[b_name] = []
+                    evidence_by_behavior[b_name].append(unified)
         
         # Process module evidences
         if module_evidences:
             for evidence in module_evidences:
                 unified = self._convert_module_evidence(evidence)
                 if unified:
-                    if unified.source_identifier not in evidence_by_behavior:
-                        evidence_by_behavior[unified.source_identifier] = []
-                    evidence_by_behavior[unified.source_identifier].append(unified)
+                    b_name = evidence.behavior
+                    if b_name not in evidence_by_behavior:
+                        evidence_by_behavior[b_name] = []
+                    evidence_by_behavior[b_name].append(unified)
         
         # Process documentation evidences
         if documentation_evidences:
             for evidence in documentation_evidences:
                 unified = self._convert_documentation_evidence(evidence)
                 if unified:
-                    if unified.source_identifier not in evidence_by_behavior:
-                        evidence_by_behavior[unified.source_identifier] = []
-                    evidence_by_behavior[unified.source_identifier].append(unified)
+                    b_name = evidence.behavior
+                    if b_name not in evidence_by_behavior:
+                        evidence_by_behavior[b_name] = []
+                    evidence_by_behavior[b_name].append(unified)
         
         # Process page evidences
         if page_evidences:
             for evidence in page_evidences:
                 unified = self._convert_page_evidence(evidence)
                 if unified:
-                    if unified.source_identifier not in evidence_by_behavior:
-                        evidence_by_behavior[unified.source_identifier] = []
-                    evidence_by_behavior[unified.source_identifier].append(unified)
+                    b_name = evidence.behavior
+                    if b_name not in evidence_by_behavior:
+                        evidence_by_behavior[b_name] = []
+                    evidence_by_behavior[b_name].append(unified)
         
         # Process service evidences
         if service_evidences:
             for evidence in service_evidences:
                 unified = self._convert_service_evidence(evidence)
                 if unified:
-                    if unified.source_identifier not in evidence_by_behavior:
-                        evidence_by_behavior[unified.source_identifier] = []
-                    evidence_by_behavior[unified.source_identifier].append(unified)
+                    b_name = evidence.behavior
+                    if b_name not in evidence_by_behavior:
+                        evidence_by_behavior[b_name] = []
+                    evidence_by_behavior[b_name].append(unified)
         
         # Generate behavior candidates
         candidates = []
@@ -163,7 +169,7 @@ class BehaviorEvidenceAggregator:
         """Convert route evidence to unified format."""
         return UnifiedEvidence(
             source_type="ROUTE",
-            source_identifier=evidence.behavior,
+            source_identifier=evidence.route,
             confidence=evidence.confidence,
             metadata={
                 "route": evidence.route,
@@ -176,7 +182,7 @@ class BehaviorEvidenceAggregator:
         """Convert test evidence to unified format."""
         return UnifiedEvidence(
             source_type="TEST",
-            source_identifier=evidence.behavior,
+            source_identifier=evidence.test_identifier,
             confidence=evidence.confidence,
             metadata={
                 "test_identifier": evidence.test_identifier,
@@ -190,7 +196,7 @@ class BehaviorEvidenceAggregator:
         """Convert module evidence to unified format."""
         return UnifiedEvidence(
             source_type="MODULE",
-            source_identifier=evidence.behavior,
+            source_identifier=evidence.module,
             confidence=evidence.confidence,
             metadata={
                 "module": evidence.module,
@@ -204,7 +210,7 @@ class BehaviorEvidenceAggregator:
         """Convert documentation evidence to unified format."""
         return UnifiedEvidence(
             source_type="DOCUMENTATION",
-            source_identifier=evidence.behavior,
+            source_identifier=evidence.source_document,
             confidence=evidence.confidence,
             excerpt=evidence.excerpt,
             metadata={
@@ -219,7 +225,7 @@ class BehaviorEvidenceAggregator:
         """Convert page evidence to unified format."""
         return UnifiedEvidence(
             source_type="PAGE",
-            source_identifier=evidence.behavior,
+            source_identifier=evidence.page,
             confidence=evidence.confidence,
             metadata={
                 "page": evidence.page,
@@ -231,7 +237,7 @@ class BehaviorEvidenceAggregator:
         """Convert service evidence to unified format."""
         return UnifiedEvidence(
             source_type="SERVICE",
-            source_identifier=evidence.behavior,
+            source_identifier=evidence.service,
             confidence=evidence.confidence,
             metadata={
                 "service": evidence.service,

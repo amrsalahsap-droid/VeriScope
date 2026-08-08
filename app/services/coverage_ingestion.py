@@ -14,7 +14,9 @@ from app.services.lcov_parser import SafeLCOVParser
 from app.services.cobertura_parser import SafeCoberturaParser, CoberturaParsingError
 from app.services.storage import ObjectStorageService
 from app.services.coverage_link_expander import CoverageLinkExpander
-from app.constants.evidence import EvidenceSource, EvidenceArtifactType, EvidenceHealthStatus
+from app.constants.evidence import EvidenceSource, EvidenceArtifactType, EvidenceHealthStatus, CoverageLevel
+
+logger = logging.getLogger(__name__)
 
 class CoverageIngestionError(ValueError):
     """Custom exception raised when coverage ingestion fails validation."""
@@ -22,17 +24,66 @@ class CoverageIngestionError(ValueError):
 
 class CoverageIngestionService:
     @staticmethod
+    def is_fake_coverage_report(report: CoverageReport) -> bool:
+        unknown_sha = not report.commit_sha or str(report.commit_sha).strip().lower() in {"unknown", "null", "none"}
+        empty_metrics = (
+            not report.files_total
+            and not report.total_lines
+            and not report.covered_lines_total
+        )
+        return (
+            report.source == EvidenceSource.MANUAL_UPLOAD.value
+            and unknown_sha
+            and report.file_hash == "dummy_hash_for_direct_ac"
+            and empty_metrics
+        )
+
+    @staticmethod
+    def cleanup_fake_coverage_artifacts(db: Session, repository_id: uuid.UUID) -> dict:
+        """Remove only legacy AC-ID pseudo-coverage and empty dummy coverage reports."""
+        direct_ac_links = db.query(FileTestLink).join(
+            CoverageReport,
+            FileTestLink.coverage_report_id == CoverageReport.id,
+        ).filter(
+            CoverageReport.repository_id == repository_id,
+            FileTestLink.file_path.like("AC-%"),
+            FileTestLink.mapping_type == "DIRECT_AC_ID",
+        ).all()
+        for link in direct_ac_links:
+            db.delete(link)
+
+        reports = db.query(CoverageReport).filter(
+            CoverageReport.repository_id == repository_id,
+        ).all()
+        fake_reports = [report for report in reports if CoverageIngestionService.is_fake_coverage_report(report)]
+        for report in fake_reports:
+            db.delete(report)
+
+        if direct_ac_links or fake_reports:
+            db.flush()
+
+        return {
+            "fake_coverage_reports_removed": len(fake_reports),
+            "fake_file_test_links_removed": len(direct_ac_links),
+        }
+
+    @staticmethod
     def ingest_coverage(
         db: Session,
         repository_id: uuid.UUID,
-        commit_sha: str,
+        commit_sha: Optional[str],
         payload_bytes: bytes,
         file_name: str,
         pull_request_id: Optional[uuid.UUID] = None,
         correlation_id: Optional[str] = None,
         evidence_source: Optional[str] = None,
         branch: Optional[str] = None,
-        source_context: Optional[str] = None
+        source_context: Optional[str] = None,
+        current_pr_head_sha: Optional[str] = None,
+        commit_sha_source: Optional[str] = None,
+        sha_mismatch: bool = False,
+        is_current: bool = False,
+        coverage_uploaded_at: Optional[datetime] = None
     ) -> CoverageReport:
         """
         Coordinates the LCOV ingestion pipeline:
@@ -114,6 +165,13 @@ class CoverageIngestionService:
             except Exception as e:
                 raise CoverageIngestionError(f"Malformed or unsafe LCOV report payload: {str(e)}") from e
 
+        # Validate that coverage parsing produced actual file records
+        if not parsed_files or len(parsed_files) == 0:
+            raise CoverageIngestionError(
+                "Coverage file uploaded but no file coverage records were parsed. "
+                "The coverage artifact may be invalid, empty, or in an unsupported format."
+            )
+
         # Calculate overall counts to construct the parent report
         total_lines = 0
         total_covered = 0
@@ -125,6 +183,23 @@ class CoverageIngestionService:
 
         overall_pct = (total_covered / total_lines) if total_lines > 0 else 0.0
 
+        logger.info("[COVERAGE INGESTION] Parsed coverage summary", {
+            "files_total": len(parsed_files),
+            "total_lines": total_lines,
+            "total_covered": total_covered,
+            "total_uncovered": total_uncovered,
+            "overall_coverage_pct": overall_pct,
+            "coverage_format": coverage_format,
+        })
+
+        # Detect coverage level honestly
+        # LCOV aggregate coverage is RUN_LEVEL by default
+        # Only TEST_CASE_LEVEL if artifact provides per-test data with test_name context
+        coverage_level = CoverageLevel.RUN_LEVEL
+        has_per_test_data = any(pf.get("test_name") for pf in parsed_files)
+        if has_per_test_data:
+            coverage_level = CoverageLevel.TEST_CASE_LEVEL
+
         # Construct and flush CoverageReport
         report = CoverageReport(
             id=uuid.uuid4(),
@@ -132,12 +207,18 @@ class CoverageIngestionService:
             workspace_id=workspace_id,
             commit_sha=commit_sha,
             pull_request_id=pull_request_id,
+            current_pr_head_sha=current_pr_head_sha,
+            commit_sha_source=commit_sha_source or "MANUAL",
+            sha_mismatch=sha_mismatch,
+            is_current=is_current,
+            coverage_uploaded_at=coverage_uploaded_at or datetime.utcnow(),
             raw_artifact_id=raw_artifact.id,
             
             # Final Contract Fields
             format=coverage_format,
             source=evidence_source,
             branch=branch,
+            coverage_level=coverage_level,
             files_total=len(parsed_files),
             covered_lines_total=total_covered,
             uncovered_lines_total=total_uncovered,
@@ -338,6 +419,10 @@ class CoverageIngestionService:
         mapped_ratio = 1.0
         avg_changed_cov = 1.0
 
+        # Initialize changed file tracking
+        changed_paths = []
+        matched_changed_paths = []
+
         if pr:
             # Evaluate using Pull Request changed files
             changed_files = (
@@ -348,19 +433,29 @@ class CoverageIngestionService:
                 )
                 .all()
             )
-            
+
             # Filter changed files to those that exist in the LCOV report
             changed_paths = [cf.file_path for cf in changed_files]
-            
+
+            logger.info("[COVERAGE INGESTION] PR changed files", {
+                "pr_id": str(pull_request_id),
+                "changed_files_total": len(changed_paths),
+                "changed_files_sample": changed_paths[:5] if changed_paths else [],
+            })
+
             # Map changed files to normalized entries we have
-            matched_changed_paths = []
             for path in changed_paths:
                 # Find matching file entry (handle fuzzy slash comparisons)
                 norm_p = SafeLCOVParser.normalize_path(path)
                 matching_entry = next((fe for fe in file_entries if fe.file_path == norm_p), None)
                 if matching_entry:
                     matched_changed_paths.append(norm_p)
-            
+
+            logger.info("[COVERAGE INGESTION] Changed file matching", {
+                "matched_changed_paths_count": len(matched_changed_paths),
+                "matched_changed_paths_sample": matched_changed_paths[:5] if matched_changed_paths else [],
+            })
+
             if not matched_changed_paths and changed_paths:
                 path_mapping_uncertain = True
                 mapped_ratio = 0.0
@@ -369,7 +464,7 @@ class CoverageIngestionService:
                 # Calculate metrics for changed files
                 mapped_changed_count = sum(1 for p in changed_paths if SafeLCOVParser.normalize_path(p) in mapped_files_with_links)
                 mapped_ratio = mapped_changed_count / len(changed_paths)
-                
+
                 # Calculate average coverage of matched changed files
                 total_cov_sum = 0.0
                 for path in matched_changed_paths:
@@ -384,6 +479,16 @@ class CoverageIngestionService:
                 mapped_ratio = len(mapped_files_with_links) / all_files_count
             else:
                 mapped_ratio = 0.0
+
+        # Persist changed-file coverage context on the report for readiness and UI.
+        if pr and changed_paths:
+            report.changed_files_total = len(changed_paths)
+            report.changed_files_with_coverage = len(matched_changed_paths)
+            report.changed_files_without_coverage = max(0, len(changed_paths) - len(matched_changed_paths))
+        else:
+            report.changed_files_total = 0
+            report.changed_files_with_coverage = 0
+            report.changed_files_without_coverage = 0
 
         # Deterministic Coverage Confidence Scoring Engine
         # MVP confidence calculation rules
@@ -461,7 +566,24 @@ class CoverageIngestionService:
             confidence_logic = f"[{source_context}] {confidence_logic}"
         report.confidence_logic = confidence_logic
         report.coverage_confidence = confidence_score
+        # The PR-current signal is only meaningful when the coverage SHA matches the selected PR.
+        report.current_pr_coverage_confidence = confidence_score if report.is_current else "NONE"
         db.add(report)
         db.flush()
+
+        # Recompute recommendation run snapshots if coverage was linked to a PR
+        # This ensures coverageStatus reflects the new coverage-to-test mappings
+        if pull_request_id:
+            try:
+                from app.services.evidence_graph.requirement_evidence_graph_service import RequirementEvidenceGraphService
+                graph_service = RequirementEvidenceGraphService(db)
+                updated_count = graph_service.recompute_snapshot_for_pr(
+                    repository_id=str(repository_id),
+                    pull_request_id=str(pull_request_id)
+                )
+                if updated_count > 0:
+                    logger.info(f"Recomputed {updated_count} recommendation run snapshots after coverage ingestion")
+            except Exception as e:
+                logger.warning(f"Failed to recompute snapshots after coverage ingestion: {e}")
 
         return report

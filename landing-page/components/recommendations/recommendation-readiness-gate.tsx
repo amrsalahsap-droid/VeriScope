@@ -25,8 +25,9 @@ import {
   Plus,
   Loader2
 } from "lucide-react";
-import PasteAcceptanceCriteriaModal from "./paste-acceptance-criteria-modal";
+import BusinessRequirementsModal from "@/components/requirements/business-requirements-modal";
 import { resolveRecommendationAction, getReadinessSummary, getOptionalGapLabel } from "@/lib/readiness-cta-resolver";
+import { buildInputReadinessViewModel, type RawInputReadinessV2Response } from "@/lib/readiness/inputReadinessAdapter";
 
 interface AvailableInputSignal {
   key: string;
@@ -80,6 +81,8 @@ interface RecommendationReadinessGateProps {
   action: "generate" | "rerun" | "view";
   recommendationRunId?: string;
   generationStatus?: "idle" | "generating" | "redirecting" | "failed";
+  runRepositoryIntelligence?: () => Promise<void>;
+  refreshState?: "idle" | "running" | "success" | "partial" | "failed";
 }
 
 // Map signal keys to display metadata
@@ -144,7 +147,7 @@ interface MissingInputAction {
 const MISSING_INPUT_ACTION_MAP: Record<string, MissingInputAction> = {
   // User Inputs Needed
   acceptance_criteria: {
-    label: "Paste Acceptance Criteria",
+    label: "Manage Business Requirements",
     actionType: "PASTE_ACCEPTANCE_CRITERIA",
     enabled: true,
     icon: FileText,
@@ -437,6 +440,111 @@ const normalizePercent = (value: number | undefined | null): number => {
   return Math.min(Math.round(value), 100);
 };
 
+/**
+ * Map the canonical 12-input V2 response to the legacy ReadinessData shape used by this gate.
+ * This ensures the recommendation readiness gate uses the same backend source of truth as the rest of the UI.
+ */
+function mapV2ToReadinessData(v2: RawInputReadinessV2Response): ReadinessData {
+  const vm = buildInputReadinessViewModel(v2);
+  if (!vm) {
+    return {
+      readiness_level: "BLOCKED",
+      expected_confidence: "LOW",
+      readiness_score: 0,
+      can_generate: false,
+      available_inputs: [],
+      missing_inputs: [],
+      next_best_actions: [],
+      primary_message: "Readiness data unavailable.",
+      confidence_blockers: [],
+      confidence_limiters: [],
+    };
+  }
+
+  const severityByStatus = (status: string): "REQUIRED" | "RECOMMENDED" | "OPTIONAL" => {
+    if (status === "MISSING" || status === "BLOCKED" || status === "NEEDS_REVIEW") return "REQUIRED";
+    if (status === "STALE" || status === "PARTIAL") return "RECOMMENDED";
+    return "OPTIONAL";
+  };
+
+  const keyToSignalMap: Record<string, string> = {
+    INPUT_1: "pull_request_diff",
+    INPUT_2: "acceptance_criteria",
+    INPUT_3: "behavior_catalog",
+    INPUT_4: "junit_test_history",
+    INPUT_5: "ac_test_mapping",
+    INPUT_6: "current_pr_execution",
+    INPUT_7: "current_pr_coverage",
+    INPUT_8: "linked_work_item",
+    INPUT_9: "environment_matrix",
+    INPUT_10: "quality_gate_profile",
+    INPUT_11: "fragility_memory",
+    INPUT_12: "out_of_scope",
+  };
+
+  const availableInputs: AvailableInputSignal[] = vm.inputsList
+    .filter((i) => i.status === "READY")
+    .map((i) => ({
+      key: keyToSignalMap[i.input_id] || i.input_id.toLowerCase(),
+      label: i.label,
+      status: "READY",
+      source: "V2",
+      confidence_contribution: i.earned_score,
+      description: i.summary,
+      evidence_count: 1,
+      linked_to_current_pr: true,
+    }));
+
+  const missingInputs: MissingInputSignal[] = vm.inputsList
+    .filter((i) => i.status !== "READY")
+    .map((i) => ({
+      key: keyToSignalMap[i.input_id] || i.input_id.toLowerCase(),
+      label: i.label,
+      severity: i.is_hard_blocker ? "REQUIRED" : severityByStatus(i.status),
+      impact: i.summary,
+      estimated_confidence_gain: i.max_score - i.earned_score,
+      actions: i.actions.map((a) => a.label || a.action),
+    }));
+
+  const nextBestActions: RecommendedAction[] = vm.nextBestActions.map((a) => ({
+    action: a.action,
+    label: a.label,
+    priority: a.priority <= 2 ? "HIGH" : a.priority <= 4 ? "MEDIUM" : "LOW",
+    estimated_confidence_gain: 0,
+  }));
+
+  const confidenceMap: Record<string, string> = {
+    LOW: "LOW",
+    MEDIUM: "MEDIUM",
+    HIGH: "HIGH",
+  };
+
+  const readinessLevelMap: Record<string, string> = {
+    BLOCKED: "BLOCKED",
+    DRAFT_ONLY: "MINIMUM_READY",
+    MINIMUM_READY: "MINIMUM_READY",
+    CONFIDENT_READY: "HIGH_CONFIDENCE_READY",
+    HIGH_CONFIDENCE_READY: "HIGH_CONFIDENCE_READY",
+  };
+
+  return {
+    readiness_level: readinessLevelMap[vm.generationStatus] || vm.generationStatus,
+    expected_confidence: confidenceMap[vm.confidenceLevel] || "LOW",
+    readiness_score: vm.confidenceScore / 100,
+    can_generate: vm.canGenerate === true || vm.canGenerate === "DRAFT_ONLY",
+    available_inputs: availableInputs,
+    missing_inputs: missingInputs,
+    next_best_actions: nextBestActions,
+    intelligence_completeness_score: normalizePercent(vm.evidenceCompleteness),
+    release_confidence: vm.releaseConfidence,
+    release_confidence_ceiling: vm.confidenceCeiling,
+    primary_message: v2.primary_message || "",
+    secondary_message: undefined,
+    confidence_blockers: vm.hardBlockers.map((b) => keyToSignalMap[b.input_id] || b.input_id),
+    confidence_limiters: vm.missingConfidenceBoosters.map((w) => w.message),
+  };
+}
+
 export default function RecommendationReadinessGate({
   isOpen,
   onClose,
@@ -445,7 +553,9 @@ export default function RecommendationReadinessGate({
   pullRequestId,
   action,
   recommendationRunId,
-  generationStatus = "idle"
+  generationStatus = "idle",
+  runRepositoryIntelligence,
+  refreshState = "idle"
 }: RecommendationReadinessGateProps) {
   const router = useRouter();
   const [readinessData, setReadinessData] = useState<ReadinessData | null>(null);
@@ -458,13 +568,47 @@ export default function RecommendationReadinessGate({
   const [isAvailableInputsCollapsed, setIsAvailableInputsCollapsed] = useState(true);
   const [isOptionalLearningCollapsed, setIsOptionalLearningCollapsed] = useState(true);
 
+  // Local refresh state for modal-specific progress display
+  const [localRefreshRunning, setLocalRefreshRunning] = useState(false);
+  const [localRefreshStartedAt, setLocalRefreshStartedAt] = useState<Date | null>(null);
+  const [localRefreshElapsed, setLocalRefreshElapsed] = useState(0);
+
+  // Elapsed timer for local refresh
+  useEffect(() => {
+    if (!localRefreshRunning || !localRefreshStartedAt) return;
+
+    const interval = setInterval(() => {
+      setLocalRefreshElapsed(Math.floor((Date.now() - localRefreshStartedAt.getTime()) / 1000));
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [localRefreshRunning, localRefreshStartedAt]);
+
+  const formatElapsed = (seconds: number): string => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const getRefreshProgressMessage = (): string => {
+    if (localRefreshElapsed < 30) {
+      return "Repository intelligence is running. This can take up to 2 minutes.";
+    } else if (localRefreshElapsed < 90) {
+      return "Still working… Large repositories can take 1–2 minutes. Do not close this page.";
+    } else {
+      return "Almost there… Finalizing behavior mappings and readiness.";
+    }
+  };
+
   const fetchReadinessData = useCallback(async () => {
     try {
       setLoading(true);
       setReadinessError(null);
       
+      // Use the canonical 12-input V2 readiness endpoint as the single source of truth for PRs.
+      // Repository-level readiness does not have a V2 endpoint yet, so keep the legacy fallback.
       const url = pullRequestId 
-        ? `/api/repositories/${repositoryId}/pull-requests/${pullRequestId}/readiness`
+        ? `/api/repositories/${repositoryId}/pull-requests/${pullRequestId}/readiness/v2`
         : `/api/repositories/${repositoryId}/readiness`;
       
       const response = await fetch(url);
@@ -477,7 +621,11 @@ export default function RecommendationReadinessGate({
       }
       
       const data = await response.json();
-      setReadinessData(data);
+      if (pullRequestId) {
+        setReadinessData(mapV2ToReadinessData(data as RawInputReadinessV2Response));
+      } else {
+        setReadinessData(data as ReadinessData);
+      }
     } catch (err) {
       console.error('[ReadinessGate] Error fetching readiness:', err);
       setReadinessError(err instanceof Error ? err.message : "Failed to load readiness data");
@@ -526,12 +674,16 @@ export default function RecommendationReadinessGate({
       onContinue();
       onClose();
     } else {
-      // For "generate" action, let the parent handle the modal close after generation completes
-      onContinue();
+      // For "generate" action, pass the generation mode to the parent
+      const generationMode = ctaAction?.generationMode || "confident";
+      onContinue(generationMode);
     }
   };
 
-  const handleActionButtonClick = async (key: string) => {
+  const handleActionButtonClick = async (key: string, event?: React.MouseEvent) => {
+    event?.preventDefault();
+    event?.stopPropagation();
+
     const action = getMissingInputAction(key);
 
     if (!action.enabled) {
@@ -539,6 +691,12 @@ export default function RecommendationReadinessGate({
       return;
     }
 
+    if (localRefreshRunning) {
+      console.log("[RI_REFRESH] ignored duplicate click");
+      return;
+    }
+
+    console.log("[RI_REFRESH] clicked", key, action.actionType);
     setActionInProgress(key);
 
     switch (action.actionType) {
@@ -610,38 +768,67 @@ export default function RecommendationReadinessGate({
         setActionInProgress(null);
         break;
       case "RUN_REPOSITORY_INTELLIGENCE":
-        try {
-          setRefreshError(null);
-          setRefreshErrorCode(null);
-          const response = await fetch(`/api/repositories/${repositoryId}/intelligence/refresh`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              include_architecture: true,
-              include_behaviors: true,
-              include_journeys: true,
-            }),
-          });
-
-          if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            console.error("Failed to refresh repository intelligence:", errorData.error || response.statusText);
-            setRefreshError(errorData.error || response.statusText || "Failed to refresh repository intelligence.");
-            setRefreshErrorCode(errorData.error_code || null);
-          } else {
+        console.log("[RI_REFRESH] setting loading true");
+        if (runRepositoryIntelligence) {
+          try {
+            setLocalRefreshRunning(true);
+            setLocalRefreshStartedAt(new Date());
+            setLocalRefreshElapsed(0);
             setRefreshError(null);
             setRefreshErrorCode(null);
+            console.log("[RI_REFRESH] loading state requested");
+            await new Promise((resolve) => requestAnimationFrame(() => resolve(void 0)));
+            console.log("[RI_REFRESH] after first paint, starting fetch");
+            await runRepositoryIntelligence();
             // Refresh readiness data after successful intelligence refresh
             await fetchReadinessData();
+          } catch (err) {
+            console.error("Error refreshing repository intelligence:", err);
+            setRefreshError(err instanceof Error ? err.message : "Failed to refresh repository intelligence. Please try again.");
+            setRefreshErrorCode(null);
+          } finally {
+            setLocalRefreshRunning(false);
+            setActionInProgress(null);
           }
-        } catch (err) {
-          console.error("Error refreshing repository intelligence:", err);
-          setRefreshError(err instanceof Error ? err.message : "Failed to refresh repository intelligence. Please try again.");
-          setRefreshErrorCode(null);
-        } finally {
-          setActionInProgress(null);
+        } else {
+          // Fallback to direct API call if parent function not provided
+          try {
+            setLocalRefreshRunning(true);
+            setLocalRefreshStartedAt(new Date());
+            setLocalRefreshElapsed(0);
+            setRefreshError(null);
+            setRefreshErrorCode(null);
+            const response = await fetch(`/api/repositories/${repositoryId}/intelligence/refresh`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                include_architecture: true,
+                include_behaviors: true,
+                include_journeys: true,
+              }),
+            });
+
+            if (!response.ok) {
+              const errorData = await response.json().catch(() => ({}));
+              console.error("Failed to refresh repository intelligence:", errorData.error || response.statusText);
+              setRefreshError(errorData.error || response.statusText || "Failed to refresh repository intelligence.");
+              setRefreshErrorCode(errorData.error_code || null);
+            } else {
+              setRefreshError(null);
+              setRefreshErrorCode(null);
+              // Refresh readiness data after successful intelligence refresh
+              await fetchReadinessData();
+            }
+          } catch (err) {
+            console.error("Error refreshing repository intelligence:", err);
+            setRefreshError(err instanceof Error ? err.message : "Failed to refresh repository intelligence. Please try again.");
+            setRefreshErrorCode(null);
+          } finally {
+            setLocalRefreshRunning(false);
+            setActionInProgress(null);
+          }
         }
         break;
       case "SKIP_OPTIONAL":
@@ -733,8 +920,16 @@ export default function RecommendationReadinessGate({
     }
   };
 
-  const getReadinessBadge = (level: string) => {
+  const getReadinessBadge = (level: string, prPackageStatus?: string) => {
     const formatted = level?.replace(/_/g, " ");
+    
+    // Part 8: Do not show High Confidence Ready if PR package is blocked or stale
+    if (level?.toUpperCase() === "HIGH_CONFIDENCE_READY") {
+      if (prPackageStatus === "BLOCKED" || prPackageStatus === "OUTDATED") {
+        return <span className="px-2.5 py-1 text-xs font-semibold rounded-full border border-rose-500/30 bg-rose-950/20 text-rose-400">PR Package Blocked</span>;
+      }
+    }
+    
     switch (level?.toUpperCase()) {
       case "HIGH_CONFIDENCE_READY":
         return <span className="px-2.5 py-1 text-xs font-semibold rounded-full border border-emerald-500/30 bg-emerald-950/20 text-emerald-400">High Confidence Ready</span>;
@@ -836,6 +1031,22 @@ export default function RecommendationReadinessGate({
                       <p className="text-zinc-300 text-sm leading-relaxed">
                         Veriscope can {action === "view" ? "show" : "generate"} this recommendation with{' '}
                         <span className="font-semibold text-white">{readinessData.expected_confidence.toLowerCase()}</span> confidence based on current evidence.
+                      {readinessData.release_confidence && (
+                        <>
+                          <br />
+                          <span className="text-zinc-300">
+                            Release Confidence: <span className="font-semibold">{readinessData.release_confidence.toLowerCase()}</span>
+                          </span>
+                        </>
+                      )}
+                      {readinessData.confidence_ceiling && (
+                        <>
+                          <br />
+                          <span className="text-zinc-300">
+                            Confidence Ceiling: <span className="font-semibold">{readinessData.confidence_ceiling.toLowerCase()}</span>
+                          </span>
+                        </>
+                      )}
                       </p>
                       {(() => {
                         // Determine the second line based on state
@@ -903,6 +1114,7 @@ export default function RecommendationReadinessGate({
                         </Button>
                       </motion.div>
                     )}
+
 
                     {/* Recommended Next Action Card */}
                     {ctaAction && ctaAction.actionType === "generate" && (
@@ -1120,21 +1332,34 @@ export default function RecommendationReadinessGate({
                                 </div>
                                 <div className="shrink-0 self-start md:self-center">
                                   <Button 
+                                    type="button"
                                     variant="outline" 
                                     size="sm"
-                                    onClick={() => handleActionButtonClick("architecture_graph")}
-                                    disabled={actionInProgress === "architecture_graph"}
+                                    onClick={(e) => handleActionButtonClick("architecture_graph", e)}
+                                    disabled={actionInProgress === "architecture_graph" || localRefreshRunning}
                                     className="border-zinc-700 hover:border-zinc-600 bg-zinc-900/60 hover:bg-zinc-800 text-zinc-300 hover:text-white rounded-lg text-xs"
                                   >
-                                    {actionInProgress === "architecture_graph" ? (
+                                    {actionInProgress === "architecture_graph" || localRefreshRunning ? (
                                       <span className="flex items-center gap-1.5">
                                         <Loader2 className="w-3 h-3 animate-spin" />
-                                        Processing...
+                                        Refreshing…
                                       </span>
                                     ) : (
                                       "Run Repository Intelligence"
                                     )}
                                   </Button>
+                                  {localRefreshRunning && (
+                                    <div data-testid="ri-refresh-loading" className="rounded-md border border-zinc-700 bg-zinc-900/60 p-3 mt-3 text-xs text-zinc-200">
+                                      <div className="font-medium">Refreshing Product Behavior Map…</div>
+                                      <div className="text-zinc-400 mt-1">Elapsed: {formatElapsed(localRefreshElapsed)}</div>
+                                      <div className="text-zinc-400 mt-1">Repository intelligence is running. This can take up to 2 minutes.</div>
+                                    </div>
+                                  )}
+                                  {localRefreshRunning && (
+                                    <div style={{ position: "fixed", top: 16, right: 16, zIndex: 99999, background: "yellow", padding: 12, color: "black" }}>
+                                      RI REFRESH RUNNING {formatElapsed(localRefreshElapsed)}
+                                    </div>
+                                  )}
                                 </div>
                               </motion.div>
                             ) : (
@@ -1408,8 +1633,8 @@ export default function RecommendationReadinessGate({
             </motion.div>
           </div>
 
-          {/* Submodal for Acceptance Criteria Submission */}
-          <PasteAcceptanceCriteriaModal
+          {/* Submodal for Business Requirements & Acceptance Criteria */}
+          <BusinessRequirementsModal
             isOpen={isFormOpen}
             onClose={() => setIsFormOpen(false)}
             onSuccess={handleActionSuccess}

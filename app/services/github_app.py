@@ -785,6 +785,12 @@ class GitHubAppService:
             )
             logger.info(f"Enqueued Pull Request sync job {job.id} to RQ.")
         except Exception as e:
+            if settings.APP_ENV == "production":
+                logger.error(f"Failed to enqueue PR sync job to RQ: {e}. Inline fallback is disabled in production.")
+                job.status = "FAILED"
+                job.completed_at = datetime.utcnow()
+                self.db.commit()
+                raise GitHubServiceUnavailableError(f"Background worker queue unavailable: {e}")
             logger.warning(f"Failed to enqueue PR sync job to RQ: {e}. Running inline fallback.")
             try:
                 self.execute_pull_request_sync_job(pr.id, installation_id, job.id)
@@ -891,6 +897,7 @@ class GitHubAppService:
         except Exception as e:
             logger.error(f"PR Sync Phase A (External REST collection) failed: {e}")
             job.status = "FAILED"
+            job.files_fetch_status = "FAILED"
             job.error_message = f"Phase A failure: {e}"
             job.completed_at = datetime.utcnow()
             pr.active_sync_job_id = None
@@ -1123,6 +1130,8 @@ class GitHubAppService:
 
             # Update job state
             job.status = "COMPLETED"
+            job.files_fetch_status = "SUCCESS"
+            job.commits_fetch_status = "SUCCESS"
             job.integrity_status = "FULL_SUCCESS"
             job.evidence_health_status = pr.evidence_health_status
             job.evidence_consistency_status = pr.evidence_consistency_status

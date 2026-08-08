@@ -24,6 +24,7 @@ async def upload_junit_xml(
     pull_request_id: Optional[uuid.UUID] = Form(None),
     parent_test_run_id: Optional[uuid.UUID] = Form(None),
     ingestion_reason: str = Form("ORIGINAL_UPLOAD"),
+    import_mode: Optional[str] = Form("BOTH"),
     x_correlation_id: Optional[str] = Header(None),
     x_source_correlation_id: Optional[str] = Header(None),
     request_origin: Optional[str] = Header(None),
@@ -32,8 +33,35 @@ async def upload_junit_xml(
 ):
     """
     Ingests, validates, and stores a JUnit XML test execution report.
+    
+    import_mode options:
+    - INVENTORY_ONLY: Updates TestCase inventory only, no TestRun/TestResult records
+    - CURRENT_PR_EXECUTION_RESULTS: Creates TestRun/TestResult records only (requires pull_request_id and commit_sha)
+    - BOTH: Updates inventory and creates execution records (default)
+    
     Returns the ingested TestRun metadata or short-circuits if duplicate coalesced.
     """
+    # Validate import_mode
+    valid_modes = ["INVENTORY_ONLY", "CURRENT_PR_EXECUTION_RESULTS", "BOTH"]
+    if import_mode not in valid_modes:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"detail": f"Invalid import_mode '{import_mode}'. Must be one of: {', '.join(valid_modes)}"}
+        )
+    
+    # Validate requirements for CURRENT_PR_EXECUTION_RESULTS or BOTH
+    if import_mode in ["CURRENT_PR_EXECUTION_RESULTS", "BOTH"]:
+        if not pull_request_id:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"detail": "pull_request_id is required for CURRENT_PR_EXECUTION_RESULTS or BOTH import modes"}
+            )
+        if not commit_sha:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"detail": "commit_sha is required for CURRENT_PR_EXECUTION_RESULTS or BOTH import modes"}
+            )
+
     # Fast pre-reading size check if size is populated in UploadFile
     max_bytes = settings.MAX_JUNIT_XML_SIZE_MB * 1024 * 1024
     if file.size and file.size > max_bytes:
@@ -66,7 +94,8 @@ async def upload_junit_xml(
             correlation_id=x_correlation_id,
             source_correlation_id=x_source_correlation_id,
             request_origin=request_origin,
-            evidence_source=evidence_source or EvidenceSource.MANUAL_UPLOAD.value
+            evidence_source=evidence_source or EvidenceSource.MANUAL_UPLOAD.value,
+            import_mode=import_mode
         )
     except OversizedXMLException as e:
         return JSONResponse(
@@ -84,7 +113,31 @@ async def upload_junit_xml(
             detail=f"Ingestion pipeline failure: {str(e)}"
         )
 
+    # Generate Import Quality Report
+    from app.services.test_import_report_service import TestImportQualityReportService
+    import_id_str = str(test_run.id) if test_run else str(uuid.uuid4())
+    import_report = TestImportQualityReportService.generate_and_persist_report(
+        db=db,
+        import_id=import_id_str,
+        repository_id=repository_id,
+        pull_request_id=pull_request_id,
+        test_run=test_run
+    )
+
+    # Handle INVENTORY_ONLY mode response
+    if import_mode == "INVENTORY_ONLY":
+        return {
+            "import_mode": "INVENTORY_ONLY",
+            "test_run_id": None,
+            "status": "INVENTORY_UPDATED",
+            "message": "Test case inventory updated successfully",
+            "duplicate_coalesced": duplicate_coalesced,
+            "correlation_id": correlation_id,
+            "import_quality_report": import_report
+        }
+
     return {
+        "import_mode": import_mode,
         "test_run_id": str(test_run.id),
         "status": test_run.status,
         "evidence_health_status": test_run.evidence_health_status,
@@ -96,8 +149,50 @@ async def upload_junit_xml(
         "skipped_tests": test_run.skipped_tests,
         "duration": test_run.duration,
         "duplicate_coalesced": duplicate_coalesced,
-        "correlation_id": test_run.correlation_id
+        "correlation_id": test_run.correlation_id,
+        "import_quality_report": import_report
     }
+
+
+@router.get("/import-report/latest")
+def get_latest_import_report(
+    repository_id: uuid.UUID = Query(...),
+    pull_request_id: Optional[uuid.UUID] = Query(None),
+    db: Session = Depends(get_db)
+):
+    """Retrieves the latest persisted Test Results Import Quality Report for a repository / PR."""
+    report = TestImportQualityReportService.get_latest_report(db, repository_id=repository_id, pull_request_id=pull_request_id)
+    if not report:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No import quality report found.")
+    return report
+
+
+@router.get("/import-report/{import_id}")
+def get_import_report_by_id(
+    import_id: str,
+    db: Session = Depends(get_db)
+):
+    """Retrieves a persisted Test Results Import Quality Report by import_id / test_run_id."""
+    report = TestImportQualityReportService.get_report_by_import_id(db, import_id=import_id)
+    if not report:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Import quality report not found for import_id '{import_id}'.")
+    return report
+
+
+@router.get("/import-report/{import_id}/diagnostics")
+def download_import_diagnostics(
+    import_id: str,
+    db: Session = Depends(get_db)
+):
+    """Downloads full import diagnostics JSON for a specific import_id."""
+    report = TestImportQualityReportService.get_report_by_import_id(db, import_id=import_id)
+    if not report:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Import quality report not found for import_id '{import_id}'.")
+    
+    headers = {
+        "Content-Disposition": f'attachment; filename="import_diagnostics_{import_id}.json"'
+    }
+    return JSONResponse(content=report, headers=headers)
 
 
 @internal_router.get("/{id}/debug", response_model=TestRunDebugResponse)

@@ -378,7 +378,11 @@ export function generateVerdictReason(
     const notMapped = summarySource?.counts?.notMappedTraceabilityRisks || 0;
     // Use the visible required items count (from regression scope) for the reason
     const requiredCount = missing; // This aligns with the visible required items count
-    reasons.push(`${verified} tests passed. ${requiredCount} critical requirements still lack automated coverage and require review or execution.`);
+    if (verified > 0) {
+      reasons.push(`${verified} requirements already verified with passing evidence. ${requiredCount} require action before release.`);
+    } else {
+      reasons.push(`${requiredCount} critical requirements still lack automated coverage and require review or execution.`);
+    }
   } else if (verdict === "READY_WITH_RISK") {
     reasons.push(`Core functionality covered by ${recommendedTests.length} tests, but ${missingScenarios.length} scenarios need attention.`);
   } else if (verdict === "NOT_READY") {

@@ -12,6 +12,8 @@ interface RecommendationCheckpointModalProps {
   action: "generate" | "rerun" | "view";
   recommendationRunId?: string;
   generationStatus?: "idle" | "generating" | "redirecting" | "failed";
+  runRepositoryIntelligence?: () => Promise<void>;
+  refreshState?: "idle" | "running" | "success" | "partial" | "failed";
 }
 
 export default function RecommendationCheckpointModal(props: RecommendationCheckpointModalProps) {

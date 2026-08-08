@@ -171,97 +171,128 @@ class BehaviorPatternLibrary:
             "skipped": 0,
         }
         
-        # Authentication pattern
-        if not self.get_pattern("Authentication"):
+        # Deactivate old generic patterns if they exist
+        from app.models.behavior_pattern import BehaviorPattern
+        for old_name in ["Authentication", "Password Reset", "User Registration", "Billing", "Notifications", "User Management"]:
+            old_p = self.db.query(BehaviorPattern).filter(
+                BehaviorPattern.name == old_name,
+                BehaviorPattern.is_active == 1
+            ).first()
+            if old_p:
+                old_p.is_active = 0
+        self.db.commit()
+
+        # 1. Sign-up password validation
+        if not self.get_pattern("Sign-up password validation"):
             self.create_pattern(
-                name="Authentication",
-                aliases=["auth", "login", "logout", "token", "session", "jwt", "password", "signin", "log-in"],
+                name="Sign-up password validation",
+                aliases=["sign-up-password-validation", "signup-password-validation", "sign-up-password", "signup-password"],
                 journey="Authentication",
-                risk_level="CRITICAL",
-                description="User authentication and session management",
+                risk_level="HIGH",
+                description="Validating password strength and rules during user sign-up",
                 default_scenarios=[
-                    {"title": "Successful login with valid credentials", "priority": "BLOCKER", "type": "POSITIVE"},
-                    {"title": "Login with invalid credentials", "priority": "MUST", "type": "NEGATIVE"},
-                    {"title": "Session timeout", "priority": "MUST", "type": "EDGE"},
-                    {"title": "JWT token expiration", "priority": "MUST", "type": "EDGE"},
-                    {"title": "Password change", "priority": "SHOULD", "type": "POSITIVE"},
+                    {"title": "Validate sign-up password complexity rules", "priority": "MUST", "type": "SECURITY"},
+                    {"title": "Successful sign-up with strong password", "priority": "BLOCKER", "type": "POSITIVE"},
                 ],
             )
             stats["created"] += 1
         else:
             stats["skipped"] += 1
-        
-        # Password Reset pattern
-        if not self.get_pattern("Password Reset"):
+
+        # 2. Reset-password behavior
+        if not self.get_pattern("Reset-password behavior"):
             self.create_pattern(
-                name="Password Reset",
-                aliases=["reset-password", "forgot-password", "password-reset", "recovery", "recover-password"],
+                name="Reset-password behavior",
+                aliases=["reset-password-behavior", "reset-password", "forgot-password", "recover-password", "reset_password"],
                 journey="Authentication",
                 risk_level="HIGH",
-                description="Password recovery and reset functionality",
+                description="User password reset and token recovery flows",
                 default_scenarios=[
+                    {"title": "Validate password reset expired token rejection", "priority": "MUST", "type": "NEGATIVE"},
                     {"title": "Request password reset with valid email", "priority": "BLOCKER", "type": "POSITIVE"},
-                    {"title": "Reset with invalid token", "priority": "MUST", "type": "NEGATIVE"},
-                    {"title": "Reset with expired token", "priority": "MUST", "type": "EDGE"},
-                    {"title": "Rate limiting on reset requests", "priority": "SHOULD", "type": "SECURITY"},
                 ],
             )
             stats["created"] += 1
         else:
             stats["skipped"] += 1
-        
-        # Registration pattern
-        if not self.get_pattern("User Registration"):
+
+        # 3. Update-password behavior
+        if not self.get_pattern("Update-password behavior"):
             self.create_pattern(
-                name="User Registration",
-                aliases=["signup", "sign-up", "register", "registration", "create-account", "join"],
+                name="Update-password behavior",
+                aliases=["update-password-behavior", "update-password", "change-password", "update_password"],
                 journey="Authentication",
                 risk_level="HIGH",
-                description="New user account creation and onboarding",
+                description="Updating user password when logged in",
                 default_scenarios=[
-                    {"title": "Successful registration with valid data", "priority": "BLOCKER", "type": "POSITIVE"},
-                    {"title": "Registration with duplicate email", "priority": "MUST", "type": "NEGATIVE"},
-                    {"title": "Email verification flow", "priority": "MUST", "type": "POSITIVE"},
-                    {"title": "Password strength validation", "priority": "SHOULD", "type": "SECURITY"},
+                    {"title": "Update password with correct current password", "priority": "MUST", "type": "POSITIVE"},
+                    {"title": "Update password with weak new password", "priority": "MUST", "type": "NEGATIVE"},
                 ],
             )
             stats["created"] += 1
         else:
             stats["skipped"] += 1
-        
-        # Billing pattern
-        if not self.get_pattern("Billing"):
+
+        # 4. Login after password change
+        if not self.get_pattern("Login after password change"):
             self.create_pattern(
-                name="Billing",
-                aliases=["billing", "subscription", "invoice", "payment", "plan", "pricing", "checkout"],
-                journey="Billing",
+                name="Login after password change",
+                aliases=["login-after-password-change", "login-after-change", "login-post-change"],
+                journey="Authentication",
                 risk_level="HIGH",
-                description="Billing, subscription, and payment management",
+                description="Validating user login using newly changed or reset password",
                 default_scenarios=[
-                    {"title": "Successful payment processing", "priority": "BLOCKER", "type": "POSITIVE"},
-                    {"title": "Payment failure handling", "priority": "MUST", "type": "NEGATIVE"},
-                    {"title": "Subscription upgrade/downgrade", "priority": "MUST", "type": "POSITIVE"},
-                    {"title": "Invoice generation", "priority": "SHOULD", "type": "POSITIVE"},
-                    {"title": "Refund processing", "priority": "SHOULD", "type": "POSITIVE"},
+                    {"title": "Successful login after password change", "priority": "MUST", "type": "POSITIVE"},
+                    {"title": "Failed login using old password", "priority": "MUST", "type": "NEGATIVE"},
                 ],
             )
             stats["created"] += 1
         else:
             stats["skipped"] += 1
-        
-        # Notifications pattern
-        if not self.get_pattern("Notifications"):
+
+        # 5. Shared password policy validation
+        if not self.get_pattern("Shared password policy validation"):
             self.create_pattern(
-                name="Notifications",
-                aliases=["notification", "email", "sms", "message", "alert", "push"],
-                journey="Notifications",
-                risk_level="LOW",
-                description="User notifications and messaging",
+                name="Shared password policy validation",
+                aliases=["shared-password-policy-validation", "shared-password-policy", "password-policy", "password-validation-rules", "shared_password_policy"],
+                journey="Authentication",
+                risk_level="HIGH",
+                description="Applying unified system-wide password strength policy checks",
                 default_scenarios=[
-                    {"title": "Email notification delivery", "priority": "MUST", "type": "POSITIVE"},
-                    {"title": "SMS notification delivery", "priority": "SHOULD", "type": "POSITIVE"},
-                    {"title": "Push notification delivery", "priority": "SHOULD", "type": "POSITIVE"},
-                    {"title": "Notification preferences", "priority": "OPTIONAL", "type": "POSITIVE"},
+                    {"title": "Validate minimum length constraint", "priority": "MUST", "type": "SECURITY"},
+                    {"title": "Validate character class constraints", "priority": "MUST", "type": "SECURITY"},
+                ],
+            )
+            stats["created"] += 1
+        else:
+            stats["skipped"] += 1
+
+        # 6. UI/API validation consistency
+        if not self.get_pattern("UI/API validation consistency"):
+            self.create_pattern(
+                name="UI/API validation consistency",
+                aliases=["ui-api-validation-consistency", "ui-api-consistency", "validation-consistency"],
+                journey="Authentication",
+                risk_level="MEDIUM",
+                description="Ensuring client UI and backend API validate passwords identically",
+                default_scenarios=[
+                    {"title": "UI validation matches API schema validation", "priority": "MUST", "type": "EDGE"},
+                ],
+            )
+            stats["created"] += 1
+        else:
+            stats["skipped"] += 1
+
+        # 7. Account security validation
+        if not self.get_pattern("Account security validation"):
+            self.create_pattern(
+                name="Account security validation",
+                aliases=["account-security-validation", "account-security", "security-validation"],
+                journey="Authentication",
+                risk_level="HIGH",
+                description="Validating account lockout and security controls on authentication endpoints",
+                default_scenarios=[
+                    {"title": "Account lock after maximum consecutive login failures", "priority": "MUST", "type": "SECURITY"},
                 ],
             )
             stats["created"] += 1

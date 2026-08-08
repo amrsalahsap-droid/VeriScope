@@ -199,6 +199,42 @@ export const ScopeGroupDisplay: React.FC<ScopeGroupDisplayProps> = ({
                           </span>
                         )}
 
+                        {/* Execution Status */}
+                        {item.execution_status && (
+                          <span className={`text-[9px] font-medium px-1.5 py-0.2 rounded border ${
+                            item.execution_status === 'PASSED' ? 'bg-green-500/10 text-green-400 border-green-500/20' :
+                            item.execution_status === 'FAILED' ? 'bg-red-500/10 text-red-400 border-red-500/20' :
+                            item.execution_status === 'SKIPPED' ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' :
+                            'bg-zinc-500/10 text-zinc-400 border-zinc-500/20'
+                          }`}>
+                            Exec: {item.execution_status}
+                          </span>
+                        )}
+
+                        {/* Freshness Status */}
+                        {item.freshness_status && (
+                          <span className={`text-[9px] font-medium px-1.5 py-0.2 rounded border ${
+                            item.freshness_status === 'FRESH' ? 'bg-green-500/10 text-green-400 border-green-500/20' :
+                            item.freshness_status === 'STALE' ? 'bg-orange-500/10 text-orange-400 border-orange-500/20' :
+                            'bg-zinc-500/10 text-zinc-400 border-zinc-500/20'
+                          }`}>
+                            {item.freshness_status}
+                          </span>
+                        )}
+
+                        {/* Release Action */}
+                        {item.release_action && item.release_action !== 'NONE' && (
+                          <span className={`text-[9px] font-medium px-1.5 py-0.2 rounded border ${
+                            item.release_action === 'RE_RUN' ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' :
+                            item.release_action === 'FIX_OR_RERUN' ? 'bg-red-500/10 text-red-400 border-red-500/20' :
+                            item.release_action === 'RUN_OR_CREATE_TEST' ? 'bg-blue-500/10 text-blue-400 border-blue-500/20' :
+                            item.release_action === 'MANUAL_REVIEW' ? 'bg-purple-500/10 text-purple-400 border-purple-500/20' :
+                            'bg-zinc-500/10 text-zinc-400 border-zinc-500/20'
+                          }`}>
+                            {item.release_action.replace('_', ' ')}
+                          </span>
+                        )}
+
                         {/* Governance status or overridden badge */}
                         {isOverridden && (
                           <span className="text-[9px] font-medium px-1.5 py-0.2 rounded border border-purple-500/20 bg-purple-950/20 text-purple-400">
@@ -250,22 +286,67 @@ export const ScopeGroupDisplay: React.FC<ScopeGroupDisplayProps> = ({
                       </div>
                     )}
 
-                    {/* Meta Details Grid */}
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs mb-3">
-                      {item.suggested_action && (
-                        <div className="space-y-1">
-                          <span className="text-[10px] text-zinc-550 uppercase tracking-wider block font-semibold">Suggested Action</span>
-                          <p className="text-zinc-300 font-sans leading-snug">{item.suggested_action}</p>
+                    {/* Safe to Skip Evidence - expandable section */}
+                    {group === ScopeGroup.SAFE_TO_SKIP && item.skip_evidence && (
+                      <div className="mt-3">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const expandedState = document.getElementById(`skip-evidence-${item.id}`)?.classList.toggle('hidden');
+                          }}
+                          className="flex items-center gap-2 text-[10px] font-semibold text-zinc-400 hover:text-zinc-200 transition-colors"
+                        >
+                          <ChevronDown className="w-3 h-3" />
+                          WHY SAFE TO SKIP
+                        </button>
+                        <div id={`skip-evidence-${item.id}`} className="hidden mt-2 p-3 bg-zinc-900/30 border border-zinc-800/60 rounded-lg space-y-2">
+                          <div className="flex items-center justify-between">
+                            <span className="text-[10px] font-semibold text-zinc-400">SKIP CONFIDENCE</span>
+                            <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${
+                              item.skip_evidence.skip_confidence_pct >= 90 ? 'bg-green-500/10 text-green-400 border border-green-500/20' :
+                              item.skip_evidence.skip_confidence_pct >= 70 ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' :
+                              'bg-amber-500/10 text-amber-400 border border-amber-500/20'
+                            }`}>
+                              {item.skip_evidence.skip_confidence_pct}%
+                            </span>
+                          </div>
+                          <div className="space-y-1">
+                            {item.skip_evidence.skip_confidence_factors.map((factor, idx) => (
+                              <div key={idx} className="flex items-start gap-2 text-[10px] text-zinc-300">
+                                <CheckCircle className="w-3 h-3 text-green-400 shrink-0 mt-0.5" />
+                                <span>{factor}</span>
+                              </div>
+                            ))}
+                          </div>
+                          {item.skip_evidence.covered_files.length > 0 && (
+                            <div className="space-y-1">
+                              <span className="text-[10px] text-zinc-550 uppercase tracking-wider block font-semibold">Covered Files</span>
+                              {item.skip_evidence.covered_files.slice(0, 3).map((file, idx) => (
+                                <div key={idx} className="text-[9px] text-zinc-400 font-mono truncate">{file}</div>
+                              ))}
+                              {item.skip_evidence.covered_files.length > 3 && (
+                                <div className="text-[9px] text-zinc-500">+{item.skip_evidence.covered_files.length - 3} more</div>
+                              )}
+                            </div>
+                          )}
+                          {item.skip_evidence.last_run_timestamp && (
+                            <div className="space-y-1">
+                              <span className="text-[10px] text-zinc-550 uppercase tracking-wider block font-semibold">Last Test Run</span>
+                              <div className="text-[9px] text-zinc-400">
+                                {new Date(item.skip_evidence.last_run_timestamp).toLocaleString()} on commit {item.skip_evidence.last_run_commit_sha?.substring(0, 8)}
+                              </div>
+                              <div className={`text-[9px] font-medium ${
+                                item.skip_evidence.last_run_status === 'PASSED' ? 'text-green-400' : 'text-amber-400'
+                              }`}>
+                                Result: {item.skip_evidence.last_run_status}
+                              </div>
+                            </div>
+                          )}
                         </div>
-                      )}
-                      {item.reason && (
-                        <div className="space-y-1">
-                          <span className="text-[10px] text-zinc-550 uppercase tracking-wider block font-semibold">Reason</span>
-                          <p className="text-zinc-400 font-sans leading-snug">{item.reason}</p>
-                        </div>
-                      )}
-                    </div>
+                      </div>
+                    )}
 
+                    {/* Meta Details Grid - continued for non-safe-to-skip */}
                     {/* References & Evidence */}
                     {(item.evidence_references?.length > 0 || item.test_references?.length > 0) && (
                       <div className="flex flex-col gap-2 mt-2 pt-2.5 border-t border-zinc-800/40">

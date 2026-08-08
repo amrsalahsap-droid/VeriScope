@@ -15,6 +15,18 @@ export interface ReadinessState {
     exists: boolean;
     input_stale: boolean;
   };
+  // Part 6: PR package readiness for Input 1
+  pr_package?: {
+    readiness_status: "READY" | "PARTIAL" | "BLOCKED" | "OUTDATED";
+    can_generate_confident_regression_plan?: boolean;
+    blockers?: string[];
+    warnings?: string[];
+    snapshot_is_stale?: boolean;
+  };
+  recommendation_audit?: {
+    status: "NO_RECOMMENDATION_YET" | "AUDITABLE" | "OUTDATED" | "LEGACY_NO_SNAPSHOT" | "UNKNOWN";
+    recommendation_run_id?: string;
+  };
 }
 
 export interface CTAAction {
@@ -27,6 +39,7 @@ export interface CTAAction {
   reason: string;
   showContinueAnyway: boolean;
   showReviewMissingInputs: boolean;
+  generationMode?: "draft" | "confident";
 }
 
 export function resolveRecommendationAction(state: ReadinessState): CTAAction {
@@ -38,12 +51,132 @@ export function resolveRecommendationAction(state: ReadinessState): CTAAction {
     blocking_inputs,
     missing_inputs,
     optional_inputs,
-    latest_recommendation
+    latest_recommendation,
+    pr_package
   } = state;
+
+  // Helper function to check Input 5 (AC/Test Mapping) status
+  const getInput5Status = () => {
+    const input5 = missing_inputs.find(input => input.key === 'INPUT_5');
+    return input5?.severity || 'READY';
+  };
+
+  const input5Status = getInput5Status();
+  const confirmedMappingsCount = state.pr_package?.confirmed_mappings_count || 0;
+
+  // Part 6: Check PR package readiness first (Input 1 guardrails)
+  if (pr_package?.readiness_status === "BLOCKED") {
+    const firstBlocker = pr_package.blockers?.[0] || "PR package incomplete";
+    return {
+      primaryLabel: "Sync PR Changes First",
+      secondaryLabel: undefined,
+      modalPrimaryLabel: "Sync PR Changes First",
+      modalSecondaryLabel: undefined,
+      actionType: "resolve",
+      tone: "warning",
+      reason: `PR package blocked: ${firstBlocker}. Changed files/head SHA are required for confident targeted regression.`,
+      showContinueAnyway: false,
+      showReviewMissingInputs: false
+    };
+  }
+
+  // Part 6: Check for stale PR package
+  if (pr_package?.snapshot_is_stale || state.recommendation_audit?.status === "OUTDATED") {
+    return {
+      primaryLabel: "Regenerate Recommendation",
+      secondaryLabel: "View Previous Recommendation",
+      modalPrimaryLabel: "Regenerate Recommendation",
+      modalSecondaryLabel: "View Previous Recommendation",
+      actionType: "regenerate",
+      tone: "caution",
+      reason: "PR has changed since this recommendation was generated",
+      showContinueAnyway: false,
+      showReviewMissingInputs: false
+    };
+  }
+
+  // Input 5 validation: If Input 5 is missing, no confident generation, draft only at most
+  if (input5Status === 'MISSING') {
+    return {
+      primaryLabel: "Generate Draft Recommendation",
+      secondaryLabel: "Add AC → Test Mappings",
+      modalPrimaryLabel: "Generate Draft Recommendation",
+      modalSecondaryLabel: "Add AC → Test Mappings",
+      actionType: "generate",
+      tone: "caution",
+      reason: "AC → Test mappings are missing. Only draft recommendation available.",
+      showContinueAnyway: false,
+      showReviewMissingInputs: false,
+      generationMode: "draft"
+    };
+  }
+
+  // Input 5 validation: If Input 5 is partial/review-needed, draft only with warning
+  if (input5Status === 'PARTIAL' || input5Status === 'REVIEW_NEEDED') {
+    return {
+      primaryLabel: "Generate Draft After Review",
+      secondaryLabel: "Review Mappings First",
+      modalPrimaryLabel: "Generate Draft After Review",
+      modalSecondaryLabel: "Review Mappings First",
+      actionType: "generate",
+      tone: "caution",
+      reason: "AC → Test mappings are not confirmed. Draft recommendation only.",
+      showContinueAnyway: false,
+      showReviewMissingInputs: false,
+      generationMode: "draft"
+    };
+  }
+
+  // Input 5 validation: If confirmed AC → Test mappings = 0, no confident generation
+  if (confirmedMappingsCount === 0 && input5Status !== 'MISSING') {
+    return {
+      primaryLabel: "Generate Draft Recommendation",
+      secondaryLabel: "Confirm AC → Test Mappings",
+      modalPrimaryLabel: "Generate Draft Recommendation",
+      modalSecondaryLabel: "Confirm AC → Test Mappings",
+      actionType: "generate",
+      tone: "caution",
+      reason: "No confirmed AC → Test mappings. Only draft recommendation available.",
+      showContinueAnyway: false,
+      showReviewMissingInputs: false,
+      generationMode: "draft"
+    };
+  }
+
+  // Part 6: PR package ready but other inputs missing (PARTIAL state)
+  if (pr_package?.readiness_status === "PARTIAL" && can_generate) {
+    return {
+      primaryLabel: "Generate Draft Recommendation",
+      secondaryLabel: "Improve Inputs",
+      modalPrimaryLabel: "Generate Draft Recommendation",
+      modalSecondaryLabel: "Improve Inputs",
+      actionType: "generate",
+      tone: "caution",
+      reason: "Draft available. Some evidence inputs are incomplete.",
+      showContinueAnyway: false,
+      showReviewMissingInputs: false,
+      generationMode: "draft"
+    };
+  }
 
   // Check for backend inconsistency
   if (expected_confidence === "HIGH" && !can_generate) {
     console.warn("Backend inconsistency: expected_confidence=HIGH but can_generate=false. Prioritizing can_generate=false.");
+  }
+
+  // Check for LEGACY_NO_SNAPSHOT (Recommendation exists but lacks snapshot)
+  if (state.recommendation_audit?.status === "LEGACY_NO_SNAPSHOT") {
+    return {
+      primaryLabel: "View Recommendation",
+      secondaryLabel: "Regenerate",
+      modalPrimaryLabel: "View Recommendation",
+      modalSecondaryLabel: "Regenerate",
+      actionType: "view",
+      tone: "caution",
+      reason: "This recommendation was generated without an auditable PR snapshot",
+      showContinueAnyway: false,
+      showReviewMissingInputs: false
+    };
   }
 
   // State 6: Recommendation exists and not stale
@@ -92,33 +225,70 @@ export function resolveRecommendationAction(state: ReadinessState): CTAAction {
     };
   }
 
-  // State 4: HIGH confidence
-  if (can_generate && expected_confidence === "HIGH" && readiness_score >= 75) {
+  // Part 6: Generate Confident Regression Plan (PR package ready + HIGH confidence)
+  if (pr_package?.readiness_status === "READY" && pr_package?.can_generate_confident_regression_plan && expected_confidence === "HIGH" && readiness_score >= 75) {
     return {
-      primaryLabel: "Generate Recommendation",
+      primaryLabel: "Generate Confident Regression Plan",
       secondaryLabel: "Review Optional Gaps",
-      modalPrimaryLabel: "Generate Recommendation",
+      modalPrimaryLabel: "Generate Confident Regression Plan",
       modalSecondaryLabel: "Review Optional Gaps",
       actionType: "generate",
       tone: "positive",
-      reason: "Ready to generate with high confidence",
+      reason: "Ready to generate confident regression plan with complete PR package",
       showContinueAnyway: false,
       showReviewMissingInputs: false
     };
   }
 
-  // State 3: MEDIUM confidence
+  // Check if quality gate profile is missing (Input 10)
+  const qualityGateMissing = missing_inputs.some(input => input.key === 'INPUT_10');
+
+  // State 5: CONFIDENT_READY / HIGH_CONFIDENCE_READY
+  if (can_generate && expected_confidence === "HIGH" && readiness_score >= 75) {
+    if (qualityGateMissing) {
+      // Can generate basic recommendation but not high-confidence release-safe
+      return {
+        primaryLabel: "Generate Recommendation",
+        secondaryLabel: "Review Optional Gaps",
+        modalPrimaryLabel: "Generate Recommendation",
+        modalSecondaryLabel: "Review Optional Gaps",
+        actionType: "generate",
+        tone: "positive",
+        reason: "Ready to generate recommendation (quality gate profile missing for high-confidence release-safe)",
+        showContinueAnyway: false,
+        showReviewMissingInputs: false,
+        generationMode: "confident"
+      };
+    } else {
+      // Full confident recommendation
+      return {
+        primaryLabel: "Generate Confident Recommendation",
+        secondaryLabel: "Review Optional Gaps",
+        modalPrimaryLabel: "Generate Confident Recommendation",
+        modalSecondaryLabel: "Review Optional Gaps",
+        actionType: "generate",
+        tone: "positive",
+        reason: "Ready to generate confident recommendation with complete evidence",
+        showContinueAnyway: false,
+        showReviewMissingInputs: false,
+        generationMode: "confident"
+      };
+    }
+  }
+
+  // State 4: MINIMUM_READY - Basic recommendation available
   if (can_generate && expected_confidence === "MEDIUM") {
     return {
-      primaryLabel: "Generate with Limited Confidence",
+      primaryLabel: "Generate Recommendation",
       secondaryLabel: "Improve Accuracy",
-      modalPrimaryLabel: "Generate with Limited Confidence",
+      modalPrimaryLabel: "Generate Recommendation",
       modalSecondaryLabel: "Improve Accuracy",
       actionType: "generate",
       tone: "caution",
-      reason: "Can generate with medium confidence",
+      reason: "Ready to generate basic recommendation",
       showContinueAnyway: false,
-      showReviewMissingInputs: false
+      showReviewMissingInputs: false,
+      generationMode: "confident"
     };
   }
 

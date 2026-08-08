@@ -267,6 +267,16 @@ class TestRegressionScopeRuntime:
         assert scope is not None
         assert scope.scope_type == "FULL"
 
+    # Test 2d: full_suite mode accepted
+    def test_mode_full_suite_accepted(self, db, test_run_with_snapshot):
+        scope = RegressionScopeV2Service.generate_scope_v2(
+            db=db,
+            run_id=str(test_run_with_snapshot.id),
+            mode=ScopeMode.FULL_SUITE,
+        )
+        assert scope is not None
+        assert scope.scope_type == "FULL_SUITE"
+
     # Test 3: changed files from snapshot are accessible in scope service
     def test_scope_service_receives_6_changed_files(self, db, test_run_with_snapshot):
         """Scope service must access the same 6 changed files stored in the snapshot."""

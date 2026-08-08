@@ -27,6 +27,9 @@ class BusinessBehaviorMapping(Base):
     # Journey context
     journey_id = Column(UUID(as_uuid=True), ForeignKey("journeys.id", ondelete="SET NULL"), nullable=True, index=True)
     
+    # Pull request context (for PR-specific mappings)
+    pull_request_id = Column(UUID(as_uuid=True), ForeignKey("pull_requests.id", ondelete="CASCADE"), nullable=True, index=True)
+    
     # Match confidence (0.0 to 1.0)
     match_confidence = Column(Float, nullable=False, default=0.5)
     

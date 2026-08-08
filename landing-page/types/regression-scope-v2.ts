@@ -1,10 +1,12 @@
 export enum ScopeGroup {
   REQUIRED = "REQUIRED",
+  REVIEW_NEEDED = "REVIEW_NEEDED",
   RECOMMENDED = "RECOMMENDED",
   OPTIONAL = "OPTIONAL",
   SAFE_TO_SKIP = "SAFE_TO_SKIP",
   EXCLUDED_ALREADY_VERIFIED = "EXCLUDED_ALREADY_VERIFIED",
-  EXCLUDED_ALREADY_PASSED_TESTS = "EXCLUDED_ALREADY_PASSED_TESTS"
+  EXCLUDED_ALREADY_PASSED_TESTS = "EXCLUDED_ALREADY_PASSED_TESTS",
+  DEFERRED_COVERAGE_DEBT = "DEFERRED_COVERAGE_DEBT"
 }
 
 export enum ScopeItemType {
@@ -97,6 +99,22 @@ export interface ScopeItem {
   risk_adjustment_delta?: number;
   // Phase 6.5B: Manual evidence governance status
   governanceStatus?: "PENDING_REVIEW" | "APPROVED" | "REJECTED" | "CHALLENGED" | "EXPIRED";
+  // Release action classification fields
+  release_action?: string;
+  freshness_status?: string;
+  freshness_reason?: string;
+  mapping_status?: string;
+  // Safe to Skip evidence
+  skip_evidence?: {
+    covered_files: string[];
+    changed_files_overlap: string[];
+    last_run_timestamp?: string;
+    last_run_commit_sha?: string;
+    last_run_status: string;
+    not_in_changed_files: boolean;
+    skip_confidence_pct: number;
+    skip_confidence_factors: string[];
+  };
   governanceReviewer?: string;
   governanceReviewedAt?: string;
   governanceReviewNote?: string;
@@ -121,6 +139,14 @@ export interface ScopeItem {
     reviewNote?: string;
     updatedAt?: string;
   };
+  // Mapping confidence fields
+  mapping_type?: string;
+  mapping_confidence?: number;
+  mapping_reason?: string;
+  linked_test_count?: number;
+  linked_tests?: string[];
+  test_run_commit_sha?: string;
+  pull_request_head_sha?: string;
 }
 
 export interface ScopeGroupSummary {
@@ -134,6 +160,8 @@ export interface ExecutionPlan {
   recommended_count: number;
   optional_count: number;
   safe_to_skip_count: number;
+  review_needed_count?: number;
+  deferred_coverage_debt_count?: number;
   total_executable_count: number;
   estimated_execution_reduction: number;
   confidence_level: number;
@@ -177,12 +205,93 @@ export interface ScopeGovernance {
   release_decision_status?: string;
 }
 
+export interface TraceabilitySummary {
+  total_requirements: number;
+  covered: number;
+  missing: number;
+  not_mapped: number;
+  partial: number;
+}
+
+export interface ReleaseDecision {
+  verdict: string;
+  reason: string;
+  required_count: number;
+  recommended_count: number;
+  already_verified_count: number;
+  source_mode: string;
+}
+
+export interface ChangedRule {
+  rule_name: string;
+  rule_type: string;
+  file_path: string;
+  line_number?: number;
+}
+
+export interface ChangeSummary {
+  file_path: string;
+  changed_functions: string[];
+  changed_rules: ChangedRule[];
+  new_conditionals: number;
+  changed_constants: string[];
+  affected_domain_terms: string[];
+}
+
+export interface CoverageGap {
+  file_path: string;
+  uncovered_branches: string[];
+  related_requirement_ids: string[];
+  risk: string;
+  gap_type: string;
+}
+
+export interface DetailedScenario {
+  precondition: string;
+  test_input: string;
+  expected_result: string;
+  test_layer: string;
+}
+
+export interface EvidenceItem {
+  requirement_id: string;
+  requirement_title: string;
+  verifying_test: string;
+  test_status: string;
+  test_freshness: string;
+  impact_reason: string;
+  final_bucket: string;
+}
+
+export interface MissingTestRecommendation {
+  id: string;
+  title: string;
+  source: string;
+  priority: number;
+  risk_rationale: string;
+  suggested_test_scenario: string;
+  detailed_scenario?: DetailedScenario;
+  linked_requirement_id?: string;
+  linked_file?: string;
+  estimated_effort: string;
+}
+
 export interface ScopeDiagnostics {
   generation_timestamp: string;
   generation_duration_ms?: number;
   rules_applied: string[];
   warnings: string[];
   errors: string[];
+  change_impact_diagnostics?: any;
+}
+
+export interface ScopeIntegrityReport {
+  integrity_status: "PASS" | "FAIL";
+  integrity_errors: string[];
+  integrity_warnings: string[];
+  total_unique_logical_items: number;
+  bucket_sum: number;
+  duplicate_identities: string[];
 }
 
 export interface RegressionScopeV2 {
@@ -198,4 +307,66 @@ export interface RegressionScopeV2 {
   optimization_metrics: ScopeOptimizationMetrics;
   governance: ScopeGovernance;
   diagnostics: ScopeDiagnostics;
+  integrity?: ScopeIntegrityReport;
+  // Phase 7: Unified view fields
+  traceability_summary?: TraceabilitySummary;
+  release_decision?: ReleaseDecision;
+  // Phase 8: Gap analysis and missing test recommendations
+  recommendations: MissingTestRecommendation[];
+  evidence_items?: EvidenceItem[];
+}
+
+// Part 9: PR Package Types for Input 1 Readiness
+export type ChangedFileStatus = "added" | "modified" | "deleted" | "renamed" | string;
+
+export interface ChangedFile {
+  file_path: string;
+  previous_file_path?: string | null;
+  status: ChangedFileStatus;
+  additions?: number;
+  deletions?: number;
+  patch_summary?: string | null;
+  file_sha?: string | null;
+  patch_hash?: string | null;
+  detected_layer?: string | null;
+  detected_component?: string | null;
+  detected_flow?: string | null;
+}
+
+export type PRPackageReadinessStatus = "READY" | "PARTIAL" | "BLOCKED" | "OUTDATED";
+
+export interface PRPackageReadiness {
+  status: PRPackageReadinessStatus;
+  confidence?: number;
+  can_generate_draft_plan?: boolean;
+  can_generate_confident_regression_plan?: boolean;
+  blockers: string[];
+  warnings: string[];
+}
+
+export interface PRPackageSnapshot {
+  head_commit_sha_at_generation?: string | null;
+  base_commit_sha_at_generation?: string | null;
+  merge_commit_sha_at_generation?: string | null;
+  changed_files_count_at_generation?: number;
+  is_stale: boolean;
+  stale_reason?: string | null;
+  current_head_sha?: string | null;
+  snapshot_head_sha?: string | null;
+}
+
+export interface PRPackage {
+  repository_id: string;
+  pull_request_id: string;
+  pr_number?: number;
+  title?: string;
+  source_branch?: string;
+  target_branch?: string;
+  head_commit_sha?: string;
+  base_commit_sha?: string;
+  merge_commit_sha?: string | null;
+  changed_files_count: number;
+  changed_files: ChangedFile[];
+  snapshot?: PRPackageSnapshot;
+  readiness: PRPackageReadiness;
 }

@@ -8,13 +8,13 @@ import {
   GitPullRequest,
   GitBranch,
   AlertTriangle,
+  ChevronDown,
   AlertCircle,
   CheckCircle2,
   Clock,
   Copy,
   Download,
   RefreshCw,
-  ChevronDown,
   ChevronRight,
   Loader2,
   FlaskConical,
@@ -37,6 +37,7 @@ import {
   Check,
   X,
   Circle,
+  Lightbulb,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
@@ -72,11 +73,15 @@ import ConfidenceExplanation, {
 } from "@/components/ConfidenceExplanation";
 import { ImproveAccuracyPanel } from "@/components/ImproveAccuracyPanel";
 import RecommendationCheckpointModal from "@/app/components/RecommendationCheckpointModal";
-import PasteAcceptanceCriteriaModal from "@/components/recommendations/paste-acceptance-criteria-modal";
+import BusinessRequirementsModal from "@/components/requirements/business-requirements-modal";
+import BusinessRequirementsBanner from "@/components/requirements/business-requirements-banner";
 import { RegressionScopeV2Display } from "@/components/regression-scope/RegressionScopeV2Display";
 import { RiskReviewGovernancePanel } from "@/components/RiskReviewGovernancePanel";
 import { ScopeGroup } from "@/types/regression-scope-v2";
 import { CICDPipelineRunsPanel } from "@/components/CICDPipelineRunsPanel";
+import { QualityGateBadge } from "@/components/QualityGateBadge";
+import { PRPackageSummaryCard, StaleRecommendationBanner, MissingInputWarning } from "@/components/pr-package-readiness";
+import { normalizePRPackage } from "@/lib/adapters/prPackageAdapter";
 
 export const dynamic = "force-dynamic";
 
@@ -87,6 +92,7 @@ interface RecommendedTest {
   display_name: string;
   suite_name: string;
   tier: "must_run" | "should_run" | "fallback";
+  execution_aware_tier?: string;
   priority_score: number;
   reason_type: string;
   reason: string;
@@ -96,6 +102,11 @@ interface RecommendedTest {
   signals?: { name: string; value: string }[];
   requirement_id?: string;
   scenario_intent?: string;
+  candidate_status?: string;
+  active_action?: string;
+  included?: boolean;
+  evidence_path?: Array<{ step: string; confidence?: number; [key: string]: any }>;
+  would_have_been_priority?: string;
 }
 
 interface ScenarioCoverageMatrixItem {
@@ -216,6 +227,10 @@ interface RunDetail {
     must_run_count: number;
     should_run_count: number;
     fallback_count: number;
+    already_verified_count?: number;
+    failed_current_pr_count?: number;
+    stale_rerun_required_count?: number;
+    mapping_review_needed_count?: number;
     estimated_runtime_seconds: number;
     full_suite_runtime_seconds: number | null;
     runtime_confidence: string | null;
@@ -649,6 +664,116 @@ function CollapsibleSection({ title, icon: Icon, children, defaultOpen = false, 
       {open && (
         <div className="px-5 pb-5">
           {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Behavior Ranking Reasoning Panel ────────────────────────────────────────
+
+function BehaviorRankingReasoningPanel({
+  impactedBehaviors,
+  behaviorReasons,
+  coverageSummary,
+  contextStatus,
+}: {
+  impactedBehaviors: any[];
+  behaviorReasons: string[];
+  coverageSummary: Record<string, any>;
+  contextStatus: string | null;
+}) {
+  const [open, setOpen] = useState(false);
+
+  const riskColor = (level: string) =>
+    level === "CRITICAL" ? "text-red-400 border-red-800/50 bg-red-950/20"
+    : level === "HIGH"   ? "text-orange-400 border-orange-800/50 bg-orange-950/20"
+    : level === "MEDIUM" ? "text-amber-400 border-amber-800/50 bg-amber-950/20"
+    : "text-zinc-400 border-zinc-700 bg-zinc-900/30";
+
+  const statusBadge = contextStatus === "READY"
+    ? "text-emerald-400 bg-emerald-950/20 border-emerald-800/40"
+    : contextStatus === "PARTIAL"
+    ? "text-amber-400 bg-amber-950/20 border-amber-800/40"
+    : "text-zinc-400 bg-zinc-900/30 border-zinc-700";
+
+  return (
+    <div className="mt-4 bg-indigo-950/10 border border-indigo-800/30 rounded-lg overflow-hidden">
+      <button
+        className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-indigo-950/20 transition-colors"
+        onClick={() => setOpen(!open)}
+      >
+        <div className="flex items-center gap-2">
+          <span className="text-indigo-400 text-sm">⬡</span>
+          <span className="text-sm font-semibold text-zinc-100">Behavior-Based Ranking Reasoning</span>
+          <span className={`text-[9px] px-1.5 py-0.5 rounded border ${statusBadge}`}>
+            {contextStatus || "—"}
+          </span>
+          <span className="text-[10px] text-zinc-500">
+            {impactedBehaviors.length} impacted behavior{impactedBehaviors.length !== 1 ? "s" : ""}
+          </span>
+        </div>
+        <span className="text-zinc-500 text-xs">{open ? "▲" : "▼"}</span>
+      </button>
+
+      {open && (
+        <div className="px-4 pb-4 space-y-4">
+          {/* Coverage summary */}
+          {(coverageSummary.total_behaviors > 0) && (
+            <div className="grid grid-cols-3 gap-2 mt-2">
+              <div className="bg-zinc-900/40 rounded p-2 text-center border border-zinc-800/30">
+                <p className="text-[9px] text-zinc-500 uppercase tracking-wider">Total Behaviors</p>
+                <p className="text-lg font-bold text-zinc-200">{coverageSummary.total_behaviors ?? 0}</p>
+              </div>
+              <div className="bg-zinc-900/40 rounded p-2 text-center border border-zinc-800/30">
+                <p className="text-[9px] text-zinc-500 uppercase tracking-wider">Impacted</p>
+                <p className="text-lg font-bold text-orange-400">{coverageSummary.impacted_behaviors_count ?? 0}</p>
+              </div>
+              <div className="bg-zinc-900/40 rounded p-2 text-center border border-zinc-800/30">
+                <p className="text-[9px] text-zinc-500 uppercase tracking-wider">Uncovered</p>
+                <p className="text-lg font-bold text-rose-400">{coverageSummary.uncovered_behaviors_count ?? 0}</p>
+              </div>
+            </div>
+          )}
+
+          {/* Impacted behaviors list */}
+          {impactedBehaviors.length > 0 && (
+            <div className="space-y-2">
+              <p className="text-[10px] text-zinc-500 uppercase tracking-wider font-medium">Impacted Behaviors</p>
+              {impactedBehaviors.map((b: any, i: number) => (
+                <div key={b.behavior_id || i} className={`flex items-start gap-2 rounded border px-3 py-2 ${riskColor(b.impact_level)}`}>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-xs font-semibold">{b.behavior_name}</span>
+                      <span className={`text-[9px] px-1.5 py-0.5 rounded border ${riskColor(b.impact_level)}`}>
+                        {b.impact_level}
+                      </span>
+                      <span className="text-[9px] text-zinc-500">{b.impact_type}</span>
+                    </div>
+                    {b.impact_reason && (
+                      <p className="text-[11px] text-zinc-400 mt-1 leading-relaxed">{b.impact_reason}</p>
+                    )}
+                  </div>
+                  <div className="text-[9px] text-zinc-500 whitespace-nowrap">
+                    conf: {Math.round((b.confidence ?? 0) * 100)}%
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Why these boost test ranking */}
+          {behaviorReasons.length > 0 && (
+            <div className="space-y-1.5">
+              <p className="text-[10px] text-zinc-500 uppercase tracking-wider font-medium">Why Behaviors Affect Ranking</p>
+              {behaviorReasons.map((r: string, i: number) => (
+                <div key={i} className="flex items-start gap-2 text-[11px] text-zinc-300 leading-relaxed">
+                  <span className="text-indigo-400 mt-0.5 shrink-0">→</span>
+                  <span>{r}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -1180,10 +1305,38 @@ export default function RecommendationDetailPage({ params }: PageProps) {
   const [regressionScopeErrorMessage, setRegressionScopeErrorMessage] = useState<string | null>(null);
   const [regressionEvidence, setRegressionEvidence] = useState<any>(null);
   const [releaseDecision, setReleaseDecision] = useState<any>(null);
-  const [scopeMode, setScopeMode] = useState<"targeted" | "risk_based" | "full">("risk_based");
+  const [scopeMode, setScopeMode] = useState<"targeted" | "risk_based" | "full_suite">("risk_based");
+  const [scopeLoading, setScopeLoading] = useState<boolean>(false);
   const [showSafeToSkip, setShowSafeToSkip] = useState<boolean>(false);
   const [auditMode, setAuditMode] = useState<boolean>(false);
   const [govAuditOpen, setGovAuditOpen] = useState<boolean>(false);
+  const [expandedRationales, setExpandedRationales] = useState<Set<string>>(new Set());
+  const [showEvidence, setShowEvidence] = useState<boolean>(false);
+  const [expandedVerified, setExpandedVerified] = useState<Set<string>>(new Set());
+
+  const toggleRationale = (id: string) => {
+    setExpandedRationales(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const toggleVerified = (id: string) => {
+    setExpandedVerified(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
 
   // Destructure safe defaults to prevent fallback test page crash
   const { 
@@ -1199,9 +1352,43 @@ export default function RecommendationDetailPage({ params }: PageProps) {
     impact_profile = { behavior_coverage_matrix: [] } 
   } = run || {};
 
-  const mustRun   = recommended_tests.filter(t => t.tier === "must_run");
-  const shouldRun = recommended_tests.filter(t => t.tier === "should_run");
-  const fallback  = recommended_tests.filter(t => t.tier === "fallback");
+  // Execution-aware bucketing: prefer backend-provided bucketed lists when available,
+  // fall back to filtering recommended_tests by execution_aware_tier.
+  // ALREADY_PASSED_CURRENT_PR tests must never appear in mustRun.
+  const _EXCLUDED_FROM_MUST_RUN = new Set([
+    "ALREADY_PASSED_CURRENT_PR",
+    "FAILED_CURRENT_PR",
+    "SKIPPED_CURRENT_PR",
+    "STALE_RESULT_RERUN_REQUIRED",
+    "NEEDS_MAPPING_REVIEW",
+    "NOT_RELEVANT",
+  ]);
+
+  const _tier = (t: RecommendedTest): string =>
+    t.execution_aware_tier || (
+      t.candidate_status && _EXCLUDED_FROM_MUST_RUN.has(t.candidate_status)
+        ? (t.candidate_status === "ALREADY_PASSED_CURRENT_PR" ? "already_verified"
+          : t.candidate_status === "FAILED_CURRENT_PR" ? "failed_current_pr"
+          : t.candidate_status === "STALE_RESULT_RERUN_REQUIRED" ? "stale_rerun_required"
+          : t.candidate_status === "NEEDS_MAPPING_REVIEW" ? "mapping_review_needed"
+          : "skipped_current_pr")
+        : t.tier
+    );
+
+  const mustRun   = ((run as any)?.must_run_tests as RecommendedTest[] | undefined)
+    ?? recommended_tests.filter(t => _tier(t) === "must_run");
+  const shouldRun = ((run as any)?.should_run_tests as RecommendedTest[] | undefined)
+    ?? recommended_tests.filter(t => _tier(t) === "should_run");
+  const fallback  = recommended_tests.filter(t => _tier(t) === "fallback");
+
+  const alreadyVerifiedFromExecution = ((run as any)?.already_verified_tests as RecommendedTest[] | undefined)
+    ?? recommended_tests.filter(t => _tier(t) === "already_verified");
+  const failedCurrentPRTests = ((run as any)?.failed_current_pr_tests as RecommendedTest[] | undefined)
+    ?? recommended_tests.filter(t => _tier(t) === "failed_current_pr");
+  const staleRerunTests = ((run as any)?.stale_rerun_required_tests as RecommendedTest[] | undefined)
+    ?? recommended_tests.filter(t => _tier(t) === "stale_rerun_required");
+  const mappingReviewTests = ((run as any)?.mapping_review_needed_tests as RecommendedTest[] | undefined)
+    ?? recommended_tests.filter(t => _tier(t) === "mapping_review_needed");
 
   const warnings = run?.input_stale && rawWarnings
     ? rawWarnings.filter((w: string) => !w.toLowerCase().includes("acceptance criteria") && !w.toLowerCase().includes("no ac"))
@@ -1301,11 +1488,13 @@ export default function RecommendationDetailPage({ params }: PageProps) {
   const [suiteSummary, setSuiteSummary] = useState<any>(null);
   const [isPasteModalOpen, setIsPasteModalOpen] = useState(false);
   const [showAllGaps, setShowAllGaps] = useState(false);
+  const [exportDropdownOpen, setExportDropdownOpen] = useState(false);
   const [showOutcomeForm, setShowOutcomeForm] = useState(false);
   const [showAllAC, setShowAllAC] = useState(false);
   const [expandedAC, setExpandedAC] = useState<string | null>(null);
   const [riskOverrideModal, setRiskOverrideModal] = useState({ isOpen: false, justification: "" });
   const [pipelineRuns, setPipelineRuns] = useState<any[]>([]);
+  const [readinessData, setReadinessData] = useState<any>(null);
 
   const handleDownloadArtifact = async (pipelineRunId: string) => {
     try {
@@ -1353,6 +1542,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) { setError(data?.error || `Error ${res.status}`); return; }
       setRun(data);
+      setReadinessData(data.readiness_snapshot || null);
       
       // Fetch outcome summary
       if (data.outcome) {
@@ -1361,11 +1551,18 @@ export default function RecommendationDetailPage({ params }: PageProps) {
 
       // Fetch V2 regression evidence
       try {
-        const evidenceRes = await fetch(`/api/recommendations/${id}/regression-evidence`, { cache: "no-store" });
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+        const evidenceRes = await fetch(`/api/recommendations/${id}/regression-evidence`, { 
+          cache: "no-store",
+          signal: controller.signal 
+        });
+        clearTimeout(timeoutId);
         const evidenceData = await evidenceRes.json().catch(() => ({}));
         setRegressionEvidence(evidenceData);
       } catch (e) {
         console.warn("Failed to fetch regression evidence", e);
+        setRegressionEvidence({}); // Set empty data on timeout/error
       }
 
       // Fetch release decision
@@ -1406,14 +1603,38 @@ export default function RecommendationDetailPage({ params }: PageProps) {
   useEffect(() => { params.then(p => setRunId(p.recommendationRunId)); }, [params]);
   useEffect(() => { if (runId) fetchRun(runId); }, [runId, fetchRun]);
 
+  useEffect(() => {
+    console.log("SCOPE_MODE_STATE_CHANGED", {
+      scopeMode,
+      timestamp: new Date().toISOString(),
+    });
+  }, [scopeMode]);
+
   // Refetch V2 regression scope when mode or runId changes
   useEffect(() => {
     if (runId) {
       const fetchScope = async () => {
+        setScopeLoading(true);
+        const url = `/api/recommendations/${runId}/regression-scope?mode=${scopeMode}`;
+        console.log("FETCH_SCOPE_REQUEST", {
+          recommendationRunId: runId,
+          scopeMode,
+          url,
+        });
         try {
-          const scopeRes = await fetch(`/api/recommendations/${runId}/regression-scope?mode=${scopeMode}`, { cache: "no-store" });
+          const scopeRes = await fetch(url, { cache: "no-store" });
           if (scopeRes.ok) {
             const wrapper = await scopeRes.json();
+            console.log("FETCH_SCOPE_RESPONSE", {
+              scopeMode,
+              status: scopeRes.status,
+              responseStatus: wrapper?.status,
+              backendMode: wrapper?.mode,
+              hasScope: Boolean(wrapper?.scope),
+              required: wrapper?.scope?.groups?.REQUIRED?.items?.length,
+              reviewNeeded: wrapper?.scope?.groups?.REVIEW_NEEDED?.items?.length,
+              alreadyVerified: wrapper?.scope?.groups?.EXCLUDED_ALREADY_VERIFIED?.items?.length,
+            });
             if (wrapper.status === "SUCCESS" && wrapper.scope) {
               setRegressionScope(wrapper.scope);
               setRegressionScopeError(false);
@@ -1425,11 +1646,15 @@ export default function RecommendationDetailPage({ params }: PageProps) {
               setRegressionScopeErrorMessage(wrapper.message || wrapper.error_code || null);
             }
           } else {
+            setRegressionScope(null);
             setRegressionScopeError(true);
           }
         } catch (e) {
+          setRegressionScope(null);
           setRegressionScopeError(true);
           console.warn("Failed to fetch regression scope", e);
+        } finally {
+          setScopeLoading(false);
         }
       };
       fetchScope();
@@ -1522,6 +1747,58 @@ export default function RecommendationDetailPage({ params }: PageProps) {
       toast.success("Exported", { description: "Evidence report saved as Markdown" });
     } catch (e: any) {
       toast.error("Export failed", { description: e.message || "Failed to export evidence report" });
+    }
+  }, [runId]);
+
+  // Export Audit Report as JSON
+  const exportAuditReportJson = useCallback(async () => {
+    if (!runId) return;
+    try {
+      const res = await fetch(`/api/recommendations/${runId}/audit-report`, { cache: "no-store" });
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.message || "Failed to generate audit report");
+      }
+      const data = await res.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `veriscope-audit-report-${runId}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success("Exported", { description: "Audit report saved as JSON" });
+    } catch (e: any) {
+      toast.error("Export failed", { description: e.message || "Failed to export audit report" });
+    }
+  }, [runId]);
+
+  // Export Audit Report as PDF
+  const exportAuditReportPdf = useCallback(async () => {
+    if (!runId) return;
+    try {
+      const res = await fetch(`/api/recommendations/${runId}/audit-report/pdf`, { cache: "no-store" });
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.message || "Failed to generate audit report PDF");
+      }
+      const data = await res.json();
+      if (data.warning) {
+        toast.warning("PDF not available", { description: data.warning });
+        // Still export the JSON as fallback
+        const blob = new Blob([JSON.stringify(data.audit_record, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `veriscope-audit-report-${runId}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+        return;
+      }
+      // PDF generation would go here when implemented
+      toast.success("Exported", { description: "Audit report saved as PDF" });
+    } catch (e: any) {
+      toast.error("Export failed", { description: e.message || "Failed to export audit report PDF" });
     }
   }, [runId]);
 
@@ -2122,22 +2399,87 @@ export default function RecommendationDetailPage({ params }: PageProps) {
   return (
     <div className="space-y-5 max-w-4xl">
 
-      {/* Legacy Recommendation Warning */}
-      {!run.readiness_snapshot && (
-        <div className="bg-zinc-950/20 border border-zinc-800/40 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div className="flex items-start gap-3">
-            <Info className="w-5 h-5 text-zinc-400 shrink-0 mt-0.5" />
-            <div>
-              <p className="text-sm font-semibold text-zinc-200">
-                Legacy recommendation: readiness snapshot was not captured.
-              </p>
-              <p className="text-xs text-zinc-400 mt-1">
-                This recommendation was generated before readiness snapshot persistence was implemented. Evidence quality may not reflect the original generation state.
-              </p>
+      {/* Decoupled Recommendation Snapshot Auditability Banner */}
+      {(() => {
+        const audit = run.recommendation_audit;
+        if (!audit) {
+          if (!run.readiness_snapshot) {
+            return (
+              <div className="bg-zinc-950/20 border border-zinc-800/40 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div className="flex items-start gap-3">
+                  <Info className="w-5 h-5 text-zinc-400 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-sm font-semibold text-zinc-200">
+                      Legacy recommendation: readiness snapshot was not captured.
+                    </p>
+                    <p className="text-xs text-zinc-400 mt-1">
+                      This recommendation was generated before readiness snapshot persistence was implemented. Evidence quality may not reflect the original generation state.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            );
+          }
+          return null;
+        }
+
+        const { status, head_commit_sha_at_generation } = audit;
+        if (status === "LEGACY_NO_SNAPSHOT") {
+          return (
+            <div className="bg-amber-950/10 border border-amber-900/30 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-sm font-semibold text-amber-200">
+                    Legacy Recommendation: No snapshot captured
+                  </p>
+                  <p className="text-xs text-amber-400 mt-1">
+                    This recommendation does not have an auditable PR package snapshot. Evidence quality may not reflect the original generation state.
+                  </p>
+                </div>
+              </div>
             </div>
-          </div>
-        </div>
-      )}
+          );
+        }
+
+        if (status === "OUTDATED") {
+          return (
+            <div className="bg-orange-950/10 border border-orange-900/30 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div className="flex items-start gap-3">
+                <RefreshCw className="w-5 h-5 text-orange-500 shrink-0 mt-0.5 animate-spin" />
+                <div>
+                  <p className="text-sm font-semibold text-orange-200">
+                    Outdated Snapshot: PR head commit has changed
+                  </p>
+                  <p className="text-xs text-orange-400 mt-1">
+                    PR has changed since this recommendation was generated (generated at commit {head_commit_sha_at_generation?.substring(0, 7) || "unknown"}). Regenerate to ensure targeted regression accuracy.
+                  </p>
+                </div>
+              </div>
+            </div>
+          );
+        }
+
+        if (status === "AUDITABLE") {
+          return (
+            <div className="bg-emerald-950/10 border border-emerald-900/30 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div className="flex items-start gap-3">
+                <CheckCircle2 className="w-5 h-5 text-emerald-500 shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-sm font-semibold text-emerald-200">
+                    Auditable Recommendation Snapshot
+                  </p>
+                  <p className="text-xs text-emerald-400 mt-1">
+                    This recommendation has a matching PR snapshot generated at commit {head_commit_sha_at_generation?.substring(0, 7) || "unknown"}.
+                  </p>
+                </div>
+              </div>
+            </div>
+          );
+        }
+
+        return null;
+      })()}
 
       {/* Dev Consistency Check */}
       <DevConsistencyCheck result={consistencyCheck} />
@@ -2217,6 +2559,11 @@ export default function RecommendationDetailPage({ params }: PageProps) {
           <div>
             <div className="flex items-center gap-2 flex-wrap">
               <h1 className="text-lg font-bold text-white">Recommendation</h1>
+              {run.is_draft && (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-950/30 text-amber-400 border border-amber-800/40 uppercase tracking-wider">
+                  Draft
+                </span>
+              )}
               {run.pull_request && (
                 <span className="text-sm text-zinc-400 font-mono">
                   PR #{run.pull_request.number} · {run.pull_request.title}
@@ -2259,9 +2606,45 @@ export default function RecommendationDetailPage({ params }: PageProps) {
           <h3 className="text-sm font-semibold text-zinc-200">Primary Actions</h3>
         </div>
         <div className="flex flex-wrap gap-2">
+          <div className="relative">
+            <Button 
+              variant="outline" 
+              size="sm" 
+              onClick={() => setExportDropdownOpen(!exportDropdownOpen)} 
+              className="border-zinc-700 bg-zinc-800/40 text-zinc-300 hover:bg-zinc-700 hover:text-white gap-1.5 text-xs"
+            >
+              <Download className="w-3.5 h-3.5" />
+              Export
+              <ChevronDown className="w-3 h-3" />
+            </Button>
+            {exportDropdownOpen && (
+              <div className="absolute top-full left-0 mt-1 bg-zinc-800 border border-zinc-700 rounded-md shadow-lg z-50 min-w-[160px]">
+                <button
+                  onClick={() => {
+                    exportAuditReportJson();
+                    setExportDropdownOpen(false);
+                  }}
+                  className="w-full text-left px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-700 hover:text-white flex items-center gap-2"
+                >
+                  <Download className="w-3 h-3" />
+                  Export as JSON
+                </button>
+                <button
+                  onClick={() => {
+                    exportAuditReportPdf();
+                    setExportDropdownOpen(false);
+                  }}
+                  className="w-full text-left px-3 py-2 text-xs text-zinc-300 hover:bg-zinc-700 hover:text-white flex items-center gap-2"
+                >
+                  <Download className="w-3 h-3" />
+                  Export as PDF
+                </button>
+              </div>
+            )}
+          </div>
           <Button variant="outline" size="sm" onClick={exportEvidenceReport} className="border-zinc-700 bg-zinc-800/40 text-zinc-300 hover:bg-zinc-700 hover:text-white gap-1.5 text-xs">
             <Download className="w-3.5 h-3.5" />
-            Export Evidence Report
+            Evidence Report
           </Button>
           <Button variant="outline" size="sm" onClick={exportJson} className="border-zinc-700 bg-zinc-800/40 text-zinc-300 hover:bg-zinc-700 hover:text-white gap-1.5 text-xs">
             <Download className="w-3.5 h-3.5" />
@@ -2276,7 +2659,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
             Copy Test IDs
           </Button>
           <Button variant="outline" size="sm" onClick={() => setCheckpointModal({ isOpen: true, action: "rerun" })} disabled={isRegenerating} className="border-zinc-700 bg-zinc-800/40 text-zinc-300 hover:bg-zinc-700 hover:text-white gap-1.5 text-xs">
-            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+            <RefreshCw className="w-3.5 h-3.5" />
             Regenerate
           </Button>
         </div>
@@ -2291,108 +2674,164 @@ export default function RecommendationDetailPage({ params }: PageProps) {
           </div>
           <div className="flex items-center gap-2">
             {/* Quality Gate Badge - distinct from Recommendation Health */}
+            <QualityGateBadge gateStatus={readinessData?.gate_status || "UNKNOWN"} />
             <span className={`px-2 py-1 text-xs font-semibold rounded border ${
-              (() => {
-                const reqItems = regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items ||
-                                 (mustRun.length > 0 ? mustRun.map((t: any) => ({
-                                   id: t.stable_identity,
-                                   readable_id: "AC-REQ-1",
-                                   title: t.display_name,
-                                   effective_risk_level: "HIGH",
-                                   risk_band: "CRITICAL",
-                                   suggested_action: "Execute test"
-                                 })) : []);
-                const hasRequiredItems = reqItems.length > 0;
-                const isApproved = (releaseDecision?.decisionStatus || "PENDING") === "APPROVED";
-                
-                if (isApproved && !hasRequiredItems) {
-                  return "bg-emerald-950/20 text-emerald-400 border-emerald-800/40";
-                } else if (hasRequiredItems) {
-                  return "bg-amber-950/20 text-amber-400 border-amber-800/40";
-                } else {
-                  return "bg-zinc-950/20 text-zinc-400 border-zinc-800/40";
-                }
-              })()
-            }`}>
-              Quality Gate: {(() => {
-                const reqItems = regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items ||
-                                 (mustRun.length > 0 ? mustRun.map((t: any) => ({
-                                   id: t.stable_identity,
-                                   readable_id: "AC-REQ-1",
-                                   title: t.display_name,
-                                   effective_risk_level: "HIGH",
-                                   risk_band: "CRITICAL",
-                                   suggested_action: "Execute test"
-                                 })) : []);
-                const hasRequiredItems = reqItems.length > 0;
-                const isApproved = (releaseDecision?.decisionStatus || "PENDING") === "APPROVED";
-                
-                if (isApproved && !hasRequiredItems) {
-                  return "PASSED";
-                } else if (hasRequiredItems) {
-                  return "PARTIAL";
-                } else {
-                  return "UNKNOWN";
-                }
-              })()}
-            </span>
-            <span className={`px-2 py-1 text-xs font-semibold rounded border ${
-              (releaseDecision?.decisionStatus || "PENDING") === "APPROVED" ? "bg-emerald-950/20 text-emerald-400 border-emerald-800/40" :
-              (releaseDecision?.decisionStatus || "PENDING") === "REJECTED" ? "bg-rose-950/20 text-rose-400 border-rose-800/40" :
+              regressionScope?.release_decision?.verdict === "SAFE_TO_RELEASE" ? "bg-emerald-950/20 text-emerald-400 border-emerald-800/40" :
+              regressionScope?.release_decision?.verdict === "DO_NOT_RELEASE" ? "bg-rose-950/20 text-rose-400 border-rose-800/40" :
+              regressionScope?.release_decision?.verdict === "REVIEW_RECOMMENDED" ? "bg-amber-950/20 text-amber-400 border-amber-800/40" :
               "bg-zinc-950/20 text-zinc-400 border-zinc-800/40"
             }`}>
-              {releaseDecision?.decisionStatus || "PENDING"}
+              {regressionScope?.release_decision?.verdict || "UNKNOWN"}
+            </span>
+            <span className="text-[10px] text-zinc-500 uppercase tracking-wider">
+              {regressionScope?.release_decision?.source_mode || scopeMode}
             </span>
           </div>
         </div>
 
-        {regressionEvidence?.decisionSummary?.decisionCopy && (
-          <div className="bg-zinc-950/20 border border-zinc-800/30 rounded-lg p-4 space-y-2">
-            <h3 className="text-sm font-semibold text-zinc-200">{regressionEvidence.decisionSummary.decisionCopy.headline}</h3>
-            <p className="text-xs text-zinc-400 leading-relaxed">{regressionEvidence.decisionSummary.decisionCopy.explanation}</p>
+        {/* Phase 7: Use unified release decision from regression scope */}
+        {regressionScope?.release_decision ? (
+          <div className="bg-zinc-950/20 border border-zinc-800/30 rounded-lg p-4 space-y-3">
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex-1">
+                <h3 className="text-sm font-semibold text-zinc-200 mb-1">
+                  {regressionScope.release_decision.verdict === "SAFE_TO_RELEASE" ? "Safe to Release" :
+                   regressionScope.release_decision.verdict === "DO_NOT_RELEASE" ? "Do Not Release" :
+                   regressionScope.release_decision.verdict === "REVIEW_RECOMMENDED" ? "Review Recommended" :
+                   "Unknown Status"}
+                </h3>
+                <p className="text-xs text-zinc-400 leading-relaxed">{regressionScope.release_decision.reason}</p>
+              </div>
+              <div className="flex gap-4 text-center">
+                <div>
+                  <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Required</p>
+                  <p className="text-lg font-bold text-rose-400">{regressionScope.release_decision.required_count}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Test Gaps</p>
+                  <p className="text-lg font-bold text-amber-400">{regressionScope.release_decision.recommended_count}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Verified</p>
+                  <p className="text-lg font-bold text-emerald-400">{regressionScope.release_decision.already_verified_count}</p>
+                </div>
+              </div>
+            </div>
           </div>
-        )}
+        ) : (
+          /* Fallback to legacy decision copy if unified decision not available */
+          <>
+            {regressionEvidence?.decisionSummary?.decisionCopy && (
+              <div className="bg-zinc-950/20 border border-zinc-800/30 rounded-lg p-4 space-y-2">
+                <h3 className="text-sm font-semibold text-zinc-200">{regressionEvidence.decisionSummary.decisionCopy.headline}</h3>
+                <p className="text-xs text-zinc-400 leading-relaxed">{regressionEvidence.decisionSummary.decisionCopy.explanation}</p>
+              </div>
+            )}
 
-        {(() => {
-          const verdictEvidenceQuality = run.readiness_snapshot?.expected_confidence || "UNKNOWN";
-          const verdictCoverageRatio = run.evidence?.coverage?.line_coverage_ratio ?? null;
-          const verdictHasFailures = prTestClassification.failed.length > 0;
-          const verdictMissingScenarios = scenarioMatrix.filter(s => s.status === "suggested");
-          const verdict = determineReleaseReadinessVerdict(
-            run.recommended_tests || [],
-            verdictMissingScenarios,
-            verdictEvidenceQuality,
-            verdictCoverageRatio,
-            verdictHasFailures
-          );
-          return (
-            <ReleaseReadinessVerdict
-              verdict={verdict}
-              reason={generateVerdictReason(
-                verdict,
-                extractUnderstandingData(run).impactedBehaviors,
+            {/* Part 9: PR Package Summary - Compact summary before Release Decision using normalized adapter */}
+            {run.pr_package && (() => {
+              const normalizedPRPackage = normalizePRPackage(
+                { 
+                  id: run.pull_request_id,
+                  number: run.pr_number,
+                  title: run.pr_title,
+                  source_branch: run.pr_source_branch,
+                  target_branch: run.pr_target_branch,
+                  head_commit_sha: run.pr_package?.head_commit_sha,
+                  base_commit_sha: run.pr_package?.base_commit_sha,
+                  merge_commit_sha: run.pr_package?.merge_commit_sha,
+                  changed_files_count: run.pr_package?.changed_files_count,
+                  changed_files: run.pr_package?.changed_files
+                },
+                { pr_package: run.pr_package }
+              );
+              return <PRPackageSummaryCard prPackage={normalizedPRPackage} compact={true} />;
+            })()}
+
+            {/* Part 9: Stale Recommendation Warning using normalized adapter */}
+            {run.pr_package && (() => {
+              const normalizedPRPackage = normalizePRPackage(
+                { 
+                  id: run.pull_request_id,
+                  number: run.pr_number,
+                  title: run.pr_title,
+                  source_branch: run.pr_source_branch,
+                  target_branch: run.pr_target_branch,
+                  head_commit_sha: run.pr_package?.head_commit_sha,
+                  base_commit_sha: run.pr_package?.base_commit_sha,
+                  merge_commit_sha: run.pr_package?.merge_commit_sha,
+                  changed_files_count: run.pr_package?.changed_files_count,
+                  changed_files: run.pr_package?.changed_files
+                },
+                { pr_package: run.pr_package }
+              );
+              if (normalizedPRPackage.snapshotStatus === "OUTDATED") {
+                return (
+                  <StaleRecommendationBanner 
+                    prPackage={normalizedPRPackage}
+                    onRegenerate={() => {
+                      toast.info("Regenerate recommendation", {
+                        description: "Navigate to the repository detail page to regenerate this recommendation."
+                      });
+                    }}
+                  />
+                );
+              }
+              return null;
+            })()}
+
+            {/* Business Requirements Banner */}
+            {run.repository && run.pull_request && (
+              <BusinessRequirementsBanner
+                repositoryId={run.repository.id}
+                pullRequestId={run.pull_request.id}
+              />
+            )}
+
+            {(() => {
+              const verdictEvidenceQuality = run.readiness_snapshot?.expected_confidence || "UNKNOWN";
+              const verdictCoverageRatio = run.evidence?.coverage?.line_coverage_ratio ?? null;
+              const verdictHasFailures = prTestClassification.failed.length > 0;
+              const verdictMissingScenarios = scenarioMatrix.filter(s => s.status === "suggested");
+              const verdict = determineReleaseReadinessVerdict(
                 run.recommended_tests || [],
                 verdictMissingScenarios,
-                verdictCoverageRatio
-              )}
-              impactedAreas={extractUnderstandingData(run).impactedBehaviors}
-              confidence={run.readiness_snapshot?.expected_confidence || undefined}
-            />
-          );
-        })()}
+                verdictEvidenceQuality,
+                verdictCoverageRatio,
+                verdictHasFailures
+              );
+              return (
+                <ReleaseReadinessVerdict
+                  verdict={verdict}
+                  reason={generateVerdictReason(
+                    verdict,
+                    extractUnderstandingData(run).impactedBehaviors,
+                    run.recommended_tests || [],
+                    verdictMissingScenarios,
+                    verdictCoverageRatio
+                  )}
+                  impactedAreas={extractUnderstandingData(run).impactedBehaviors}
+                  confidence={run.readiness_snapshot?.expected_confidence || undefined}
+                />
+              );
+            })()}
+          </>
+        )}
 
         {/* Review CTAs - no approval buttons at top */}
         <div className="flex gap-3 mt-4">
           {(() => {
-            const reqItems = regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items || 
-                             (mustRun.length > 0 ? mustRun.map((t: any) => ({
-                               id: t.stable_identity,
-                               readable_id: "AC-REQ-1",
-                               title: t.display_name,
-                               effective_risk_level: "HIGH",
-                               risk_band: "CRITICAL",
-                               suggested_action: "Execute test"
-                             })) : []);
+            const rawRequiredItems = regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items ?? [];
+            const reqItems = rawRequiredItems.filter((item: any) => {
+              const releaseAction = item.release_action ?? item.releaseAction;
+              const executionStatus = item.execution_status ?? item.executionStatus;
+              const freshnessStatus = item.freshness_status ?? item.freshnessStatus;
+
+              if (releaseAction === "NONE") return false;
+              if (executionStatus === "PASSED" && freshnessStatus === "FRESH") return false;
+
+              return true;
+            });
             const hasRequiredItems = reqItems.length > 0;
             return (
               <>
@@ -2401,7 +2840,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
                     onClick={() => document.getElementById("required-before-release")?.scrollIntoView({ behavior: "smooth" })}
                     className="flex-1 bg-rose-600 hover:bg-rose-700 text-white font-semibold text-xs py-2 rounded-lg"
                   >
-                    Review {reqItems.length} Required Items
+                    Review {reqItems.length} Required Actions
                   </Button>
                 )}
                 <Button
@@ -2425,42 +2864,521 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         </div>
         <div className="space-y-2">
           {(() => {
-            const reqItems = regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items || 
-                             (mustRun.length > 0 ? mustRun.map((t: any) => ({
-                               id: t.stable_identity,
-                               readable_id: "AC-REQ-1",
-                               title: t.display_name,
-                               effective_risk_level: "HIGH",
-                               risk_band: "CRITICAL",
-                               suggested_action: "Execute test"
-                             })) : []);
+            if (regressionScopeError) {
+              return <p className="text-xs text-rose-500 italic">Unable to calculate release blockers. Please retry.</p>;
+            }
+
+            if (!regressionScope) {
+              return <p className="text-xs text-zinc-500 italic">Loading regression scope...</p>;
+            }
+
+            const rawRequiredItems = regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items ?? [];
+            const reqItems = rawRequiredItems.filter((item: any) => {
+              const releaseAction = item.release_action ?? item.releaseAction;
+              const executionStatus = item.execution_status ?? item.executionStatus;
+              const freshnessStatus = item.freshness_status ?? item.freshnessStatus;
+
+              if (releaseAction === "NONE") return false;
+              if (executionStatus === "PASSED" && freshnessStatus === "FRESH") return false;
+
+              return true;
+            });
+
+            console.log("REGRESSION_SCOPE_AVAILABLE_TO_PAGE", {
+              required: regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items?.length,
+              recommended: regressionScope?.groups?.[ScopeGroup.RECOMMENDED]?.items?.length,
+              optional: regressionScope?.groups?.[ScopeGroup.OPTIONAL]?.items?.length,
+              safeToSkip: regressionScope?.groups?.[ScopeGroup.SAFE_TO_SKIP]?.items?.length,
+              alreadyVerified: regressionScope?.groups?.[ScopeGroup.EXCLUDED_ALREADY_VERIFIED]?.items?.length,
+              firstRequired: regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items?.[0],
+              firstAlreadyVerified: regressionScope?.groups?.[ScopeGroup.EXCLUDED_ALREADY_VERIFIED]?.items?.[0],
+            });
+            console.log("REQUIRED_BEFORE_RELEASE_RENDER_SOURCE", {
+              component: "RecommendationDetailPage",
+              sourceVariableName: regressionScope ? "regressionScope.groups.REQUIRED.items" : "mustRun fallback",
+              count: reqItems?.length,
+              firstItem: reqItems?.[0],
+              firstItemKeys: reqItems?.[0] ? Object.keys(reqItems[0]) : null,
+              hasExecutionStatus: Boolean(reqItems?.[0]?.execution_status),
+              hasFreshnessStatus: Boolean(reqItems?.[0]?.freshness_status),
+              hasReleaseAction: Boolean(reqItems?.[0]?.release_action),
+            });
 
             if (reqItems.length === 0) {
-              return <p className="text-xs text-zinc-500 italic">No required actions before release.</p>;
+              return (
+                <div className="space-y-1">
+                  <p className="text-xs text-emerald-400 font-medium">No required release actions.</p>
+                  <p className="text-[11px] text-zinc-500">All impacted acceptance criteria are verified by fresh tests.</p>
+                </div>
+              );
             }
 
             return reqItems.map((item: any, idx: number) => (
-              <div key={item.id || idx} className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg p-3 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] font-mono text-zinc-400">{item.readable_id}</span>
-                    <h4 className="text-xs font-semibold text-zinc-200">{item.title}</h4>
+              <div key={item.id || idx} className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg p-3 space-y-2">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1 flex-wrap">
+                      <span className="text-[10px] font-mono text-zinc-400">{item.readable_id}</span>
+                      <h4 className="text-xs font-semibold text-zinc-200">{item.title}</h4>
+                    </div>
+                    {/* Phase 7: Show impact reason from change impact engine */}
+                    {item.reason && (
+                      <p className="text-[11px] text-zinc-400 mt-1 leading-relaxed">{item.reason}</p>
+                    )}
+                    {/* Phase 7: Show linked test evidence */}
+                    {item.linked_tests && item.linked_tests.length > 0 && (
+                      <div className="mt-2">
+                        <p className="text-[9px] text-zinc-500 font-medium uppercase tracking-wider mb-1">Linked Tests ({item.linked_tests.length})</p>
+                        <div className="flex flex-wrap gap-1">
+                          {item.linked_tests.slice(0, 3).map((test: string, tIdx: number) => (
+                            <span key={tIdx} className="text-[9px] font-mono bg-zinc-900 text-zinc-400 px-1.5 py-0.5 rounded border border-zinc-800/60">
+                              {test.split("::").slice(-1)[0].substring(0, 20)}
+                            </span>
+                          ))}
+                          {item.linked_tests.length > 3 && (
+                            <span className="text-[9px] text-zinc-500">+{item.linked_tests.length - 3} more</span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    {auditMode && (
+                      <span className="text-[9px] text-zinc-600 font-mono block mt-1">ID: {item.id}</span>
+                    )}
                   </div>
-                  {auditMode && (
-                    <span className="text-[9px] text-zinc-600 font-mono block mt-1">ID: {item.id}</span>
-                  )}
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="text-[9px] px-1.5 py-0.5 rounded border border-rose-950 bg-rose-950/20 text-rose-400">
-                    {item.risk_band || "HIGH"}
-                  </span>
-                  <span className="text-[10px] text-zinc-400">{item.suggested_action}</span>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="text-[9px] px-1.5 py-0.5 rounded border border-rose-950 bg-rose-950/20 text-rose-400">
+                      {item.risk_band || "HIGH"}
+                    </span>
+                    <span className="text-[10px] text-zinc-400">{item.suggested_action}</span>
+                  </div>
                 </div>
               </div>
             ));
           })()}
         </div>
       </div>
+
+      {/* ── 2.5. Already Verified Section ── */}
+      {(() => {
+        const alreadyVerifiedItems = regressionScope?.groups?.[ScopeGroup.EXCLUDED_ALREADY_VERIFIED]?.items ?? [];
+        // Fall back to execution-aware already-verified tests from the recommendation
+        const execVerified = alreadyVerifiedFromExecution ?? [];
+        if (alreadyVerifiedItems.length === 0 && execVerified.length === 0) return null;
+
+        // If scope has items, render them; otherwise render execution-aware tests
+        if (alreadyVerifiedItems.length === 0 && execVerified.length > 0) {
+          return (
+            <div id="already-verified" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-3">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+                <h2 className="text-lg font-bold text-white">Already Verified ({execVerified.length})</h2>
+              </div>
+              <p className="text-[11px] text-zinc-400">These tests already passed on the current PR head SHA. No re-run needed.</p>
+              <div className="space-y-2">
+                {execVerified.map((t: any, idx: number) => (
+                  <div key={t.stable_identity || idx} className="bg-zinc-950/40 border border-emerald-900/20 rounded-lg p-3 space-y-1">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1 flex-wrap">
+                          <span className="text-[10px] font-mono text-zinc-400">{t.suite_name}</span>
+                          <h4 className="text-xs font-semibold text-zinc-200">{t.display_name}</h4>
+                        </div>
+                        <p className="text-[11px] text-zinc-400">{t.reason}</p>
+                        {t.would_have_been_priority && (
+                          <span className="text-[9px] text-zinc-500">Would have been: {t.would_have_been_priority}</span>
+                        )}
+                        {t.evidence_path && t.evidence_path.length > 0 && (
+                          <div className="mt-1 flex flex-wrap gap-1">
+                            {t.evidence_path.map((step: any, sIdx: number) => (
+                              <span key={sIdx} className="text-[9px] font-mono bg-zinc-900 text-zinc-500 px-1.5 py-0.5 rounded border border-zinc-800/60">
+                                {step.step || step.edge_type || "evidence"}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <span className="text-[9px] px-1.5 py-0.5 rounded border border-emerald-950 bg-emerald-950/20 text-emerald-400 uppercase font-semibold">
+                          VERIFIED
+                        </span>
+                        <span className="text-[10px] text-zinc-400">NO RERUN NEEDED</span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        }
+
+        return (
+          <div id="already-verified" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-3">
+            <div className="flex items-center gap-2">
+              <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+              <h2 className="text-lg font-bold text-white">Already Verified ({alreadyVerifiedItems.length})</h2>
+            </div>
+            <div className="space-y-2">
+              {alreadyVerifiedItems.map((item: any, idx: number) => (
+                <div key={item.id || idx} className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg p-3 space-y-2">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-1 flex-wrap">
+                        <span className="text-[10px] font-mono text-zinc-400">{item.readable_id}</span>
+                        <h4 className="text-xs font-semibold text-zinc-200">{item.title}</h4>
+                      </div>
+                      {/* Phase 7: Show impact reason from change impact engine */}
+                      {item.reason && (
+                        <p className="text-[11px] text-zinc-400 mt-1 leading-relaxed">{item.reason}</p>
+                      )}
+                      {/* Phase 7: Show linked test evidence */}
+                      {item.linked_tests && item.linked_tests.length > 0 && (
+                        <div className="mt-2">
+                          <p className="text-[9px] text-zinc-500 font-medium uppercase tracking-wider mb-1">Verified by Tests ({item.linked_tests.length})</p>
+                          <div className="flex flex-wrap gap-1">
+                            {item.linked_tests.slice(0, 3).map((test: string, tIdx: number) => (
+                              <span key={tIdx} className="text-[9px] font-mono bg-emerald-950/20 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-800/40">
+                                {test.split("::").slice(-1)[0].substring(0, 20)}
+                              </span>
+                            ))}
+                            {item.linked_tests.length > 3 && (
+                              <span className="text-[9px] text-zinc-500">+{item.linked_tests.length - 3} more</span>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                      {auditMode && (
+                        <span className="text-[9px] text-zinc-600 font-mono block mt-1">ID: {item.id}</span>
+                      )}
+                      
+                      {/* Collapsible verifying test details */}
+                      {(() => {
+                        const itemEvidence = regressionScope?.evidence_items?.filter(
+                          (ev: any) => ev.requirement_id === item.source_ac_id || ev.requirement_id === item.id
+                        ) || [];
+                        if (itemEvidence.length === 0) return null;
+
+                        return (
+                          <div className="mt-2 pt-2 border-t border-zinc-800/40">
+                            <button
+                              onClick={() => toggleVerified(item.id)}
+                              className="text-[10px] font-semibold text-emerald-400 hover:text-emerald-300 transition-colors flex items-center gap-1"
+                            >
+                              <span>View verifying tests ({itemEvidence.length})</span>
+                              <ChevronDown className={`w-3.5 h-3.5 transition-transform ${expandedVerified.has(item.id) ? "rotate-180" : ""}`} />
+                            </button>
+                            {expandedVerified.has(item.id) && (
+                              <div className="mt-2 space-y-2 pl-2 border-l border-emerald-800/30">
+                                {itemEvidence.map((ev: any, evIdx: number) => (
+                                  <div key={evIdx} className="text-[11px] bg-zinc-950/60 p-2.5 rounded border border-zinc-800/50 space-y-1">
+                                    <div className="flex items-center justify-between gap-2">
+                                      <span className="font-mono text-zinc-350 font-medium break-all text-xs text-zinc-200">{ev.verifying_test}</span>
+                                      <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-950/30 text-emerald-400 border border-emerald-900/30 uppercase font-semibold">
+                                        {ev.test_status}
+                                      </span>
+                                    </div>
+                                    <p className="text-zinc-400 text-[10px] leading-relaxed">{ev.impact_reason}</p>
+                                    <div className="flex items-center gap-2 text-[9px] text-zinc-500">
+                                      <span>Freshness: {ev.test_freshness}</span>
+                                      <span>•</span>
+                                      <span>Bucket: {ev.final_bucket}</span>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="text-[9px] px-1.5 py-0.5 rounded border border-emerald-950 bg-emerald-950/20 text-emerald-400">
+                        VERIFIED
+                      </span>
+                      <span className="text-[10px] text-zinc-400">{item.execution_status} / {item.freshness_status}</span>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ── 2.5b. Failed Current PR Section ── */}
+      {failedCurrentPRTests.length > 0 && (
+        <div id="failed-current-pr" className="bg-zinc-900/30 border border-rose-800/40 rounded-xl p-5 space-y-3">
+          <div className="flex items-center gap-2">
+            <X className="w-5 h-5 text-rose-400" />
+            <h2 className="text-lg font-bold text-white">Failed Current PR ({failedCurrentPRTests.length})</h2>
+          </div>
+          <p className="text-[11px] text-zinc-400">These tests failed on the current PR head SHA. Investigate or block release.</p>
+          <div className="space-y-2">
+            {failedCurrentPRTests.map((t: any, idx: number) => (
+              <div key={t.stable_identity || idx} className="bg-zinc-950/40 border border-rose-900/30 rounded-lg p-3 space-y-1">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1 flex-wrap">
+                      <span className="text-[10px] font-mono text-zinc-400">{t.suite_name}</span>
+                      <h4 className="text-xs font-semibold text-zinc-200">{t.display_name}</h4>
+                    </div>
+                    <p className="text-[11px] text-zinc-400">{t.reason}</p>
+                    {t.evidence_path && t.evidence_path.length > 0 && (
+                      <div className="mt-1 flex flex-wrap gap-1">
+                        {t.evidence_path.map((step: any, sIdx: number) => (
+                          <span key={sIdx} className="text-[9px] font-mono bg-zinc-900 text-zinc-500 px-1.5 py-0.5 rounded border border-zinc-800/60">
+                            {step.step || step.edge_type || "evidence"}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="text-[9px] px-1.5 py-0.5 rounded border border-rose-950 bg-rose-950/20 text-rose-400 uppercase font-semibold">
+                      FAILED
+                    </span>
+                    <span className="text-[10px] text-zinc-400">{t.active_action?.replace(/_/g, " ")}</span>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── 2.5c. Stale Rerun Required Section ── */}
+      {staleRerunTests.length > 0 && (
+        <div id="stale-rerun" className="bg-zinc-900/30 border border-amber-800/40 rounded-xl p-5 space-y-3">
+          <div className="flex items-center gap-2">
+            <Clock className="w-5 h-5 text-amber-400" />
+            <h2 className="text-lg font-bold text-white">Stale Rerun Required ({staleRerunTests.length})</h2>
+          </div>
+          <p className="text-[11px] text-zinc-400">These tests passed on an older commit SHA, not the current PR head. Re-run to verify.</p>
+          <div className="space-y-2">
+            {staleRerunTests.map((t: any, idx: number) => (
+              <div key={t.stable_identity || idx} className="bg-zinc-950/40 border border-amber-900/30 rounded-lg p-3 space-y-1">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1 flex-wrap">
+                      <span className="text-[10px] font-mono text-zinc-400">{t.suite_name}</span>
+                      <h4 className="text-xs font-semibold text-zinc-200">{t.display_name}</h4>
+                    </div>
+                    <p className="text-[11px] text-zinc-400">{t.reason}</p>
+                    {t.would_have_been_priority && (
+                      <span className="text-[9px] text-zinc-500">Original priority: {t.would_have_been_priority}</span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="text-[9px] px-1.5 py-0.5 rounded border border-amber-950 bg-amber-950/20 text-amber-400 uppercase font-semibold">
+                      STALE
+                    </span>
+                    <span className="text-[10px] text-zinc-400">RUN NOW</span>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── 2.5d. Mapping Review Needed Section ── */}
+      {mappingReviewTests.length > 0 && (
+        <div id="mapping-review-needed" className="bg-zinc-900/30 border border-blue-800/40 rounded-xl p-5 space-y-3">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-5 h-5 text-blue-400" />
+            <h2 className="text-lg font-bold text-white">Mapping Review Needed ({mappingReviewTests.length})</h2>
+          </div>
+          <p className="text-[11px] text-zinc-400">These tests have unconfirmed AC → Test mappings. Confirm the mapping before claiming confident coverage.</p>
+          <div className="space-y-2">
+            {mappingReviewTests.map((t: any, idx: number) => (
+              <div key={t.stable_identity || idx} className="bg-zinc-950/40 border border-blue-900/30 rounded-lg p-3 space-y-1">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1 flex-wrap">
+                      <span className="text-[10px] font-mono text-zinc-400">{t.suite_name}</span>
+                      <h4 className="text-xs font-semibold text-zinc-200">{t.display_name}</h4>
+                    </div>
+                    <p className="text-[11px] text-zinc-400">{t.reason}</p>
+                    {t.mapping_uncertainty && (
+                      <span className="text-[9px] text-blue-400 bg-blue-950/20 px-1.5 py-0.5 rounded border border-blue-900/30">
+                        review_status: {t.mapping_uncertainty}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="text-[9px] px-1.5 py-0.5 rounded border border-blue-950 bg-blue-950/20 text-blue-400 uppercase font-semibold">
+                      REVIEW
+                    </span>
+                    <span className="text-[10px] text-zinc-400">CONFIRM MAPPING</span>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Collapsible View Evidence Section */}
+      {regressionScope?.evidence_items && regressionScope.evidence_items.length > 0 && (
+        <div id="view-evidence" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Shield className="w-5 h-5 text-emerald-400" />
+              <h2 className="text-lg font-bold text-white">View Verification Evidence ({regressionScope.evidence_items.length})</h2>
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setShowEvidence(!showEvidence)}
+              className="text-xs font-semibold text-zinc-400 hover:text-white"
+            >
+              {showEvidence ? "Hide Details" : "Show Details"}
+            </Button>
+          </div>
+          {showEvidence && (
+            <div className="space-y-3 pt-2">
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse text-[11px] font-sans">
+                  <thead>
+                    <tr className="border-b border-zinc-850 text-zinc-500 font-semibold uppercase tracking-wider">
+                      <th className="py-2.5 px-3 text-[10px] text-zinc-400">Requirement</th>
+                      <th className="py-2.5 px-3 text-[10px] text-zinc-400">Verifying Test</th>
+                      <th className="py-2.5 px-3 text-[10px] text-zinc-400">Status / Freshness</th>
+                      <th className="py-2.5 px-3 text-[10px] text-zinc-400">Justification</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-zinc-850">
+                    {regressionScope.evidence_items.map((ev: any, evIdx: number) => (
+                      <tr key={evIdx} className="hover:bg-zinc-900/25">
+                        <td className="py-3 px-3">
+                          <div className="font-semibold text-zinc-205">{ev.requirement_title}</div>
+                          <div className="text-[9px] font-mono text-zinc-500">{ev.requirement_id}</div>
+                        </td>
+                        <td className="py-3 px-3 font-mono text-zinc-350">{ev.verifying_test}</td>
+                        <td className="py-3 px-3">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-950/20 text-emerald-400 border border-emerald-900/30 uppercase font-semibold">
+                              {ev.test_status}
+                            </span>
+                            <span className="text-[9px] px-1.5 py-0.5 rounded bg-zinc-900 text-zinc-400 border border-zinc-805 uppercase font-semibold">
+                              {ev.test_freshness}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="py-3 px-3 text-zinc-400 leading-relaxed max-w-xs">{ev.impact_reason}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── 2.6. Recommended Tests Section (Phase 8) ── */}
+      {(() => {
+        const recommendations = regressionScope?.recommendations ?? [];
+        if (recommendations.length === 0) return null;
+
+        return (
+          <div id="recommended-tests" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-4">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Lightbulb className="w-5 h-5 text-amber-400" />
+                <h2 className="text-lg font-bold text-white">Test Gaps ({recommendations.length})</h2>
+              </div>
+              <span className="text-[10px] text-zinc-500 uppercase tracking-wider">
+                Missing test coverage
+              </span>
+            </div>
+            <div className="space-y-3">
+              {recommendations.map((rec: any, idx: number) => (
+                <div key={rec.id || idx} className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg p-4 space-y-3">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-2 flex-wrap">
+                        <span className={`text-[9px] px-2 py-0.5 rounded font-semibold uppercase ${
+                          rec.source === 'COVERAGE_GAP' ? 'bg-rose-950/20 text-rose-400 border border-rose-800/40' :
+                          rec.source === 'REQUIREMENT_GAP' ? 'bg-amber-950/20 text-amber-400 border border-amber-800/40' :
+                          'bg-blue-950/20 text-blue-400 border border-blue-800/40'
+                        }`}>
+                          {rec.source.replace('_', ' ')}
+                        </span>
+                        <span className={`text-[9px] px-2 py-0.5 rounded font-semibold ${
+                          rec.priority === 1 ? 'bg-rose-950/20 text-rose-400' :
+                          rec.priority === 2 ? 'bg-amber-950/20 text-amber-400' :
+                          'bg-zinc-950/20 text-zinc-400'
+                        }`}>
+                          Priority {rec.priority}
+                        </span>
+                        <span className="text-[9px] text-zinc-500">
+                          Effort: {rec.estimated_effort}
+                        </span>
+                      </div>
+                      <h4 className="text-sm font-semibold text-zinc-200 mb-2">{rec.title}</h4>
+                      
+                      <div className="flex items-center gap-2 mt-2 mb-2">
+                        <button
+                          onClick={() => toggleRationale(rec.id)}
+                          className="text-[10px] font-semibold text-amber-400 hover:text-amber-300 transition-colors flex items-center gap-1"
+                        >
+                          <span>Why this matters</span>
+                          <ChevronDown className={`w-3.5 h-3.5 transition-transform ${expandedRationales.has(rec.id) ? "rotate-180" : ""}`} />
+                        </button>
+                      </div>
+                      {expandedRationales.has(rec.id) && (
+                        <div className="mb-2 text-[11px] bg-amber-950/15 border border-amber-900/30 text-amber-200/90 rounded-lg p-3 leading-relaxed">
+                          {rec.risk_rationale}
+                        </div>
+                      )}
+
+                      {rec.detailed_scenario ? (
+                        <div className="mt-3 bg-zinc-900/80 rounded-lg p-3.5 border border-zinc-800/80 space-y-2">
+                          <div className="grid grid-cols-2 gap-3 text-[11px]">
+                            <div>
+                              <span className="text-zinc-500 font-medium block uppercase tracking-wider text-[9px] mb-0.5">Precondition</span>
+                              <span className="text-zinc-300 leading-relaxed block">{rec.detailed_scenario.precondition}</span>
+                            </div>
+                            <div>
+                              <span className="text-zinc-500 font-medium block uppercase tracking-wider text-[9px] mb-0.5">Validation Layer</span>
+                              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[9px] font-medium bg-purple-950/40 text-purple-400 border border-purple-800/40">
+                                {rec.detailed_scenario.test_layer}
+                              </span>
+                            </div>
+                          </div>
+                          <div className="border-t border-zinc-800/50 pt-2 grid grid-cols-1 md:grid-cols-2 gap-3 text-[11px]">
+                            <div>
+                              <span className="text-zinc-500 font-medium block uppercase tracking-wider text-[9px] mb-0.5">Test Input</span>
+                              <code className="text-amber-400 font-mono bg-zinc-950/60 px-1.5 py-0.5 rounded border border-zinc-800/30 break-all block leading-relaxed mt-0.5">
+                                {rec.detailed_scenario.test_input}
+                              </code>
+                            </div>
+                            <div>
+                              <span className="text-zinc-500 font-medium block uppercase tracking-wider text-[9px] mb-0.5">Expected Result</span>
+                              <span className="text-emerald-400 leading-relaxed block mt-0.5">{rec.detailed_scenario.expected_result}</span>
+                            </div>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="bg-zinc-900/50 rounded p-3 border border-zinc-800/30">
+                          <p className="text-[9px] text-zinc-500 font-medium uppercase tracking-wider mb-1">Suggested Test Scenario</p>
+                          <p className="text-[11px] text-zinc-300 leading-relaxed">{rec.suggested_test_scenario}</p>
+                        </div>
+                      )}
+                      
+                      {rec.linked_file && (
+                        <p className="text-[10px] text-zinc-500 mt-2">
+                          Linked file: <span className="font-mono">{rec.linked_file.split('/').slice(-1)}</span>
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ── 3. Regression Scope Plan Section ── */}
       <div id="regression-scope-plan" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-4">
@@ -2473,7 +3391,14 @@ export default function RecommendationDetailPage({ params }: PageProps) {
             <Button
               variant={scopeMode === "targeted" ? "default" : "ghost"}
               size="sm"
-              onClick={() => setScopeMode("targeted")}
+              onClick={() => {
+                console.log("SCOPE_MODE_CLICK_FIRED", {
+                  clickedMode: "targeted",
+                  previousMode: scopeMode,
+                  timestamp: new Date().toISOString(),
+                });
+                setScopeMode("targeted");
+              }}
               className="text-[10px] py-1 px-2.5"
             >
               Targeted Mode
@@ -2481,23 +3406,42 @@ export default function RecommendationDetailPage({ params }: PageProps) {
             <Button
               variant={scopeMode === "risk_based" ? "default" : "ghost"}
               size="sm"
-              onClick={() => setScopeMode("risk_based")}
+              onClick={() => {
+                console.log("SCOPE_MODE_CLICK_FIRED", {
+                  clickedMode: "risk_based",
+                  previousMode: scopeMode,
+                  timestamp: new Date().toISOString(),
+                });
+                setScopeMode("risk_based");
+              }}
               className="text-[10px] py-1 px-2.5"
             >
-              Risk-based Mode
+              Risk-Based Mode
             </Button>
             <Button
-              variant={scopeMode === "full" ? "default" : "ghost"}
+              variant={scopeMode === "full_suite" ? "default" : "ghost"}
               size="sm"
-              onClick={() => setScopeMode("full")}
+              onClick={() => {
+                console.log("SCOPE_MODE_CLICK_FIRED", {
+                  clickedMode: "full_suite",
+                  previousMode: scopeMode,
+                  timestamp: new Date().toISOString(),
+                });
+                setScopeMode("full_suite");
+              }}
               className="text-[10px] py-1 px-2.5"
             >
-              Full Mode
+              Full Suite
             </Button>
           </div>
         </div>
 
-        {regressionScopeError ? (
+        {scopeLoading ? (
+          <div className="flex items-center justify-center py-8">
+            <Loader2 className="w-6 h-6 text-zinc-400 animate-spin" />
+            <span className="ml-2 text-xs text-zinc-400">Loading regression scope...</span>
+          </div>
+        ) : regressionScopeError ? (
           <div className="bg-rose-950/20 border border-rose-800/40 rounded-lg p-4 space-y-2">
             <p className="text-xs text-rose-300 font-medium">Unable to load optimized regression scope</p>
             {regressionScopeErrorMessage && (
@@ -2511,6 +3455,14 @@ export default function RecommendationDetailPage({ params }: PageProps) {
               scope={regressionScope} 
               showSafeToSkip={showSafeToSkip} 
               auditMode={auditMode}
+              onModeChange={(mode) => {
+                console.log("SCOPE_MODE_CLICK_FIRED", {
+                  clickedMode: mode,
+                  previousMode: scopeMode,
+                  timestamp: new Date().toISOString(),
+                });
+                setScopeMode(mode);
+              }}
             />
             <div className="flex items-center gap-2">
               <input
@@ -2604,7 +3556,49 @@ export default function RecommendationDetailPage({ params }: PageProps) {
           <h2 className="text-lg font-bold text-white">Coverage & Traceability</h2>
         </div>
 
-        <WhatVeriscopeUnderstood {...extractUnderstandingData(run)} />
+        {/* Phase 7: Use unified traceability summary from regression scope */}
+        {regressionScope?.traceability_summary ? (
+          <div className="grid grid-cols-4 gap-3">
+            <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30 text-center">
+              <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Total ACs</p>
+              <p className="text-xl font-bold text-zinc-200">{regressionScope.traceability_summary.total_requirements}</p>
+            </div>
+            <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30 text-center">
+              <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Covered</p>
+              <p className="text-xl font-bold text-emerald-400">{regressionScope.traceability_summary.covered}</p>
+            </div>
+            <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30 text-center">
+              <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Missing</p>
+              <p className="text-xl font-bold text-rose-400">{regressionScope.traceability_summary.missing}</p>
+            </div>
+            <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30 text-center">
+              <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Not Mapped</p>
+              <p className="text-xl font-bold text-amber-400">{regressionScope.traceability_summary.not_mapped}</p>
+            </div>
+          </div>
+        ) : null}
+
+        <WhatVeriscopeUnderstood 
+          {...extractUnderstandingData(run)} 
+          fileImpactMap={regressionEvidence?.fileImpactMap}
+        />
+
+        {/* ── Behavior-Based Ranking Reasoning ── */}
+        {(() => {
+          const behaviorReasons: string[] = impact_profile?.behavior_based_reasons || [];
+          const impactedBehaviors: any[] = impact_profile?.impacted_behaviors || [];
+          const covSummary = impact_profile?.behavior_coverage_summary || {};
+          const ctxStatus: string | null = impact_profile?.behavior_context_status || null;
+          if (!impactedBehaviors.length && !behaviorReasons.length) return null;
+          return (
+            <BehaviorRankingReasoningPanel
+              impactedBehaviors={impactedBehaviors}
+              behaviorReasons={behaviorReasons}
+              coverageSummary={covSummary}
+              contextStatus={ctxStatus}
+            />
+          );
+        })()}
 
         <div className="space-y-2 mt-4">
           {(() => {
@@ -2726,15 +3720,17 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         </div>
 
         {(() => {
-          const reqItems = regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items ||
-                           (mustRun.length > 0 ? mustRun.map((t: any) => ({
-                             id: t.stable_identity,
-                             readable_id: "AC-REQ-1",
-                             title: t.display_name,
-                             effective_risk_level: "HIGH",
-                             risk_band: "CRITICAL",
-                             suggested_action: "Execute test"
-                           })) : []);
+          const rawRequiredItems = regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items ?? [];
+          const reqItems = rawRequiredItems.filter((item: any) => {
+            const releaseAction = item.release_action ?? item.releaseAction;
+            const executionStatus = item.execution_status ?? item.executionStatus;
+            const freshnessStatus = item.freshness_status ?? item.freshnessStatus;
+
+            if (releaseAction === "NONE") return false;
+            if (executionStatus === "PASSED" && freshnessStatus === "FRESH") return false;
+
+            return true;
+          });
           const hasRequiredItems = reqItems.length > 0;
 
           if (hasRequiredItems) {
@@ -2902,11 +3898,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
       {/* CI/CD Pipeline Runs */}
       <CICDPipelineRunsPanel 
         pipelineRuns={pipelineRuns}
-        hasRequiredItems={
-          (regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items?.length || 0) > 0 ||
-          mustRun.length > 0
-        }
-        isApproved={(releaseDecision?.decisionStatus || "PENDING") === "APPROVED"}
+        gateStatus={readinessData?.gate_status || "UNKNOWN"}
       />
 
       {/* Feedback Footer */}
@@ -2934,11 +3926,11 @@ export default function RecommendationDetailPage({ params }: PageProps) {
       )}
 
       {run.repository && (
-        <PasteAcceptanceCriteriaModal
+        <BusinessRequirementsModal
           isOpen={isPasteModalOpen}
           onClose={() => setIsPasteModalOpen(false)}
           onSuccess={(updatedReadiness) => {
-            toast.success("Acceptance Criteria Saved", {
+            toast.success("Business Requirements Saved", {
               description: "Readiness has been recalculated and recommendation details refreshed."
             });
             if (runId) {

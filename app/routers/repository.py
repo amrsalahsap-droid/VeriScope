@@ -92,6 +92,7 @@ async def upload_test_history(
     branch: Optional[str] = Form(None),
     run_name: Optional[str] = Form(None),
     source: str = Form(EvidenceSource.MANUAL_UPLOAD.value),
+    import_mode: Optional[str] = Form("INVENTORY_ONLY"),
     db: Session = Depends(get_db),
     workspace_id: str = Depends(get_current_workspace_id)
 ):
@@ -150,7 +151,8 @@ async def upload_test_history(
             repository_id=repository_id,
             commit_sha=commit_sha,
             evidence_source=source,
-            branch=branch
+            branch=branch,
+            import_mode=import_mode or "INVENTORY_ONLY"
         )
     except OversizedXMLException as e:
         raise HTTPException(
@@ -168,17 +170,37 @@ async def upload_test_history(
             detail=f"Ingestion pipeline failure: {str(e)}"
         )
     
+    # 6. For INVENTORY_ONLY mode, duplicate coalescing is allowed (idempotent inventory update)
+    if import_mode == "INVENTORY_ONLY" or test_run is None:
+        readiness_service = RepositoryReadinessService(db)
+        readiness_result = readiness_service.calculate_readiness(repository_id, UUID(workspace_id))
+        
+        return {
+            "import_mode": "INVENTORY_ONLY",
+            "test_run_id": None,
+            "status": "INVENTORY_UPDATED",
+            "message": "Test case inventory updated successfully",
+            "duplicate_coalesced": duplicate_coalesced,
+            "repository_readiness": {
+                "readiness_state": readiness_result.readiness_state,
+                "readiness_reasons": readiness_result.readiness_reasons,
+                "next_action": readiness_result.next_action
+            }
+        }
+    
+    # 7. For execution modes, reject duplicate artifacts
     if duplicate_coalesced:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Duplicate test run artifact detected. This JUnit XML file has already been uploaded."
         )
     
-    # 6. Recalculate repository readiness
+    # 8. Recalculate repository readiness for execution modes
     readiness_service = RepositoryReadinessService(db)
     readiness_result = readiness_service.calculate_readiness(repository_id, UUID(workspace_id))
     
     return {
+        "import_mode": import_mode,
         "test_run_id": str(test_run.id),
         "tests_total": test_run.total_tests,
         "tests_passed": test_run.passed_tests,
@@ -907,7 +929,87 @@ def create_recommendation(
             headers={"X-Error-Code": "REPOSITORY_NOT_READY"}
         )
 
-    # 6. Run recommendation engine with debug logging
+    # 6. Determine generation mode and enforce strict gating for confident mode
+    generation_mode = (payload.mode if payload and payload.mode else None) or "confident"
+    if generation_mode not in ("draft", "confident"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "INVALID_GENERATION_MODE",
+                "message": "Generation mode must be 'draft' or 'confident'.",
+                "allowed_modes": ["draft", "confident"]
+            }
+        )
+
+    if generation_mode == "confident":
+        try:
+            from app.services.input_readiness_v2_service import InputReadinessV2Service
+            v2_readiness = InputReadinessV2Service(db).calculate_readiness(
+                repository_id=repository_id,
+                pull_request_id=pull_request_id
+            )
+
+            if not v2_readiness.can_generate_confident:
+                blocking = getattr(v2_readiness, 'blocking_inputs', []) or []
+                partial = getattr(v2_readiness, 'partial_inputs', []) or []
+                primary_reason = getattr(v2_readiness, 'primary_reason', "") or ""
+
+                # Build a human-readable reason
+                if not primary_reason:
+                    input5 = (v2_readiness.inputs or {}).get("INPUT_5")
+                    if input5 and input5.status in ("MISSING", "PARTIAL", "REVIEW_NEEDED"):
+                        primary_reason = "AC \u2192 Test Mapping is partial and unconfirmed."
+                    elif not v2_readiness.can_generate_draft:
+                        primary_reason = "Minimum inputs required for draft generation are missing."
+                    else:
+                        primary_reason = "Confident generation is not allowed with current readiness state."
+
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "error": "CONFIDENT_GENERATION_NOT_ALLOWED",
+                        "reason": primary_reason,
+                        "allowed_modes": ["draft"] if v2_readiness.can_generate_draft else [],
+                        "blocking_inputs": blocking,
+                        "partial_inputs": partial,
+                        "generation_status": getattr(v2_readiness, 'generation_status', None),
+                    }
+                )
+        except HTTPException:
+            raise
+        except Exception as _readiness_exc:
+            import logging
+            logging.getLogger("veriscope.repository_router").warning(
+                f"InputReadinessV2 check failed for confident generation (non-fatal): {_readiness_exc}"
+            )
+
+    # Enforce minimum: draft requires at least Input 1 (PR package)
+    if generation_mode == "draft":
+        try:
+            from app.services.input_readiness_v2_service import InputReadinessV2Service
+            v2_readiness_draft = InputReadinessV2Service(db).calculate_readiness(
+                repository_id=repository_id,
+                pull_request_id=pull_request_id
+            )
+            if not v2_readiness_draft.can_generate_draft:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "error": "DRAFT_GENERATION_NOT_ALLOWED",
+                        "reason": "Minimum inputs (PR package) required for draft generation are missing.",
+                        "allowed_modes": [],
+                        "blocking_inputs": getattr(v2_readiness_draft, 'blocking_inputs', []) or [],
+                    }
+                )
+        except HTTPException:
+            raise
+        except Exception as _draft_exc:
+            import logging
+            logging.getLogger("veriscope.repository_router").warning(
+                f"InputReadinessV2 draft check failed (non-fatal): {_draft_exc}"
+            )
+
+    # 7. Run recommendation engine with debug logging
     svc = RecommendationService(db)
     readiness_acknowledged = payload.readiness_acknowledged if payload else False
 
@@ -964,7 +1066,8 @@ def create_recommendation(
                 readiness_acknowledged=readiness_acknowledged,
                 readiness_snapshot=readiness_snapshot,
                 generated_from_repository_id=repository_id,
-                generated_from_pull_request_id=pull_request_id
+                generated_from_pull_request_id=pull_request_id,
+                generation_mode=generation_mode,
             )
         )
         
@@ -1105,6 +1208,7 @@ async def upload_pr_test_run(
             pull_request_id=pull_request_id,
             ingestion_reason="PR_MANUAL_UPLOAD",
             evidence_source=source,
+            branch=branch,
             run_name=run_name
         )
         
@@ -1240,11 +1344,15 @@ def add_pr_acceptance_criteria(
 
 
 class ManualAcceptanceCriteriaSubmit(BaseModel):
-    business_change: str
+    business_change: Optional[str] = None
     affected_users: Optional[str] = None
-    acceptance_criteria: str
+    acceptance_criteria: Optional[str] = None
     risk_notes: Optional[str] = None
     testing_notes: Optional[str] = None
+    # Grouped requirements support
+    business_change_summary: Optional[str] = None
+    affected_users_or_journeys: Optional[str] = None
+    requirement_groups: Optional[List[Dict[str, Any]]] = None
 
 
 class ManualAcceptanceCriteriaResponse(BaseModel):
@@ -1326,16 +1434,24 @@ def add_pr_acceptance_criteria_manual(
         BusinessIntentOverride.is_active == True
     ).update({"is_active": False})
 
-    # 3. Create and add a new BusinessIntentOverride
+    # 3. Determine if grouped requirements are provided
+    use_grouped_requirements = payload.requirement_groups is not None and len(payload.requirement_groups) > 0
+    
+    # Use the appropriate field names based on input type
+    business_change_summary = payload.business_change_summary or payload.business_change or ""
+    affected_users_or_journeys = payload.affected_users_or_journeys or payload.affected_users or ""
+    risk_notes = payload.risk_notes or ""
+    
+    # 4. Create and add a new BusinessIntentOverride
     bio = BusinessIntentOverride(
         id=uuid.uuid4(),
         repository_id=repository_id,
         pull_request_id=pull_request_id,
-        business_change_summary=payload.business_change,
-        affected_users_journeys=payload.affected_users,
-        risk_notes=payload.risk_notes,
+        business_change_summary=business_change_summary,
+        affected_users_journeys=affected_users_or_journeys,
+        risk_notes=risk_notes,
         testing_notes=payload.testing_notes,
-        acceptance_criteria=payload.acceptance_criteria,
+        acceptance_criteria=payload.acceptance_criteria or "",
         source="MANUAL_USER_INPUT",
         is_active=True,
         is_processed=True,
@@ -1345,62 +1461,382 @@ def add_pr_acceptance_criteria_manual(
     db.add(bio)
     db.flush()
 
-    # 4. Extract and persist AcceptanceCriterion records (for readiness check)
+    # 5. Extract and persist AcceptanceCriterion records (for readiness check)
     extractor = AcceptanceCriteriaExtractor(db=db)
     
-    # Extract criteria from the pasted text (with validation)
-    criteria, excluded_fragments = extractor._extract_criteria_from_text(payload.acceptance_criteria, "MANUAL_USER_INPUT")
-    
-    if not criteria:
-        # Fallback to treat lines as criteria (but still validate)
-        raw_lines = payload.acceptance_criteria.split("\n")
-        for line in raw_lines:
-            line = line.strip()
-            if not line:
-                continue
-            clean_text = re.sub(r"^(\s*[-*\d\.]+\s+)", "", line)
-            if clean_text:
-                # Validate before adding
-                is_valid, reason = extractor._is_valid_acceptance_criterion(clean_text)
-                if is_valid:
-                    criteria.append({
-                        "text": clean_text,
-                        "source": "MANUAL_USER_INPUT",
-                        "confidence": 1.0,
-                        "evidence_excerpt": line,
-                        "normalized_key": extractor._generate_normalized_key(extractor._normalize_text(clean_text)),
-                        "criterion_type": extractor._classify_criterion_type(clean_text)
-                    })
-                else:
-                    excluded_fragments.append({
-                        "text": clean_text,
-                        "reason": reason,
-                        "source": "MANUAL_USER_INPUT"
-                    })
-                
-    # Normalize and deduplicate (this generates labels)
-    criteria = extractor._normalize_and_deduplicate(criteria)
-    
-    # Classify criterion types
-    for criterion in criteria:
-        criterion["criterion_type"] = extractor._classify_criterion_type(criterion["text"])
+    if use_grouped_requirements:
+        # Handle grouped requirements - persist as hierarchical structure
+        from app.models.requirement_package import RequirementPackage
+        from app.models.requirement_group import RequirementGroup
         
-    persisted_ac = []
-    all_excluded = excluded_fragments
-    if criteria:
-        persisted_ac, excluded = extractor.persist_criteria(criteria, str(repository_id), str(pull_request_id), db)
-        all_excluded = excluded_fragments + excluded
+        # Delete existing requirement package for this PR
+        existing_pkg = db.query(RequirementPackage).filter(
+            RequirementPackage.repository_id == repository_id,
+            RequirementPackage.pull_request_id == pull_request_id
+        ).first()
+        if existing_pkg:
+            db.delete(existing_pkg)
+            db.flush()
+        
+        # Create new requirement package with separated sections
+        pkg = RequirementPackage(
+            id=uuid.uuid4(),
+            repository_id=repository_id,
+            pull_request_id=pull_request_id,
+            source_type="MANUAL_USER_INPUT",
+            source_id=str(bio.id),
+            package_version="1.0.0",
+            status="NEEDS_REVIEW",
+            business_change_summary=business_change_summary,
+            affected_journeys=None,  # Will be populated from payload
+            risk_notes=risk_notes,
+            invalid_test_data_examples=None,
+            valid_test_data_examples=None,
+            security_notes=None,
+            integration_notes=None,
+            out_of_scope_notes=None
+        )
+        db.add(pkg)
+        db.flush()
+        
+        # Create requirement groups and acceptance criteria
+        persisted_ac = []
+        all_excluded = []
+        
+        for group_idx, group_data in enumerate(payload.requirement_groups):
+            group_number = group_idx + 1
+            group_title = group_data.get("title", f"Group {group_number}")
+            group_type = group_data.get("group_type", "ENHANCEMENT")
+            business_flow = group_data.get("business_flow")
+            risk_level = group_data.get("risk_level")
+            acceptance_criteria_data = group_data.get("acceptance_criteria", [])
+            
+            # Generate stable group key
+            group_slug = re.sub(r"[^a-z0-9]+", "-", group_title.lower()).strip("-")
+            stable_group_key = f"repo:{repository_id}:pr:{pull_request_id}:group:{group_slug}:source:manual"
+            
+            # Create requirement group
+            req_group = RequirementGroup(
+                id=uuid.uuid4(),
+                requirement_package_id=pkg.id,
+                pull_request_id=pull_request_id,
+                group_number=group_number,
+                group_type=group_type,
+                stable_group_key=stable_group_key,
+                title=group_title,
+                description=group_data.get("description"),
+                business_flow=business_flow,
+                priority=group_data.get("priority"),
+                risk_level=risk_level,
+                source_type="MANUAL_USER_INPUT",
+                status="ACTIVE"
+            )
+            db.add(req_group)
+            db.flush()
+            
+            # Create acceptance criteria for this group
+            INVALID_AC_PREFIXES = (
+                "business change:", "business summary:", "affected journeys:",
+                "affected users:", "affected flows:", "invalid test data",
+                "valid test data", "security notes:", "security:", "risk notes:",
+                "integration notes:", "api notes:", "out of scope:", "not in scope:",
+                "notes:", "assumptions:",
+            )
+            for ac_idx, ac_data in enumerate(acceptance_criteria_data):
+                # Preserve the original uploaded AC number when the client
+                # supplied one; only fall back to positional order when the
+                # source number is genuinely unknown (e.g. manually added AC).
+                explicit_source_number = ac_data.get("source_number")
+                if isinstance(explicit_source_number, str) and explicit_source_number.strip().isdigit():
+                    explicit_source_number = int(explicit_source_number.strip())
+                source_order = explicit_source_number if isinstance(explicit_source_number, int) else len(persisted_ac) + 1
+                ac_title = ac_data.get("title", "")
+                ac_description = ac_data.get("description", "")
+                ac_source_type = ac_data.get("source_type", "MANUAL")
+                ac_status = ac_data.get("status", "ACTIVE")
+                
+                if not ac_title or len(ac_title.strip()) < 5:
+                    continue
+                
+                # Guard: reject lines that are section headers or known non-AC content
+                ac_title_lower = ac_title.strip().lower()
+                if any(ac_title_lower.startswith(prefix) for prefix in INVALID_AC_PREFIXES):
+                    import logging as _aclog
+                    _aclog.getLogger("veriscope.ac_guard").warning(
+                        "INVALID_AC_CLASSIFICATION rejected: %s", ac_title[:80]
+                    )
+                    continue
+                
+                # Generate stable AC key scoped to group
+                ac_slug = re.sub(r"[^a-z0-9]+", "-", ac_title.lower()).strip("-")
+                stable_ac_key = f"{stable_group_key}:ac:{ac_slug}"
+                
+                # Create acceptance criterion
+                ac = AcceptanceCriterion(
+                    id=uuid.uuid4(),
+                    repository_id=repository_id,
+                    pull_request_id=pull_request_id,
+                    requirement_group_id=req_group.id,
+                    source_number=source_order,
+                    ac_number=source_order,
+                    stable_ac_key=stable_ac_key,
+                    title=ac_title,
+                    description=ac_description,
+                    raw_text=ac_title,
+                    normalized_text=ac_title.lower().strip(),
+                    source_type=ac_source_type,
+                    status=ac_status,
+                    text=ac_title,
+                    normalized_key=stable_ac_key,
+                    source="MANUAL_USER_INPUT",
+                    confidence=1.0,
+                    criterion_type="FUNCTIONAL"
+                )
+                db.add(ac)
+                persisted_ac.append(ac)
+        
+        db.flush()
+    else:
+        # Use section-aware parser for flat text mode
+        sections = extractor.parse_business_requirements_sections(payload.acceptance_criteria)
+        
+        # Update business intent override with separated sections
+        bio.business_change_summary = sections.get("business_change_summary") or business_change_summary
+        bio.affected_users_journeys = "\n".join(sections.get("affected_journeys", [])) or affected_users_or_journeys
+        bio.risk_notes = sections.get("risk_notes") or risk_notes
+        
+        # Create requirement package with separated sections
+        from app.models.requirement_package import RequirementPackage
+        from app.models.requirement_group import RequirementGroup
+        
+        # Delete existing requirement package for this PR
+        existing_pkg = db.query(RequirementPackage).filter(
+            RequirementPackage.repository_id == repository_id,
+            RequirementPackage.pull_request_id == pull_request_id
+        ).first()
+        if existing_pkg:
+            db.delete(existing_pkg)
+            db.flush()
+        
+        # Create new requirement package with separated sections
+        pkg = RequirementPackage(
+            id=uuid.uuid4(),
+            repository_id=repository_id,
+            pull_request_id=pull_request_id,
+            source_type="MANUAL_USER_INPUT",
+            source_id=str(bio.id),
+            package_version="1.0.0",
+            status="NEEDS_REVIEW",
+            business_change_summary=sections.get("business_change_summary") or business_change_summary,
+            affected_journeys=sections.get("affected_journeys") or [],
+            risk_notes=sections.get("risk_notes") or risk_notes,
+            invalid_test_data_examples=sections.get("invalid_test_data_examples") or [],
+            valid_test_data_examples=sections.get("valid_test_data_examples") or [],
+            security_notes=sections.get("security_notes") or [],
+            integration_notes=sections.get("integration_notes"),
+            out_of_scope_notes=sections.get("out_of_scope_notes")
+        )
+        db.add(pkg)
+        db.flush()
+        
+        # Extract only acceptance criteria from the parsed sections
+        ac_texts = sections.get("acceptance_criteria", [])
+        
+        # Convert to criteria format
+        criteria = []
+        for source_order, ac_text in enumerate(ac_texts, start=1):
+            explicit_ref = re.match(r"^\s*AC[-\s]?(\d+)\s*[:.)-]?\s*", ac_text, re.IGNORECASE)
+            display_number = int(explicit_ref.group(1)) if explicit_ref else source_order
+            normalized_ac_text = ac_text[explicit_ref.end():].strip() if explicit_ref else ac_text
+            is_valid, reason = extractor._is_valid_acceptance_criterion(normalized_ac_text)
+            if is_valid:
+                criteria.append({
+                    "source_order": source_order,
+                    "display_number": display_number,
+                    "text": normalized_ac_text,
+                    "source": "MANUAL_USER_INPUT",
+                    "confidence": 1.0,
+                    "evidence_excerpt": ac_text,
+                    "normalized_key": extractor._generate_normalized_key(extractor._normalize_text(ac_text)),
+                    "criterion_type": extractor._classify_criterion_type(ac_text)
+                })
+        
+        # Normalize and deduplicate
+        criteria = extractor._normalize_and_deduplicate(criteria)
+        
+        # Classify criterion types
+        for criterion in criteria:
+            criterion["criterion_type"] = extractor._classify_criterion_type(criterion["text"])
+        
+        # Persist criteria using intelligent grouping based on affected journeys
+        persisted_ac = []
+        all_excluded = []
+        
+        if criteria:
+            # Intelligent grouping based on affected journeys
+            affected_journeys = sections.get("affected_journeys", [])
+            
+            if affected_journeys:
+                # Create groups based on affected journeys
+                group_records = {}
+                for journey_idx, journey in enumerate(affected_journeys):
+                    group_slug = re.sub(r"[^a-z0-9]+", "-", journey.lower()).strip("-")
+                    stable_group_key = f"repo:{repository_id}:pr:{pull_request_id}:group:{group_slug}:source:manual"
+                    
+                    req_group = RequirementGroup(
+                        id=uuid.uuid4(),
+                        requirement_package_id=pkg.id,
+                        pull_request_id=pull_request_id,
+                        group_number=journey_idx + 1,
+                        group_type="ENHANCEMENT",
+                        stable_group_key=stable_group_key,
+                        title=journey,
+                        status="ACTIVE"
+                    )
+                    db.add(req_group)
+                    db.flush()
+                    group_records[journey] = req_group
+                
+                # Distribute ACs across journey groups
+                for criterion_data in criteria:
+                    ac_text = criterion_data["text"].lower()
+                    assigned = False
+                    
+                    for journey, req_group in group_records.items():
+                        journey_lower = re.sub(r"[-\s]", "", journey.lower())
+                        if journey_lower in ac_text or ac_text in journey_lower:
+                            ac_slug = re.sub(r"[^a-z0-9]+", "-", criterion_data["text"].lower()).strip("-")
+                            stable_ac_key = f"{req_group.stable_group_key}:ac:{ac_slug}"
+                            
+                            ac = AcceptanceCriterion(
+                                id=uuid.uuid4(),
+                                repository_id=repository_id,
+                                pull_request_id=pull_request_id,
+                                requirement_group_id=req_group.id,
+                                source_number=criterion_data["display_number"],
+                                ac_number=criterion_data["display_number"],
+                                stable_ac_key=stable_ac_key,
+                                title=criterion_data["text"],
+                                description=criterion_data.get("description"),
+                                raw_text=criterion_data["text"],
+                                normalized_text=criterion_data["text"].lower().strip(),
+                                source_type=criterion_data.get("source_type", "MANUAL"),
+                                status="ACTIVE",
+                                text=criterion_data["text"],
+                                normalized_key=stable_ac_key,
+                                source="MANUAL_USER_INPUT",
+                                confidence=criterion_data["confidence"],
+                                criterion_type=criterion_data.get("criterion_type", "FUNCTIONAL")
+                            )
+                            db.add(ac)
+                            persisted_ac.append(ac)
+                            assigned = True
+                            break
+                    
+                    # Add unassigned ACs to a "General Requirements" group
+                    if not assigned:
+                        if "general" not in group_records:
+                            group_slug = "general-requirements"
+                            stable_group_key = f"repo:{repository_id}:pr:{pull_request_id}:group:{group_slug}:source:manual"
+                            
+                            req_group = RequirementGroup(
+                                id=uuid.uuid4(),
+                                requirement_package_id=pkg.id,
+                                pull_request_id=pull_request_id,
+                                group_number=len(group_records) + 1,
+                                group_type="ENHANCEMENT",
+                                stable_group_key=stable_group_key,
+                                title="General Requirements",
+                                status="ACTIVE"
+                            )
+                            db.add(req_group)
+                            db.flush()
+                            group_records["general"] = req_group
+                        
+                        ac_slug = re.sub(r"[^a-z0-9]+", "-", criterion_data["text"].lower()).strip("-")
+                        stable_ac_key = f"{group_records['general'].stable_group_key}:ac:{ac_slug}"
+                        
+                        ac = AcceptanceCriterion(
+                            id=uuid.uuid4(),
+                            repository_id=repository_id,
+                            pull_request_id=pull_request_id,
+                            requirement_group_id=group_records["general"].id,
+                            source_number=criterion_data["display_number"],
+                            ac_number=criterion_data["display_number"],
+                            stable_ac_key=stable_ac_key,
+                            title=criterion_data["text"],
+                            description=criterion_data.get("description"),
+                            raw_text=criterion_data["text"],
+                            normalized_text=criterion_data["text"].lower().strip(),
+                            source_type=criterion_data.get("source_type", "MANUAL"),
+                            status="ACTIVE",
+                            text=criterion_data["text"],
+                            normalized_key=stable_ac_key,
+                            source="MANUAL_USER_INPUT",
+                            confidence=criterion_data["confidence"],
+                            criterion_type=criterion_data.get("criterion_type", "FUNCTIONAL")
+                        )
+                        db.add(ac)
+                        persisted_ac.append(ac)
+            else:
+                # Fallback: single "General Requirements" group
+                group_slug = "general-requirements"
+                stable_group_key = f"repo:{repository_id}:pr:{pull_request_id}:group:{group_slug}:source:manual"
+                
+                req_group = RequirementGroup(
+                    id=uuid.uuid4(),
+                    requirement_package_id=pkg.id,
+                    pull_request_id=pull_request_id,
+                    group_number=1,
+                    group_type="ENHANCEMENT",
+                    stable_group_key=stable_group_key,
+                    title="General Requirements",
+                    status="ACTIVE"
+                )
+                db.add(req_group)
+                db.flush()
+                
+                # Create acceptance criteria
+                for ac_idx, criterion_data in enumerate(criteria):
+                    ac_slug = re.sub(r"[^a-z0-9]+", "-", criterion_data["text"].lower()).strip("-")
+                    stable_ac_key = f"{stable_group_key}:ac:{ac_slug}"
+                    
+                    ac = AcceptanceCriterion(
+                        id=uuid.uuid4(),
+                        repository_id=repository_id,
+                        pull_request_id=pull_request_id,
+                        requirement_group_id=req_group.id,
+                        source_number=criterion_data["display_number"],
+                        ac_number=criterion_data["display_number"],
+                        stable_ac_key=stable_ac_key,
+                        title=criterion_data["text"],
+                        description=criterion_data.get("description"),
+                        raw_text=criterion_data["text"],
+                        normalized_text=criterion_data["text"].lower().strip(),
+                        source_type=criterion_data.get("source_type", "MANUAL"),
+                        status="ACTIVE",
+                        text=criterion_data["text"],
+                        normalized_key=stable_ac_key,
+                        source="MANUAL_USER_INPUT",
+                        confidence=criterion_data["confidence"],
+                        criterion_type=criterion_data.get("criterion_type", "FUNCTIONAL")
+                    )
+                    db.add(ac)
+                    persisted_ac.append(ac)
+            
+            db.flush()
 
-    # 5. Extract structured scenarios and save to override
-    extracted_scenarios = extractor.extract_from_business_intent_override(
-        payload.acceptance_criteria,
-        str(bio.id),
-        str(repository_id),
-        source="MANUAL_USER_INPUT"
-    )
-    bio.extracted_scenarios = extracted_scenarios
+    # 6. Extract structured scenarios and save to override (only for flat text mode)
+    if not use_grouped_requirements:
+        extracted_scenarios = extractor.extract_from_business_intent_override(
+            payload.acceptance_criteria,
+            str(bio.id),
+            str(repository_id),
+            source="MANUAL_USER_INPUT"
+        )
+        bio.extracted_scenarios = extracted_scenarios
 
-    # 6. Run BusinessBehaviorMapper to map to business behaviors
+    # 7. Run BusinessBehaviorMapper to map to business behaviors
     from app.models.behavior import Behavior
     from app.models.behavior_scenario import BehaviorScenario
     from app.models.journey import Journey
@@ -3837,6 +4273,95 @@ def update_ci_settings(
         repositoryId=repository.id,
         ciFailOnPartial=repository.ci_fail_on_partial
     )
+
+
+@router.get("/{repository_id}/fragility-memory")
+def get_fragility_memory(
+    repository_id: UUID,
+    db: Session = Depends(get_db),
+    workspace_id: str = Depends(get_current_workspace_id)
+):
+    """
+    Get fragility memory for a repository.
+    Returns top 10 most fragile ACs by PatternMemoryV2 signal count.
+    """
+    from app.models.pattern_memory_v2 import PatternMemoryV2
+    from app.models.acceptance_criterion import AcceptanceCriterion
+    from sqlalchemy import func
+    from datetime import datetime, timedelta
+    
+    # Validate repository belongs to workspace
+    repository = db.query(Repository).filter(
+        Repository.id == repository_id,
+        Repository.workspace_id == UUID(workspace_id)
+    ).first()
+    
+    if not repository:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Repository not found in your active workspace."
+        )
+    
+    # Get PatternMemoryV2 records for this repository, grouped by pattern_key
+    from sqlalchemy import text
+    query = text("""
+        SELECT 
+            pattern_key,
+            COUNT(*) as signal_count,
+            array_agg(DISTINCT signal_type) as signal_types,
+            MAX(created_at) as last_signal_date
+        FROM pattern_memories_v2
+        WHERE repository_id = :repo_id
+        GROUP BY pattern_key
+        ORDER BY signal_count DESC
+        LIMIT 10
+    """)
+    
+    results = db.execute(query, {"repo_id": str(repository_id)}).fetchall()
+    
+    fragile_areas = []
+    for row in results:
+        pattern_key = row.pattern_key
+        signal_count = row.signal_count
+        signal_types = row.signal_types
+        last_signal_date = row.last_signal_date
+        
+        # Find AC title
+        ac = db.query(AcceptanceCriterion).filter(
+            AcceptanceCriterion.repository_id == repository_id,
+            AcceptanceCriterion.normalized_key == pattern_key
+        ).first()
+        
+        ac_title = ac.text if ac else pattern_key
+        
+        # Calculate trend (simplified - compare recent vs older signals)
+        thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+        recent_signals = db.query(PatternMemoryV2).filter(
+            PatternMemoryV2.repository_id == repository_id,
+            PatternMemoryV2.pattern_key == pattern_key,
+            PatternMemoryV2.created_at >= thirty_days_ago
+        ).count()
+        
+        if recent_signals > signal_count * 0.5:
+            trend = "WORSENING"
+        elif recent_signals < signal_count * 0.2:
+            trend = "IMPROVING"
+        else:
+            trend = "STABLE"
+        
+        fragile_areas.append({
+            "pattern_key": pattern_key,
+            "ac_title": ac_title,
+            "signal_count": signal_count,
+            "signal_types": signal_types,
+            "last_signal_date": last_signal_date.isoformat() if last_signal_date else None,
+            "trend": trend
+        })
+    
+    return {
+        "repository_id": str(repository_id),
+        "fragile_areas": fragile_areas
+    }
 
 
 

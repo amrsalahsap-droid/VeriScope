@@ -68,6 +68,9 @@ class RecommendationRun(Base):
     flakiness_profile_hash = Column(String, nullable=True)
 
     recommendation_mode = Column(String, nullable=True) # NORMAL / WIDENED / SAFE_FALLBACK / FULL_REGRESSION
+    is_draft = Column(Boolean, nullable=False, default=False, server_default="false")
+    generation_mode = Column(String, nullable=True)  # 'draft' or 'confident'
+    generation_blocked_reason = Column(String, nullable=True)
     optimization_allowed = Column(Boolean, nullable=False, default=True)
     unsafe_for_optimization = Column(Boolean, nullable=False, default=False)
     evidence_quality_reasons = Column(JSONB, nullable=True)
@@ -94,11 +97,45 @@ class RecommendationRun(Base):
     stale_since = Column(DateTime, nullable=True)
     stale_input_types = Column(JSONB, nullable=True)
 
+    # Part 2: Direct PR snapshot fields for Input 1 auditability
+    head_commit_sha_at_generation = Column(String, nullable=True)
+    base_commit_sha_at_generation = Column(String, nullable=True)
+    merge_commit_sha_at_generation = Column(String, nullable=True)
+    changed_files_snapshot_json = Column(JSONB, nullable=True)
+    pr_package_ready_at_generation = Column(Boolean, nullable=True)
+    input_package_version = Column(String, nullable=True)
+
+    # Input 2 (Business Requirements) snapshot fields
+    requirement_package_id_at_generation = Column(UUID(as_uuid=True), nullable=True)
+    requirement_package_snapshot_json = Column(JSONB, nullable=True)
+    requirement_groups_snapshot_json = Column(JSONB, nullable=True)
+    acceptance_criteria_snapshot_json = Column(JSONB, nullable=True)
+    stable_ac_keys_snapshot_json = Column(JSONB, nullable=True)
+    requirement_package_ready_at_generation = Column(Boolean, nullable=True)
+
     # Requirement Evidence Graph Snapshot (for audit/debug)
     requirement_evidence_snapshot_json = Column(JSONB, nullable=True)
     ac_traceability_snapshot_json = Column(JSONB, nullable=True)
     missing_test_mapping_snapshot_json = Column(JSONB, nullable=True)
     execution_mapping_snapshot_json = Column(JSONB, nullable=True)
+
+    # Input 3 (Behavior Mapping) snapshot fields
+    product_behavior_map_snapshot_json = Column(JSONB, nullable=True)
+    behavior_areas_snapshot_json = Column(JSONB, nullable=True)
+    behavior_evidence_snapshot_json = Column(JSONB, nullable=True)
+    changed_file_behavior_mappings_snapshot_json = Column(JSONB, nullable=True)
+    requirement_behavior_mappings_snapshot_json = Column(JSONB, nullable=True)
+    behavior_map_source_commit_sha = Column(String, nullable=True)
+    behavior_map_generated_at = Column(DateTime, nullable=True)
+    behavior_context_status = Column(String, nullable=True)
+
+    # Input 4 (Test Case Inventory) snapshot fields
+    test_inventory_snapshot_json = Column(JSONB, nullable=True)
+    stable_test_ids_snapshot_json = Column(JSONB, nullable=True)
+    test_inventory_source_snapshot_json = Column(JSONB, nullable=True)
+    test_inventory_snapshot_hash = Column(String, nullable=True)
+    test_inventory_generated_at = Column(DateTime, nullable=True)
+    test_inventory_status_at_generation = Column(String, nullable=True)
 
     # Relationships
     repository = relationship("Repository", back_populates="recommendation_runs")
@@ -191,6 +228,10 @@ class RecommendedTest(Base):
     estimated_duration_seconds = Column(Float, nullable=True)
     included = Column(Boolean, nullable=False, default=True)
     warning = Column(String, nullable=True)
+    candidate_status = Column(String, nullable=True)
+    active_action = Column(String, nullable=True)
+    mapping_uncertainty = Column(String, nullable=True)
+    evidence_path = Column(JSONB, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     # Relationships
@@ -345,6 +386,15 @@ class RecommendationOutcome(Base):
 
     @escaped_defect.setter
     def escaped_defect(self, value: bool):
+        self.escaped_defect_detected = value
+        self.escaped_defect_legacy = value
+
+    @property
+    def defect_escaped(self) -> bool:
+        return self.escaped_defect_detected
+
+    @defect_escaped.setter
+    def defect_escaped(self, value: bool):
         self.escaped_defect_detected = value
         self.escaped_defect_legacy = value
 
@@ -666,6 +716,21 @@ class RecommendationInputSnapshot(Base):
     external_requirement_coverage = Column(JSONB, nullable=False, default=list)
     integration_sync_status = Column(JSONB, nullable=False, default=list)
     external_context_gaps = Column(JSONB, nullable=False, default=list)
+
+    # Input 2 (Business Requirements) snapshot fields
+    requirement_package = Column(JSONB, nullable=True)
+    requirement_groups = Column(JSONB, nullable=False, default=list)
+    stable_ac_keys = Column(JSONB, nullable=False, default=list)
+    
+    # Input 3 (Behavior Mapping) snapshot fields
+    business_behavior_mappings = Column(JSONB, nullable=False, default=list)
+    behavior_scenario_coverages = Column(JSONB, nullable=False, default=list)
+
+    # Input 4 (Test Case Inventory) snapshot fields
+    test_inventory = Column(JSONB, nullable=False, default=list)
+    test_inventory_snapshot_hash = Column(String, nullable=True)
+    test_inventory_snapshot_generated_at = Column(DateTime, nullable=True)
+    test_inventory_status_at_generation = Column(String, nullable=True)
     
     snapshot_truncated = Column(Boolean, nullable=False, default=False)
     snapshot_size_bytes = Column(Integer, nullable=True)

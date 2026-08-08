@@ -43,8 +43,16 @@ class TestManagementProvider(str, Enum):
     MANUAL = "MANUAL"
 
 
+class CoverageLevel(str, Enum):
+    """Coverage granularity level."""
+    RUN_LEVEL = "RUN_LEVEL"  # Aggregate suite-level coverage
+    TEST_FILE_LEVEL = "TEST_FILE_LEVEL"  # Test-file/spec-level coverage
+    TEST_CASE_LEVEL = "TEST_CASE_LEVEL"  # Individual test-case-level coverage
+
+
 # Type aliases for use in function signatures
 EvidenceSourceLiteral = Literal["MANUAL_UPLOAD", "GITHUB_ACTIONS", "CI_ARTIFACT", "TEST_MANAGEMENT_IMPORT", "MANUAL"]
 EvidenceArtifactTypeLiteral = Literal["JUNIT_XML", "LCOV", "COBERTURA", "UNKNOWN"]
 EvidenceHealthStatusLiteral = Literal["HEALTHY", "DEGRADED", "INVALID", "UNSUPPORTED"]
 TestManagementProviderLiteral = Literal["TESTRAIL", "XRAY", "ZEPHYR", "JIRA", "MANUAL"]
+CoverageLevelLiteral = Literal["RUN_LEVEL", "TEST_FILE_LEVEL", "TEST_CASE_LEVEL"]

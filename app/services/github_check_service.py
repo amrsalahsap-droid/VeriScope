@@ -130,10 +130,13 @@ class GitHubCheckService:
             payload["target_url"] = target_url
         
         try:
-            response = requests.post(url, json=payload, headers=self._get_headers())
+            # Use GitHubApiClient for proper error handling and rate limiting
+            from app.services.github_api_client import GitHubApiClient
+            github_client = GitHubApiClient()
+            response = github_client.request("POST", url, headers=self._get_headers(), body=payload)
             response.raise_for_status()
             return response.json()
-        except requests.RequestException as e:
+        except Exception as e:
             logger.error(f"Failed to create GitHub commit status: {e}")
             return None
     
@@ -267,9 +270,12 @@ class GitHubCheckService:
         """
         Map quality gate status to GitHub commit status.
         
+        GitHub Status API valid states: pending, success, failure, error
+        Note: "neutral" is NOT valid for Status API (only for Checks API)
+        
         Status mapping:
         - PASSED → success
-        - PARTIAL → neutral or failure depending on ciFailOnPartial config
+        - PARTIAL → pending (indicates incomplete, not success)
         - FAILED → failure
         - BLOCKED → failure
         - UNKNOWN → pending
@@ -277,10 +283,10 @@ class GitHubCheckService:
         if quality_gate == QualityGateStatus.PASSED:
             return "success"
         elif quality_gate == QualityGateStatus.PARTIAL:
-            # PARTIAL can be configured to fail CI
+            # PARTIAL maps to pending (incomplete) or failure if configured to fail CI
             if self.ci_fail_on_partial:
                 return "failure"
-            return "neutral"
+            return "pending"
         elif quality_gate == QualityGateStatus.FAILED:
             return "failure"
         elif quality_gate == QualityGateStatus.BLOCKED:
@@ -295,7 +301,10 @@ class GitHubCheckService:
         regression_scope_summary: Dict[str, int],
         summary_text: str,
         recommendation_url: Optional[str] = None,
-        artifact_url: Optional[str] = None
+        artifact_url: Optional[str] = None,
+        recommendation_health: Optional[str] = None,
+        release_decision: Optional[str] = None,
+        changed_files: Optional[int] = None
     ) -> str:
         """
         Generate markdown PR comment for quality gate result.
@@ -317,7 +326,17 @@ class GitHubCheckService:
 
 {summary_text}
 
-### Regression Scope
+"""
+        
+        # Add Recommendation Health if available
+        if recommendation_health:
+            comment += f"### Recommendation Health\n{recommendation_health}\n\n"
+        
+        # Add Release Decision if available
+        if release_decision:
+            comment += f"### Release Decision\n{release_decision}\n\n"
+        
+        comment += f"""### Regression Scope
 - **Required:** {regression_scope_summary.get('required', 0)}
 - **Recommended:** {regression_scope_summary.get('recommended', 0)}
 - **Optional:** {regression_scope_summary.get('optional', 0)}
@@ -327,10 +346,14 @@ class GitHubCheckService:
 """
         
         if required_count > 0:
-            comment += f"### Required Before Release\n{required_count} critical requirements still require review or execution.\n"
+            comment += f"### Required Before Release\n{required_count} critical requirements still require review or execution.\n\n"
+        
+        # Add PR changes if available
+        if changed_files is not None:
+            comment += f"### PR Changes\n{changed_files} files changed\n\n"
         
         if recommendation_url:
-            comment += f"\n[View Full Recommendation]({recommendation_url})\n"
+            comment += f"[View Full Recommendation]({recommendation_url})\n"
         
         if artifact_url:
             comment += f"\n[Download Evidence Artifact]({artifact_url})\n"

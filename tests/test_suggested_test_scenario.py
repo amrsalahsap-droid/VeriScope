@@ -20,6 +20,13 @@ from app.models.repository import Repository
 from app.models.pull_request import PullRequest, PullRequestChangedFile
 from app.models.recommendation import RecommendationRun, SuggestedTestScenario, RecommendedTest
 from app.models.user import Workspace
+
+# Dynamic import of all models to ensure complete schema generation in SQLite memory db
+import pkgutil
+import app.models
+for _, module_name, _ in pkgutil.walk_packages(app.models.__path__, app.models.__name__ + "."):
+    __import__(module_name)
+
 from app.services.suggested_test_scenario_generator import SuggestedTestScenarioGenerator
 from app.services.recommendation import RecommendationService
 from app.routers.recommendation import get_recommendation_run
@@ -83,7 +90,7 @@ def test_suggested_test_scenario_generator(db):
     assert signup_scenario is not None
     assert signup_scenario.testing_type == "Security / UI"
     assert signup_scenario.impacted_area == "User Registration"
-    assert signup_scenario.priority == "HIGH"
+    assert signup_scenario.priority in ("MUST", "SHOULD")
     assert "Email address is not registered in the system" in signup_scenario.preconditions
     assert signup_scenario.test_data.get("weak_password") == "123456"
     assert len(signup_scenario.steps) > 0
@@ -109,6 +116,9 @@ def test_service_integration_persists_scenarios(db):
         name="test-repo",
         full_name="org/test-repo",
         default_branch="main",
+        is_active=True,
+        selected_for_analysis=True,
+        connection_status="CONNECTED",
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow()
     )
@@ -125,6 +135,7 @@ def test_service_integration_persists_scenarios(db):
         target_branch="main",
         state="open",
         head_commit_sha="aabbccddee0011223344556677889900",
+        changed_files_count=1,
         github_created_at=datetime.utcnow(),
         github_updated_at=datetime.utcnow()
     )
@@ -162,6 +173,53 @@ def test_service_integration_persists_scenarios(db):
         created_at=datetime.utcnow()
     )
     db.add(tr)
+
+    # Seed requirement package, group, AC
+    from app.models.requirement_package import RequirementPackage
+    from app.models.requirement_group import RequirementGroup
+    from app.models.acceptance_criterion import AcceptanceCriterion
+    
+    pkg = RequirementPackage(
+        id=uuid.uuid4(),
+        repository_id=repo_id,
+        pull_request_id=pr_id,
+        source_type="MANUAL_USER_INPUT",
+        source_id=str(uuid.uuid4()),
+        package_version="1.0.0",
+        status="ACTIVE",
+        business_change_summary="Upgrade login flow",
+        created_at=datetime.utcnow()
+    )
+    db.add(pkg)
+    db.flush()
+    
+    grp = RequirementGroup(
+        id=uuid.uuid4(),
+        requirement_package_id=pkg.id,
+        pull_request_id=pr_id,
+        group_number=1,
+        group_type="ENHANCEMENT",
+        stable_group_key=f"repo:{repo_id}:pr:{pr_id}:group:auth:source:manual",
+        title="Authentication",
+        status="ACTIVE"
+    )
+    db.add(grp)
+    db.flush()
+    
+    ac = AcceptanceCriterion(
+        id=uuid.uuid4(),
+        requirement_group_id=grp.id,
+        pull_request_id=pr_id,
+        repository_id=repo_id,
+        ac_number=1,
+        stable_ac_key="ac1",
+        text="Verify login works",
+        description="Verify login works",
+        normalized_key="ac1",
+        status="ACCEPTED",
+        source="MANUAL_USER_INPUT"
+    )
+    db.add(ac)
 
     db.commit()
 

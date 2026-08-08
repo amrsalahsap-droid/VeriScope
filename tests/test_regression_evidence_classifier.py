@@ -1455,5 +1455,170 @@ class TestViewModelBuilder:
         assert view_model_rec.coverage_gaps[0].severity == "Recommended"
 
 
+class TestDirectACIDMatching:
+    """Tests for direct AC ID matching logic."""
+
+    def test_junit_parser_extracts_acceptance_criterion_property(self):
+        """Verify SafeJUnitParser parses acceptance_criterion property from JUnit XML."""
+        xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+        <testsuite name="core_suite" tests="1">
+            <testcase name="test_password_validation" classname="PasswordTest" time="0.05">
+                <properties>
+                    <property name="acceptance_criterion" value="AC-01"/>
+                </properties>
+            </testcase>
+        </testsuite>
+        """
+        from app.services.junit_parser import SafeJUnitParser
+        results = SafeJUnitParser.parse_xml(xml_content)
+        
+        assert len(results["test_cases"]) == 1
+        tc = results["test_cases"][0]
+        assert tc["declared_ac_id"] == "AC-01"
+
+    def test_requirement_matcher_direct_ac_id_match_success(self):
+        """Verify RequirementMatcher returns score 1.0 when declared_ac_id matches requirement."""
+        req = RequirementNode(
+            requirement_id="req-ac1",
+            readable_id="AC-01",
+            title="Password must contain at least one digit",
+            flow="signup"
+        )
+        test = TestNode(
+            test_id="test-ac1",
+            title="Test digit validation",
+            declared_ac_id="AC-01"
+        )
+        
+        score, diagnostics = RequirementMatcher.match_requirement_to_test(req, test)
+        assert score == 1.0
+        assert "Direct ID match" in diagnostics["signals"]
+        assert diagnostics["mapping_type"] == "DIRECT_AC_ID"
+
+    def test_requirement_matcher_direct_ac_id_match_case_insensitivity(self):
+        """Verify direct AC ID match is case-insensitive."""
+        req = RequirementNode(
+            requirement_id="req-ac1",
+            readable_id="AC-01",
+            title="Password must contain at least one digit",
+            flow="signup"
+        )
+        test = TestNode(
+            test_id="test-ac1",
+            title="Test digit validation",
+            declared_ac_id="ac-01" # lowercase
+        )
+        
+        score, diagnostics = RequirementMatcher.match_requirement_to_test(req, test)
+        assert score == 1.0
+        assert "Direct ID match" in diagnostics["signals"]
+        assert diagnostics["mapping_type"] == "DIRECT_AC_ID"
+
+    def test_requirement_matcher_direct_ac_id_mismatch_skips_text_similarity(self, monkeypatch):
+        """Verify requirement matcher returns 0.0 and skips text similarity if AC ID matches a different AC."""
+        req = RequirementNode(
+            requirement_id="req-ac2",
+            readable_id="AC-02",
+            title="Password validation reset digit",
+            flow="signup"
+        )
+        test = TestNode(
+            test_id="test-ac1",
+            title="Password validation reset digit",
+            declared_ac_id="AC-01"
+        )
+        
+        # Mock SessionLocal and the query
+        mock_db = MagicMock()
+        mock_query = MagicMock()
+        mock_filter = MagicMock()
+        
+        mock_curr_ac = MagicMock()
+        mock_curr_ac.repository_id = "repo-1"
+        
+        mock_matched_ac = MagicMock()
+        mock_matched_ac.id = "req-ac1"
+        
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_filter
+        mock_filter.first.side_effect = [mock_curr_ac, mock_matched_ac]
+        
+        class MockSessionLocal:
+            def __enter__(self):
+                return mock_db
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                pass
+                
+        monkeypatch.setattr("app.db.session.SessionLocal", MockSessionLocal)
+        
+        score, diagnostics = RequirementMatcher.match_requirement_to_test(req, test)
+        assert score == 0.0
+
+    def test_evidence_matching_service_direct_ac_id_match(self):
+        """Verify EvidenceMatchingService populates mapping_type in MatchTableEntry."""
+        req = RequirementNode(
+            requirement_id="req-ac1",
+            readable_id="AC-01",
+            title="Password must contain at least one digit",
+            flow="signup"
+        )
+        test = TestNode(
+            test_id="test-ac1",
+            title="Test digit validation",
+            declared_ac_id="AC-01"
+        )
+        
+        matcher = EvidenceMatchingService()
+        result, is_confident = matcher.find_best_match(req, [test])
+        
+        assert is_confident is True
+        assert result.score == 1.0
+        assert len(matcher.match_table) == 1
+        entry = matcher.match_table[0]
+        assert entry.mapping_type == "DIRECT_AC_ID"
+
+    def test_evidence_matching_service_direct_ac_id_mismatch(self, monkeypatch):
+        """Verify EvidenceMatchingService returns 0.0 and skips text similarity when declared_ac_id matches a different AC."""
+        req = RequirementNode(
+            requirement_id="req-ac2",
+            readable_id="AC-02",
+            title="Password validation reset digit",
+            flow="signup"
+        )
+        test = TestNode(
+            test_id="test-ac1",
+            title="Password validation reset digit",
+            declared_ac_id="AC-01"
+        )
+        
+        mock_db = MagicMock()
+        mock_query = MagicMock()
+        mock_filter = MagicMock()
+        
+        mock_curr_ac = MagicMock()
+        mock_curr_ac.repository_id = "repo-1"
+        
+        mock_matched_ac = MagicMock()
+        mock_matched_ac.id = "req-ac1"
+        
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_filter
+        mock_filter.first.side_effect = [mock_curr_ac, mock_matched_ac]
+        
+        class MockSessionLocal:
+            def __enter__(self):
+                return mock_db
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                pass
+                
+        monkeypatch.setattr("app.db.session.SessionLocal", MockSessionLocal)
+        
+        matcher = EvidenceMatchingService()
+        result, is_confident = matcher.find_best_match(req, [test])
+        
+        assert is_confident is False
+        assert result is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

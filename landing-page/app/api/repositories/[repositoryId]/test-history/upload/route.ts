@@ -54,8 +54,12 @@ export async function POST(
     const body = await res.json().catch(() => ({}));
 
     if (!res.ok) {
+      console.error("Backend upload error:", {
+        status: res.status,
+        body: body
+      });
       return NextResponse.json(
-        { error: body?.detail || `Backend error ${res.status}` },
+        { error: body?.detail || body?.error || `Backend error ${res.status}` },
         { status: res.status }
       );
     }

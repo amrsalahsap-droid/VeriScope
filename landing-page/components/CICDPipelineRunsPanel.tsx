@@ -39,14 +39,12 @@ interface PipelineRun {
 
 interface CICDPipelineRunsPanelProps {
   pipelineRuns: PipelineRun[];
-  hasRequiredItems: boolean;
-  isApproved: boolean;
+  gateStatus: 'PASSED' | 'PASSED_WITH_OVERRIDE' | 'PARTIAL' | 'BLOCKED' | 'UNKNOWN';
 }
 
 export function CICDPipelineRunsPanel({ 
   pipelineRuns, 
-  hasRequiredItems, 
-  isApproved 
+  gateStatus 
 }: CICDPipelineRunsPanelProps) {
   return (
     <div id="cicd-pipeline-runs" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-4">
@@ -55,7 +53,7 @@ export function CICDPipelineRunsPanel({
           <GitBranch className="w-5 h-5 text-blue-400" />
           <h2 className="text-lg font-bold text-white">CI/CD Pipeline Runs</h2>
         </div>
-        <QualityGateBadge hasRequiredItems={hasRequiredItems} isApproved={isApproved} />
+        <QualityGateBadge gateStatus={gateStatus} />
       </div>
       
       {/* Empty State - shown when no pipeline runs exist */}

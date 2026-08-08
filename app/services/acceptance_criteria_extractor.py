@@ -61,6 +61,53 @@ class AcceptanceCriteriaExtractor:
         r"given.*when.*then",
     ]
     
+    # Section header patterns for business requirement parsing.
+    # All patterns are anchored (^) and require a colon so they only match
+    # dedicated section headers, not content lines.
+    SECTION_PATTERNS = {
+        "business_change": [
+            r"^business change\s*:",
+            r"^business summary\s*:",
+            r"^change summary\s*:",
+        ],
+        "affected_journeys": [
+            r"^affected journeys\s*:",
+            r"^affected users\s*:",
+            r"^affected flows\s*:",
+        ],
+        "acceptance_criteria": [
+            r"^acceptance criteria\s*:",
+            r"^acceptance criterion\s*:",
+        ],
+        "invalid_test_data": [
+            r"^invalid test data\s*(?:examples?)?\s*:",
+            r"^negative test data\s*(?:examples?)?\s*:",
+            r"^bad test data\s*(?:examples?)?\s*:",
+        ],
+        "valid_test_data": [
+            r"^valid test data\s*(?:examples?)?\s*:",
+            r"^positive test data\s*(?:examples?)?\s*:",
+        ],
+        "security_notes": [
+            r"^security notes?\s*:",
+        ],
+        "risk_notes": [
+            r"^risk notes?\s*:",
+        ],
+        "integration_notes": [
+            r"^integration notes?\s*:",
+            r"^api notes?\s*:",
+        ],
+        "out_of_scope": [
+            r"^out of scope\s*:",
+            r"^not in scope\s*:",
+        ],
+        "notes": [
+            r"^notes?\s*:",
+            r"^assumptions?\s*:",
+        ],
+    }
+    
     # Pattern for recognizing list items
     LIST_ITEM_PATTERNS = [
         r"^\s*[-*]\s+(.+)",  # - item or * item
@@ -242,6 +289,9 @@ class AcceptanceCriteriaExtractor:
         
         in_ac_section = not has_ac_header
         current_criterion = []
+        current_source_number = None
+        # Compiled inline; also used by resolver via _AC_LABEL_RE
+        _AC_PREFIX_RE = re.compile(r'^[Aa][Cc][-\s]?0*(\d+)[:\s]\s*(.+)', re.DOTALL)
         
         for line in lines:
             stripped = line.strip()
@@ -256,8 +306,31 @@ class AcceptanceCriteriaExtractor:
                     continue
             
             # Check if we're leaving the AC section
-            if in_ac_section and re.match(r"^\s*#{1,3}\s+", stripped):
-                break
+            # Stop at major headers OR section markers that indicate non-AC content
+            if in_ac_section:
+                should_break = False
+                if re.match(r"^\s*#{1,3}\s+", stripped):
+                    should_break = True
+                else:
+                    # Stop at common section markers that follow AC sections
+                    section_end_patterns = [
+                        r"invalid test data",
+                        r"valid test data",
+                        r"test data",
+                        r"examples?",
+                        r"sample data",
+                        r"security notes?",
+                        r"out of scope",
+                        r"notes?",
+                        r"assumptions",
+                        r"dependencies"
+                    ]
+                    for pattern in section_end_patterns:
+                        if re.search(pattern, stripped, re.IGNORECASE):
+                            should_break = True
+                            break
+                if should_break:
+                    break
             
             # Try to match list item patterns
             matched = False
@@ -276,6 +349,7 @@ class AcceptanceCriteriaExtractor:
                                     "source": source,
                                     "confidence": self._calculate_confidence(criterion_text),
                                     "evidence_excerpt": line,
+                                    "source_number": current_source_number,
                                 })
                             else:
                                 excluded_fragments.append({
@@ -284,9 +358,17 @@ class AcceptanceCriteriaExtractor:
                                     "source": source
                                 })
                         current_criterion = []
+                        current_source_number = None
                     
-                    # Start new criterion
-                    current_criterion.append(match.group(1))
+                    # Start new criterion — detect AC-NN: prefix and strip it
+                    raw_item = match.group(1)
+                    ac_prefix_match = _AC_PREFIX_RE.match(raw_item)
+                    if ac_prefix_match:
+                        current_source_number = int(ac_prefix_match.group(1))
+                        raw_item = ac_prefix_match.group(2).strip()
+                    else:
+                        current_source_number = None
+                    current_criterion.append(raw_item)
                     matched = True
                     break
             
@@ -337,6 +419,7 @@ class AcceptanceCriteriaExtractor:
                         "source": source,
                         "confidence": self._calculate_confidence(criterion_text),
                         "evidence_excerpt": line,
+                        "source_number": current_source_number,
                     })
                 else:
                     excluded_fragments.append({
@@ -661,6 +744,13 @@ class AcceptanceCriteriaExtractor:
         Returns:
             Tuple of (persisted_criteria, excluded_fragments)
         """
+        import re
+        import uuid
+        from datetime import datetime
+        from app.models.requirement_package import RequirementPackage
+        from app.models.requirement_group import RequirementGroup
+        from app.models.acceptance_criterion import AcceptanceCriterion
+
         if isinstance(repository_id, str):
             repository_id = uuid.UUID(repository_id)
         if isinstance(pull_request_id, str):
@@ -669,11 +759,181 @@ class AcceptanceCriteriaExtractor:
         if not self.db:
             self.db = db
         
+        # 1. Retrieve or create RequirementPackage
+        pkg = db.query(RequirementPackage).filter(
+            RequirementPackage.repository_id == repository_id,
+            RequirementPackage.pull_request_id == pull_request_id
+        ).first()
+        if pkg:
+            # Delete existing requirement groups (Acceptance criteria will have FK set to NULL first)
+            db.query(RequirementGroup).filter(RequirementGroup.requirement_package_id == pkg.id).delete()
+            db.commit()
+        else:
+            pkg = RequirementPackage(
+                id=uuid.uuid4(),
+                repository_id=repository_id,
+                pull_request_id=pull_request_id,
+                source_type="MANUAL_USER_INPUT",
+                package_version="1.0.0",
+                status="NEEDS_REVIEW",
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow()
+            )
+            db.add(pkg)
+            db.commit()
+
+        # Helper function to parse hierarchical text
+        def parse_hierarchical_text(text: str):
+            lines = text.split("\n")
+            groups = []
+            current_group = {
+                "group_title": "General Requirements",
+                "group_type": "ENHANCEMENT",
+                "ac_lines": []
+            }
+            
+            group_pattern = re.compile(r"^(?:Enhancement|Feature|Bug\s*Fix|Tech\s*Debt|Non-Functional|Security|Group)\s*\d*\s*[:\-]\s*(.*)$", re.IGNORECASE)
+            header_pattern = re.compile(r"^#+\s*(.*)$")
+            
+            for line in lines:
+                line_strip = line.strip()
+                if not line_strip:
+                    continue
+                
+                g_match = group_pattern.match(line_strip)
+                h_match = header_pattern.match(line_strip)
+                
+                if g_match or h_match:
+                    title = g_match.group(1).strip() if g_match else h_match.group(1).strip()
+                    g_type = "ENHANCEMENT"
+                    lower_line = line_strip.lower()
+                    if "bug" in lower_line:
+                        g_type = "BUG_FIX"
+                    elif "tech" in lower_line or "debt" in lower_line:
+                        g_type = "TECH_DEBT"
+                    elif "security" in lower_line:
+                        g_type = "SECURITY"
+                    elif "non-functional" in lower_line or "nfr" in lower_line:
+                        g_type = "NON_FUNCTIONAL"
+                        
+                    if current_group["ac_lines"]:
+                        groups.append(current_group)
+                    
+                    current_group = {
+                        "group_title": title or line_strip,
+                        "group_type": g_type,
+                        "ac_lines": []
+                    }
+                else:
+                    clean_line = re.sub(r"^[\-\*\+]\s*(?:AC\-\d+\s*)?", "", line_strip)
+                    clean_line = re.sub(r"^\d+[\.\)]\s*", "", clean_line)
+                    clean_line = re.sub(r"^\[[\s[xX]?\]\s*", "", clean_line)
+                    clean_line = clean_line.strip()
+                    if clean_line and len(clean_line) > 5:
+                        current_group["ac_lines"].append(clean_line)
+                        
+            if current_group["ac_lines"] or not groups:
+                groups.append(current_group)
+            return groups
+
+        # Helper to make stable slug keys
+        def make_slug(val):
+            val_clean = re.sub(r"[^a-zA-Z0-9\s\-]", "", val).strip().lower()
+            return re.sub(r"[\s\-]+", "-", val_clean)
+
+        # Helper to generate stable group key with full context
+        def generate_stable_group_key(repository_id, pull_request_id, group_slug, source_type):
+            """Generate stable group key considering repository, PR, and source."""
+            return f"repo:{repository_id}:pr:{pull_request_id}:group:{group_slug}:source:{source_type}"
+
+        # Helper to generate stable AC key with full context
+        def generate_stable_ac_key(repository_id, pull_request_id, group_slug, ac_slug, source_type):
+            """Generate stable AC key considering repository, PR, group, and source."""
+            return f"repo:{repository_id}:pr:{pull_request_id}:group:{group_slug}:ac:{ac_slug}:source:{source_type}"
+
+        # Get text source to parse groups
+        text_to_parse = ""
+        from app.models.business_intent import BusinessIntentOverride
+        bio = db.query(BusinessIntentOverride).filter(
+            BusinessIntentOverride.pull_request_id == pull_request_id,
+            BusinessIntentOverride.is_active == True
+        ).first()
+        if bio and bio.acceptance_criteria:
+            text_to_parse = bio.acceptance_criteria
+            
+        if not text_to_parse:
+            from app.models.pull_request import PullRequest
+            pr = db.query(PullRequest).filter(PullRequest.id == pull_request_id).first()
+            if pr and pr.description:
+                text_to_parse = pr.description
+                
+        if not text_to_parse:
+            text_to_parse = "\n".join([c.get("evidence_excerpt") or c["text"] for c in criteria])
+
+        parsed_groups = parse_hierarchical_text(text_to_parse)
+
+        # Determine source type for stable keys
+        source_type = "MANUAL_USER_INPUT"
+        if bio:
+            source_type = "BUSINESS_INTENT_OVERRIDE"
+        elif criteria and criteria[0].get("source"):
+            source_type = criteria[0].get("source")
+
+        # Persist groups and build group dictionary mapping titles to group records
+        group_records = {}
+        for index, pg in enumerate(parsed_groups, start=1):
+            group_slug = make_slug(pg["group_title"])
+            stable_group_key = generate_stable_group_key(
+                str(repository_id), 
+                str(pull_request_id), 
+                group_slug, 
+                source_type
+            )
+            
+            group_rec = RequirementGroup(
+                id=uuid.uuid4(),
+                requirement_package_id=pkg.id,
+                pull_request_id=pull_request_id,
+                group_number=index,
+                group_type=pg["group_type"],
+                stable_group_key=stable_group_key,
+                title=pg["group_title"],
+                status="NEEDS_REVIEW"
+            )
+            db.add(group_rec)
+            db.commit()
+            group_records[pg["group_title"]] = group_rec
+
+        # Map each criterion to group
+        def get_group_for_ac_text(ac_text):
+            norm_ac = ac_text.lower().strip()
+            for pg in parsed_groups:
+                for line in pg["ac_lines"]:
+                    if norm_ac in line.lower() or line.lower() in norm_ac:
+                        return group_records[pg["group_title"]]
+            # Fallback
+            if parsed_groups:
+                return group_records[parsed_groups[0]["group_title"]]
+            return None
+
         persisted = []
         excluded_fragments = []
+        ac_number = 1
         
         for criterion_data in criteria:
-            # Check if already exists (by repository_id + pull_request_id + normalized key)
+            group_rec = get_group_for_ac_text(criterion_data["text"])
+            group_id = group_rec.id if group_rec else None
+            group_slug = make_slug(group_rec.title) if group_rec else "general"
+            # Use normalized text for AC slug to ensure uniqueness within group
+            ac_slug = make_slug(criterion_data.get("normalized_text") or criterion_data["text"])
+            stable_ac_key = generate_stable_ac_key(
+                str(repository_id),
+                str(pull_request_id),
+                group_slug,
+                ac_slug,
+                source_type
+            )
+
             existing = db.query(AcceptanceCriterion).filter(
                 AcceptanceCriterion.repository_id == repository_id,
                 AcceptanceCriterion.pull_request_id == pull_request_id,
@@ -682,37 +942,221 @@ class AcceptanceCriteriaExtractor:
             
             if existing:
                 # Update existing criterion details for this PR
+                existing.requirement_group_id = group_id
+                existing.ac_number = ac_number
+                existing.stable_ac_key = stable_ac_key
                 existing.source = criterion_data["source"]
                 existing.confidence = criterion_data["confidence"]
                 existing.evidence_excerpt = criterion_data.get("evidence_excerpt")
                 existing.text = criterion_data["text"]
                 existing.criterion_type = criterion_data.get("criterion_type", "UNKNOWN")
                 existing.label = criterion_data.get("label")
+                # Propagate source_number when available (e.g. after AC-NN: prefix detection)
+                if criterion_data.get("source_number") is not None:
+                    existing.source_number = criterion_data["source_number"]
+                existing.status = "NEEDS_REVIEW"
+                existing.version = existing.version + 1 if existing.version else 2
                 db.commit()
                 persisted.append(existing)
-                continue
-            
-            # Create new criterion
-            criterion = AcceptanceCriterion(
-                id=uuid.uuid4(),
-                repository_id=repository_id,
-                pull_request_id=pull_request_id,
-                source_section=criterion_data.get("source_section", "ACCEPTANCE_CRITERIA"),
-                source_number=criterion_data.get("source_number"),
-                text=criterion_data["text"],
-                normalized_key=criterion_data["normalized_key"],
-                label=criterion_data.get("label"),
-                criterion_type=criterion_data.get("criterion_type", "UNKNOWN"),
-                source=criterion_data["source"],
-                confidence=criterion_data["confidence"],
-                evidence_excerpt=criterion_data.get("evidence_excerpt"),
-            )
-            db.add(criterion)
-            db.commit()
-            persisted.append(criterion)
+            else:
+                # Create new criterion
+                criterion = AcceptanceCriterion(
+                    id=uuid.uuid4(),
+                    repository_id=repository_id,
+                    pull_request_id=pull_request_id,
+                    requirement_group_id=group_id,
+                    ac_number=ac_number,
+                    stable_ac_key=stable_ac_key,
+                    source_section=criterion_data.get("source_section", "ACCEPTANCE_CRITERIA"),
+                    source_number=criterion_data.get("source_number"),
+                    text=criterion_data["text"],
+                    normalized_key=criterion_data["normalized_key"],
+                    label=criterion_data.get("label"),
+                    criterion_type=criterion_data.get("criterion_type", "UNKNOWN"),
+                    source=criterion_data["source"],
+                    confidence=criterion_data["confidence"],
+                    evidence_excerpt=criterion_data.get("evidence_excerpt"),
+                    status="NEEDS_REVIEW",
+                    version=1
+                )
+                db.add(criterion)
+                db.commit()
+                persisted.append(criterion)
+            ac_number += 1
         
         return persisted, excluded_fragments
     
+    # Sections that terminate AC collection when encountered
+    AC_STOP_SECTIONS = {
+        "invalid_test_data", "valid_test_data", "security_notes",
+        "risk_notes", "integration_notes", "out_of_scope", "notes",
+    }
+
+    # Maps SECTION_PATTERNS key → output dict key
+    SECTION_KEY_MAP = {
+        "business_change":    "business_change_summary",
+        "affected_journeys":  "affected_journeys",
+        "acceptance_criteria":"acceptance_criteria",
+        "invalid_test_data":  "invalid_test_data_examples",
+        "valid_test_data":    "valid_test_data_examples",
+        "security_notes":     "security_notes",
+        "risk_notes":         "risk_notes",
+        "integration_notes":  "integration_notes",
+        "out_of_scope":       "out_of_scope_notes",
+        "notes":              "out_of_scope_notes",
+    }
+
+    # Strict AC line: must begin with a number or AC-id prefix
+    AC_LINE_RE = re.compile(r"^\d+[\.\)]\s+|^AC[-\s]?\d+\s*[-:]?\s*", re.IGNORECASE)
+
+    def parse_business_requirements_sections(
+        self,
+        text: str
+    ) -> Dict[str, Any]:
+        """Parse business requirements text into strictly separated sections.
+
+        Only lines inside the 'Acceptance Criteria:' section that match the
+        AC_LINE_RE pattern (e.g. '1. …', '2) …', 'AC-01 …') become acceptance
+        criteria.  Everything else is stored in its own bucket and is NEVER
+        counted as an AC.
+
+        Returns dict with keys:
+            business_change_summary, affected_journeys, acceptance_criteria,
+            invalid_test_data_examples, valid_test_data_examples,
+            security_notes, risk_notes, integration_notes, out_of_scope_notes,
+            rejected_lines
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # List-bucket keys
+        LIST_BUCKETS = {
+            "affected_journeys", "acceptance_criteria",
+            "invalid_test_data_examples", "valid_test_data_examples",
+            "security_notes", "risk_notes", "integration_notes",
+        }
+
+        sections: Dict[str, Any] = {
+            "business_change_summary": None,
+            "affected_journeys": [],
+            "acceptance_criteria": [],
+            "invalid_test_data_examples": [],
+            "valid_test_data_examples": [],
+            "security_notes": [],
+            "risk_notes": [],
+            "integration_notes": [],
+            "out_of_scope_notes": None,
+            "rejected_lines": [],
+        }
+
+        current_section: str | None = None   # SECTION_PATTERNS key
+        in_ac_section: bool = False
+        current_list_content: list[str] = []
+
+        def _flush(section_key: str | None, content: list[str]) -> None:
+            """Flush accumulated list content into the right bucket."""
+            if not section_key or not content:
+                return
+            dest = self.SECTION_KEY_MAP.get(section_key)
+            if dest is None:
+                return
+            if dest in LIST_BUCKETS:
+                existing = sections.get(dest)
+                if isinstance(existing, list):
+                    existing.extend(content)
+            elif dest == "out_of_scope_notes":
+                sections["out_of_scope_notes"] = "\n".join(content)
+            # business_change_summary is handled inline (after colon)
+
+        for raw in text.split("\n"):
+            stripped = raw.strip()
+            if not stripped:
+                continue
+
+            # ── Detect section header ─────────────────────────────────────────
+            new_section: str | None = None
+            for sec_name, patterns in self.SECTION_PATTERNS.items():
+                for pat in patterns:
+                    if re.search(pat, stripped, re.IGNORECASE):
+                        new_section = sec_name
+                        break
+                if new_section:
+                    break
+
+            if new_section is not None:
+                # Flush previous section's accumulated list content
+                _flush(current_section, current_list_content)
+                current_list_content = []
+
+                # Transition state
+                current_section = new_section
+                in_ac_section = (new_section == "acceptance_criteria")
+                if new_section in self.AC_STOP_SECTIONS:
+                    in_ac_section = False
+
+                # Capture inline value after the colon on the header line
+                colon_idx = stripped.find(":")
+                if colon_idx != -1:
+                    inline = stripped[colon_idx + 1:].strip()
+                    if inline:
+                        dest = self.SECTION_KEY_MAP.get(new_section)
+                        if dest == "business_change_summary":
+                            sections["business_change_summary"] = inline
+                        elif dest in LIST_BUCKETS:
+                            # Inline list item on same line as header (rare)
+                            sections[dest].append(inline)  # type: ignore[union-attr]
+                continue
+
+            # ── Accumulate content under current section ──────────────────────
+            if current_section is None:
+                sections["rejected_lines"].append(stripped)
+                continue
+
+            dest = self.SECTION_KEY_MAP.get(current_section)
+
+            if dest == "acceptance_criteria":
+                if not in_ac_section:
+                    sections["rejected_lines"].append(stripped)
+                    continue
+                # Strict: only numbered / AC-id lines
+                if self.AC_LINE_RE.match(stripped):
+                    ac_text = self.AC_LINE_RE.sub("", stripped).strip()
+                    if len(ac_text) > 3:
+                        current_list_content.append(ac_text)
+                    else:
+                        sections["rejected_lines"].append(stripped)
+                else:
+                    sections["rejected_lines"].append(stripped)
+
+            elif dest in LIST_BUCKETS:
+                clean = re.sub(r"^[\-\*\+]\s+", "", stripped)
+                clean = re.sub(r"^\d+[\.\)]\s+", "", clean).strip()
+                if clean:
+                    current_list_content.append(clean)
+
+            elif dest == "out_of_scope_notes":
+                current_list_content.append(stripped)
+
+            else:
+                sections["rejected_lines"].append(stripped)
+
+        # Flush final section
+        _flush(current_section, current_list_content)
+
+        logger.info(
+            "[INPUT_2_SECTION_PARSE] business_change=%s journeys=%d acs=%d "
+            "invalid_td=%d valid_td=%d security=%d rejected=%d",
+            bool(sections["business_change_summary"]),
+            len(sections["affected_journeys"]),
+            len(sections["acceptance_criteria"]),
+            len(sections["invalid_test_data_examples"]),
+            len(sections["valid_test_data_examples"]),
+            len(sections["security_notes"]),
+            len(sections["rejected_lines"]),
+        )
+
+        return sections
+
     def extract_from_business_intent_override(
         self,
         acceptance_criteria_text: str,

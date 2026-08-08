@@ -61,6 +61,11 @@ interface Repository {
 
 interface UploadResult {
   coverage_report_id: string;
+  commit_sha: string | null;
+  current_pr_head_sha: string | null;
+  commit_sha_source: string;
+  sha_mismatch: boolean;
+  is_current: boolean;
   format: string;
   files_total: number;
   covered_lines_total: number;
@@ -68,6 +73,11 @@ interface UploadResult {
   total_lines: number;
   line_coverage_ratio: number;
   coverage_confidence: string;
+  current_pr_coverage_confidence: string | null;
+  changed_files_total: number;
+  changed_files_with_coverage: number;
+  changed_files_without_coverage: number;
+  file_to_test_link_count: number;
   parser_version: string;
   normalization_schema_version: string;
   repository_readiness: {
@@ -120,10 +130,13 @@ export default function CoveragePage({ params, searchParams }: PageProps) {
   const [pullRequests, setPullRequests] = useState<any[]>([]);
   const [runningRecommendation, setRunningRecommendation] = useState<string | null>(null);
   const [from, setFrom] = useState<string>("details");
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   // PR context states
   const [pullRequestId, setPullRequestId] = useState<string | null>(null);
   const [prNumber, setPrNumber] = useState<number | null>(null);
+  const [prHeadSha, setPrHeadSha] = useState<string | null>(null);
+  const [prBranch, setPrBranch] = useState<string | null>(null);
   const [returnTo, setReturnTo] = useState<string | null>(null);
   const [sourceParam, setSourceParam] = useState<string | null>(null);
   const [inputTypeParam, setInputTypeParam] = useState<string | null>(null);
@@ -333,6 +346,8 @@ export default function CoveragePage({ params, searchParams }: PageProps) {
         const matchingPr = data.pull_requests?.find((p: any) => p.id === currentPrId);
         if (matchingPr) {
           setPrNumber(matchingPr.number);
+          setPrHeadSha(matchingPr.head_commit_sha || null);
+          setPrBranch(matchingPr.source_branch || null);
         }
       }
     } catch (err) {
@@ -514,7 +529,13 @@ export default function CoveragePage({ params, searchParams }: PageProps) {
       console.log("[UPLOAD SUBMIT]", {
         format,
         fileName: file.name,
-        endpoint: `/api/repositories/${repositoryId}/coverage/upload`
+        endpoint: `/api/repositories/${repositoryId}/coverage/upload`,
+        advancedOpen,
+        commitSha,
+        pullRequestId,
+        prHeadSha,
+        willSendCommitSha: advancedOpen && commitSha ? commitSha : null,
+        willSendPullRequestId: pullRequestId || null
       });
     }
 
@@ -522,9 +543,14 @@ export default function CoveragePage({ params, searchParams }: PageProps) {
       const formData = new FormData();
       formData.append("file", file);
       formData.append("format", format);
-      formData.append("commit_sha", commitSha || "");
-      formData.append("branch", branch || "");
       formData.append("source", "MANUAL_UPLOAD");
+      // Only send commit_sha when advanced override is explicitly enabled
+      if (advancedOpen && commitSha) {
+        formData.append("commit_sha", commitSha);
+      }
+      if (advancedOpen && branch) {
+        formData.append("branch", branch);
+      }
       if (pullRequestId) formData.append("pull_request_id", pullRequestId);
       if (sourceParam) formData.append("source_context", sourceParam);
 
@@ -833,6 +859,32 @@ export default function CoveragePage({ params, searchParams }: PageProps) {
                   </p>
                 </div>
                 <div className="bg-zinc-900/20 border border-zinc-850/65 p-3 rounded-lg flex flex-col justify-between">
+                  <p className="text-xxs uppercase tracking-wider text-zinc-500 mb-1">Commit Source</p>
+                  <p className="text-sm font-bold text-zinc-200">{uploadResult.commit_sha_source === "AUTO_FROM_SELECTED_PR" ? "Auto from selected PR" : "Manual"}</p>
+                </div>
+                <div className="bg-zinc-900/20 border border-zinc-850/65 p-3 rounded-lg flex flex-col justify-between">
+                  <p className="text-xxs uppercase tracking-wider text-zinc-500 mb-1">Is Current</p>
+                  <p className={`text-lg font-bold ${uploadResult.is_current ? "text-emerald-400" : "text-amber-400"}`}>
+                    {uploadResult.is_current ? "Yes" : "No"}
+                  </p>
+                </div>
+                <div className="bg-zinc-900/20 border border-zinc-850/65 p-3 rounded-lg flex flex-col justify-between">
+                  <p className="text-xxs uppercase tracking-wider text-zinc-500 mb-1">SHA Mismatch</p>
+                  <p className={`text-lg font-bold ${uploadResult.sha_mismatch ? "text-rose-400" : "text-emerald-400"}`}>
+                    {uploadResult.sha_mismatch ? "Yes" : "No"}
+                  </p>
+                </div>
+                <div className="bg-zinc-900/20 border border-zinc-850/65 p-3 rounded-lg flex flex-col justify-between">
+                  <p className="text-xxs uppercase tracking-wider text-zinc-500 mb-1">Changed Files Covered</p>
+                  <p className="text-lg font-bold text-zinc-200">
+                    {uploadResult.changed_files_with_coverage} / {uploadResult.changed_files_total}
+                  </p>
+                </div>
+                <div className="bg-zinc-900/20 border border-zinc-850/65 p-3 rounded-lg flex flex-col justify-between">
+                  <p className="text-xxs uppercase tracking-wider text-zinc-500 mb-1">File-to-Test Links</p>
+                  <p className="text-lg font-bold text-zinc-200">{uploadResult.file_to_test_link_count}</p>
+                </div>
+                <div className="bg-zinc-900/20 border border-zinc-850/65 p-3 rounded-lg flex flex-col justify-between">
                   <p className="text-xxs uppercase tracking-wider text-zinc-500 mb-1">Format</p>
                   <p className="text-lg font-bold text-zinc-100">{uploadResult.format}</p>
                 </div>
@@ -866,6 +918,14 @@ export default function CoveragePage({ params, searchParams }: PageProps) {
                   <div className="flex justify-between items-center py-1 border-b border-zinc-900/60">
                     <span className="text-zinc-500 font-medium">Source</span>
                     <span className="text-zinc-300 font-medium">Manual upload</span>
+                  </div>
+                  <div className="flex justify-between items-center py-1 border-b border-zinc-900/60">
+                    <span className="text-zinc-500 font-medium">Commit SHA</span>
+                    <span className="font-mono text-zinc-300 font-medium">{uploadResult.commit_sha ?? "—"}</span>
+                  </div>
+                  <div className="flex justify-between items-center py-1 border-b border-zinc-900/60">
+                    <span className="text-zinc-500 font-medium">PR Head SHA</span>
+                    <span className="font-mono text-zinc-300 font-medium">{uploadResult.current_pr_head_sha ?? "—"}</span>
                   </div>
                   <div className="flex justify-between items-center py-1 border-b border-zinc-900/60">
                     <span className="text-zinc-500 font-medium">Report Hash</span>
@@ -1254,33 +1314,80 @@ export default function CoveragePage({ params, searchParams }: PageProps) {
                   )}
                 </div>
 
-                {/* 6. Optional metadata */}
+                {/* 6. PR context metadata */}
                 <div className="pt-4 border-t border-zinc-900 space-y-4">
                   <h4 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
-                    Optional Metadata
+                    PR Context
                   </h4>
-                  <div className="grid sm:grid-cols-2 gap-4">
-                    <div>
-                      <label className="block text-xs font-medium text-zinc-500 mb-1.5">Commit SHA</label>
-                      <input
-                        type="text"
-                        value={commitSha}
-                        onChange={(e) => setCommitSha(e.target.value)}
-                        placeholder="e.g. 5fa7ab81..."
-                        className="w-full bg-zinc-900/30 border border-zinc-850 rounded-xl px-3.5 py-2.5 text-xs text-zinc-250 placeholder-zinc-600 focus:outline-none focus:border-zinc-700 font-mono"
-                      />
+
+                  {pullRequestId && prHeadSha ? (
+                    <div className="space-y-2 text-xs">
+                      <div className="flex justify-between items-center py-1.5 border-b border-zinc-900/60">
+                        <span className="text-zinc-500 font-medium">Selected PR</span>
+                        <span className="font-mono text-zinc-200">#{prNumber ?? "—"}</span>
+                      </div>
+                      <div className="flex justify-between items-center py-1.5 border-b border-zinc-900/60">
+                        <span className="text-zinc-500 font-medium">Head SHA</span>
+                        <span className="font-mono text-emerald-400">{prHeadSha}</span>
+                      </div>
+                      <div className="flex justify-between items-center py-1.5 border-b border-zinc-900/60">
+                        <span className="text-zinc-500 font-medium">Branch</span>
+                        <span className="font-mono text-zinc-200">{prBranch ?? "—"}</span>
+                      </div>
+                      <p className="text-zinc-500 leading-relaxed">
+                        Coverage will be attached to this PR head SHA automatically. No manual entry required.
+                      </p>
                     </div>
-                    <div>
-                      <label className="block text-xs font-medium text-zinc-500 mb-1.5">Target Branch</label>
-                      <input
-                        type="text"
-                        value={branch}
-                        onChange={(e) => setBranch(e.target.value)}
-                        placeholder="e.g. main"
-                        className="w-full bg-zinc-900/30 border border-zinc-850 rounded-xl px-3.5 py-2.5 text-xs text-zinc-250 placeholder-zinc-600 focus:outline-none focus:border-zinc-700"
-                      />
+                  ) : (
+                    <p className="text-xs text-zinc-500">
+                      No PR selected. Upload will require a commit SHA via Advanced options.
+                    </p>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAdvancedOpen((v) => !v);
+                      // Clear manual SHA when closing advanced options to prevent stale values
+                      if (advancedOpen) {
+                        setCommitSha("");
+                        setBranch("");
+                      }
+                    }}
+                    className="text-xs text-zinc-400 hover:text-white underline underline-offset-4"
+                  >
+                    {advancedOpen ? "Hide advanced options" : "Advanced options"}
+                  </button>
+
+                  {advancedOpen && (
+                    <div className="grid sm:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-xs font-medium text-zinc-500 mb-1.5">Commit SHA override</label>
+                        <input
+                          type="text"
+                          value={commitSha}
+                          onChange={(e) => setCommitSha(e.target.value)}
+                          placeholder="e.g. 5fa7ab81..."
+                          className="w-full bg-zinc-900/30 border border-zinc-850 rounded-xl px-3.5 py-2.5 text-xs text-zinc-250 placeholder-zinc-600 focus:outline-none focus:border-zinc-700 font-mono"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-zinc-500 mb-1.5">Target Branch override</label>
+                        <input
+                          type="text"
+                          value={branch}
+                          onChange={(e) => setBranch(e.target.value)}
+                          placeholder="e.g. main"
+                          className="w-full bg-zinc-900/30 border border-zinc-850 rounded-xl px-3.5 py-2.5 text-xs text-zinc-250 placeholder-zinc-600 focus:outline-none focus:border-zinc-700"
+                        />
+                      </div>
+                      {advancedOpen && commitSha && pullRequestId && prHeadSha && commitSha !== prHeadSha && (
+                        <div className="col-span-2 text-xs text-amber-400 bg-amber-950/20 border border-amber-900/30 rounded-lg p-3">
+                          You are overriding the selected PR head SHA. If this SHA does not match the PR, coverage will be marked Historical Only.
+                        </div>
+                      )}
                     </div>
-                  </div>
+                  )}
                 </div>
 
                 {/* Error messaging inside form */}

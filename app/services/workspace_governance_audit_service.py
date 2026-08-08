@@ -802,3 +802,57 @@ class WorkspaceGovernanceAuditService:
 
         db.add(event)
         db.commit()
+
+    @staticmethod
+    def log_outcome_learning_event(
+        db: Session,
+        workspace_id: UUID,
+        actor_id: UUID,
+        event_type: str,
+        repository_id: Optional[UUID] = None,
+        recommendation_run_id: Optional[UUID] = None,
+        pipeline_run_id: Optional[UUID] = None,
+        label_type: Optional[str] = None,
+        decision: Optional[str] = None,
+        reason: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """
+        Log an outcome learning audit event with secrets redacted.
+        """
+        # Secret redaction from metadata
+        sanitized_metadata = {}
+        if metadata:
+            REDACT_KEYS = {
+                "token", "authorization", "password", "secret", "key", "jwt", 
+                "apikey", "api_key", "pwd", "auth", "signature", "credential",
+                "connection", "private"
+            }
+            def basic_redact(data: Any) -> Any:
+                if isinstance(data, dict):
+                    return {k: (basic_redact(v) if not any(rk in k.lower() for rk in REDACT_KEYS) else "***REDACTED***") for k, v in data.items()}
+                elif isinstance(data, list):
+                    return [basic_redact(x) for x in data]
+                return data
+            sanitized_metadata = basic_redact(metadata)
+
+        audit_meta = {
+            "recommendation_run_id": str(recommendation_run_id) if recommendation_run_id else None,
+            "pipeline_run_id": str(pipeline_run_id) if pipeline_run_id else None,
+            "label_type": label_type,
+            "decision": decision,
+            "metadata_json": sanitized_metadata
+        }
+
+        event = WorkspaceGovernanceAuditEvent(
+            workspace_id=workspace_id,
+            actor_id=actor_id,
+            repository_id=repository_id,
+            event_type=event_type,
+            decision=decision,
+            reason=reason,
+            audit_metadata=audit_meta
+        )
+        db.add(event)
+        db.commit()
+

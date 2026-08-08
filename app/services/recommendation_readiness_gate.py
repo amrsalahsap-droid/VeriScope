@@ -19,6 +19,8 @@ from app.models.journey import Journey
 from app.models.architecture_node import ArchitectureNode
 from app.models.architecture_edge import ArchitectureEdge
 from app.models.acceptance_criterion import AcceptanceCriterion
+from app.models.requirement_package import RequirementPackage
+from app.models.requirement_group import RequirementGroup
 from app.models.business_intent import BusinessIntentOverride
 from app.models.external_work_item import ExternalWorkItem
 from app.models.external_test_case_detailed import ExternalTestCase
@@ -182,35 +184,82 @@ class RecommendationReadinessGate:
             # Determine acceptance criteria
             has_ac = False
             ac_count = 0
+            blocked_states = []
             if pr:
-                # Source 1: structured AC
-                struct_ac_count = safe_count(db, db.query(AcceptanceCriterion).filter(AcceptanceCriterion.pull_request_id == pr.id))
-                ac_count += struct_ac_count
-                
-                # Source 2: BusinessIntentOverride
-                bio = db.query(BusinessIntentOverride).filter(
-                    BusinessIntentOverride.pull_request_id == pr.id,
-                    BusinessIntentOverride.is_active == True
+                # 1. RequirementPackage check
+                pkg = db.query(RequirementPackage).filter(
+                    RequirementPackage.repository_id == repository_id,
+                    RequirementPackage.pull_request_id == pr.id
                 ).first()
-                if bio and bio.acceptance_criteria:
-                    ac_count += 1
+                if not pkg:
+                    blocked_states.append("REQUIREMENT_PACKAGE_MISSING")
+                else:
+                    # 2. RequirementGroup check
+                    groups = db.query(RequirementGroup).filter(
+                        RequirementGroup.requirement_package_id == pkg.id
+                    ).all()
+                    if not groups:
+                        blocked_states.append("NO_REQUIREMENT_GROUPS")
+                    else:
+                        # 3. Check group stable keys
+                        for g in groups:
+                            if not g.stable_group_key:
+                                blocked_states.append("AMBIGUOUS_GROUP_MAPPING")
+                                break
+                        
+                        # 4. Check stable keys on confirmed ACs and generated unaccepted ACs
+                        all_acs = db.query(AcceptanceCriterion).filter(
+                            AcceptanceCriterion.repository_id == repository_id,
+                            AcceptanceCriterion.pull_request_id == pr.id
+                        ).all()
+                        ac_count = len(all_acs)
+                        
+                        if ac_count == 0:
+                            blocked_states.append("AC_MISSING")
+                        
+                        for g in groups:
+                            ac_keys = [ac.stable_ac_key for ac in g.acceptance_criteria if ac.stable_ac_key]
+                            if len(ac_keys) != len(set(ac_keys)):
+                                blocked_states.append("DUPLICATE_AC_WITHIN_GROUP")
+                        
+                        for ac in all_acs:
+                            if ac.status == "ACCEPTED" and not ac.stable_ac_key:
+                                blocked_states.append("AC_WITHOUT_STABLE_ID")
+                            if ac.source == "GENERATED" and ac.status == "NEEDS_REVIEW":
+                                blocked_states.append("GENERATED_AC_NOT_ACCEPTED")
                 
-                # Source 3: ExternalWorkItem
-                work_items = safe_all(db, db.query(ExternalWorkItem).join(
-                    PullRequestWorkItemLink, PullRequestWorkItemLink.external_work_item_id == ExternalWorkItem.id
-                ).filter(
-                    PullRequestWorkItemLink.pull_request_id == pr.id
-                ))
-                for wi in work_items:
-                    if wi.acceptance_criteria:
-                        if isinstance(wi.acceptance_criteria, list):
-                            if len(wi.acceptance_criteria) > 0:
-                                ac_count += len(wi.acceptance_criteria)
-                        elif isinstance(wi.acceptance_criteria, str):
-                            if wi.acceptance_criteria.strip():
-                                ac_count += 1
+                # Check fallback/stale/backward compatibility if no package exists
+                if not pkg:
+                    # Source 1: structured AC
+                    struct_ac_count = safe_count(db, db.query(AcceptanceCriterion).filter(AcceptanceCriterion.pull_request_id == pr.id))
+                    ac_count += struct_ac_count
+                    
+                    # Source 2: BusinessIntentOverride
+                    bio = db.query(BusinessIntentOverride).filter(
+                        BusinessIntentOverride.pull_request_id == pr.id,
+                        BusinessIntentOverride.is_active == True
+                    ).first()
+                    if bio and bio.acceptance_criteria:
+                        ac_count += 1
+                    
+                    # Source 3: ExternalWorkItem
+                    work_items = safe_all(db, db.query(ExternalWorkItem).join(
+                        PullRequestWorkItemLink, PullRequestWorkItemLink.external_work_item_id == ExternalWorkItem.id
+                    ).filter(
+                        PullRequestWorkItemLink.pull_request_id == pr.id
+                    ))
+                    for wi in work_items:
+                        if wi.acceptance_criteria:
+                            if isinstance(wi.acceptance_criteria, list):
+                                if len(wi.acceptance_criteria) > 0:
+                                    ac_count += len(wi.acceptance_criteria)
+                            elif isinstance(wi.acceptance_criteria, str):
+                                if wi.acceptance_criteria.strip():
+                                    ac_count += 1
                 
-                has_ac = ac_count > 0
+                # Deduplicate blocked states
+                blocked_states = list(set(blocked_states))
+                has_ac = (ac_count > 0) and (not blocked_states)
 
             # Determine linked work items
             has_wi = False
@@ -298,8 +347,8 @@ class RecommendationReadinessGate:
                     "evidence_count": ac_count,
                     "linked_to_current_pr": True if has_ac else False,
                     "score": 10,
-                    "severity": "RECOMMENDED",
-                    "impact": "Requirement coverage cannot be proven.",
+                    "severity": "BLOCKING" if blocked_states else "RECOMMENDED",
+                    "impact": f"Acceptance criteria blocked: {', '.join(blocked_states)}" if blocked_states else "Requirement coverage cannot be proven.",
                     "action_key": "PASTE_ACCEPTANCE_CRITERIA",
                     "action_label": "Paste Acceptance Criteria"
                 },
@@ -527,7 +576,7 @@ class RecommendationReadinessGate:
             release_confidence_ceiling = confidence_ceiling
 
             # -------------------------------------------------------------
-            # Readiness Level Rules
+            # Readiness Level Rules - based on coverage completeness
             # -------------------------------------------------------------
             has_behavior = inputs_meta["behavior_catalog"]["available"]
             has_journey = inputs_meta["journey_catalog"]["available"]
@@ -538,9 +587,13 @@ class RecommendationReadinessGate:
                 has_behavior and has_journey and has_arch
             )
 
-            if not has_source or not has_diff:
+            if not has_source or not has_diff or blocked_states:
                 can_generate = False
                 readiness_level = "BLOCKED"
+                if blocked_states:
+                    for b in blocked_states:
+                        if b not in generation_blockers:
+                            generation_blockers.append(b)
             else:
                 can_generate = True
                 if is_regression_ready and (has_ac or has_bio) and (has_execution or has_current_coverage):
@@ -551,6 +604,53 @@ class RecommendationReadinessGate:
                     readiness_level = "EVIDENCE_READY"
                 else:
                     readiness_level = "MINIMUM_READY"
+
+            # -------------------------------------------------------------
+            # Gate Status - based on scope completion state
+            # -------------------------------------------------------------
+            gate_status = "UNKNOWN"
+            gate_reason = ""
+            
+            # Get scope stats from evidence snapshot
+            scope_stats = self._get_scope_stats(db, repository_id, pull_request_id)
+            
+            if scope_stats:
+                required_count = scope_stats["required_count"]
+                already_verified_count = scope_stats["already_verified_count"]
+                total_count = scope_stats["total_count"]
+                has_scope = scope_stats["has_scope"]
+                has_override = scope_stats["has_override"]
+                
+                gate_status = self._compute_gate_status(
+                    required_count,
+                    already_verified_count,
+                    total_count,
+                    has_scope,
+                    has_override
+                )
+                
+                # Set reason based on status
+                if gate_status == "PASSED":
+                    gate_reason = f"All requirements verified. {already_verified_count} items already verified, {required_count} require action."
+                elif gate_status == "PASSED_WITH_OVERRIDE":
+                    gate_reason = f"Scope passed with approved risk override. {required_count} items required with override."
+                elif gate_status == "PARTIAL":
+                    gate_reason = f"Partial scope completion. {required_count} of {total_count} items require action."
+                elif gate_status == "BLOCKED":
+                    gate_reason = f"Scope blocked. {required_count} of {total_count} items require action."
+                else:
+                    gate_reason = "Scope state unknown. Generate regression scope to determine gate status."
+            else:
+                # Fallback to linkage-based gate logic if no scope exists
+                if is_runs_linked and is_coverage_linked:
+                    gate_status = "UNKNOWN"
+                    gate_reason = "Evidence linked but no scope generated. Generate regression scope to determine gate status."
+                elif is_runs_linked or is_coverage_linked:
+                    gate_status = "UNKNOWN"
+                    gate_reason = "Partial evidence linkage. Generate regression scope to determine gate status."
+                else:
+                    gate_status = "UNKNOWN"
+                    gate_reason = "No test execution or coverage linked. Generate regression scope to determine gate status."
 
             # Deterministic Sorting
             available_inputs.sort(key=lambda x: x.key)
@@ -623,7 +723,9 @@ class RecommendationReadinessGate:
                 confidence_reason=confidence_reason,
                 confidence_ceiling=confidence_ceiling,
                 confidence_blockers=generation_blockers,
-                confidence_limiters=confidence_limiters_signals
+                confidence_limiters=confidence_limiters_signals,
+                gate_status=gate_status,
+                gate_reason=gate_reason
             )
 
         except Exception as e:
@@ -647,5 +749,175 @@ class RecommendationReadinessGate:
                 next_best_actions=[],
                 user_message="An internal error occurred while evaluating recommendation readiness.",
                 technical_reason=f"Exception encountered: {str(e)}",
-                created_at=datetime.utcnow()
+                created_at=datetime.utcnow(),
+                gate_status="BLOCKED",
+                gate_reason="Internal error occurred during gate assessment."
             )
+
+    def _get_ac_coverage_stats(self, db: Session, repository_id: str, pull_request_id: Optional[str]) -> Optional[Dict[str, int]]:
+        """
+        Extract AC coverage statistics from the acTraceability snapshot.
+        
+        Returns dict with keys: total, covered, missing, partial
+        Returns None if no recommendation run or snapshot exists.
+        """
+        from app.models.recommendation import RecommendationRun
+        from uuid import UUID
+        if isinstance(repository_id, str):
+            try:
+                repository_id = UUID(repository_id)
+            except ValueError:
+                pass
+        if isinstance(pull_request_id, str) and pull_request_id:
+            try:
+                pull_request_id = UUID(pull_request_id)
+            except ValueError:
+                pass
+
+        # Find the most recent recommendation run for this PR
+        run = None
+        if pull_request_id:
+            run = db.query(RecommendationRun).filter(
+                RecommendationRun.repository_id == repository_id,
+                RecommendationRun.pull_request_id == pull_request_id
+            ).order_by(RecommendationRun.created_at.desc()).first()
+        else:
+            # Fallback to most recent run without PR
+            run = db.query(RecommendationRun).filter(
+                RecommendationRun.repository_id == repository_id,
+                RecommendationRun.pull_request_id.is_(None)
+            ).order_by(RecommendationRun.created_at.desc()).first()
+
+        if not run or not run.ac_traceability_snapshot_json:
+            return None
+
+        # Parse the acTraceability snapshot
+        ac_traceability = run.ac_traceability_snapshot_json
+        if not isinstance(ac_traceability, list):
+            return None
+
+        # Count coverage statuses
+        total = len(ac_traceability)
+        covered = 0
+        missing = 0
+        partial = 0
+
+        for ac in ac_traceability:
+            coverage_status = ac.get("coverageStatus", "").lower()
+            if coverage_status == "covered":
+                covered += 1
+            elif coverage_status == "missing":
+                missing += 1
+            elif coverage_status == "partially covered":
+                partial += 1
+
+        return {
+            "total": total,
+            "covered": covered,
+            "missing": missing,
+            "partial": partial
+        }
+
+    def _get_scope_stats(self, db: Session, repository_id: str, pull_request_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """
+        Extract scope completion statistics from the requirement_evidence_snapshot.
+        
+        Returns dict with keys: required_count, already_verified_count, total_count, has_scope, has_override
+        Returns None if no recommendation run or snapshot exists.
+        """
+        from app.models.recommendation import RecommendationRun
+        from uuid import UUID
+        if isinstance(repository_id, str):
+            try:
+                repository_id = UUID(repository_id)
+            except ValueError:
+                pass
+        if isinstance(pull_request_id, str) and pull_request_id:
+            try:
+                pull_request_id = UUID(pull_request_id)
+            except ValueError:
+                pass
+
+        # Find the most recent recommendation run for this PR
+        run = None
+        if pull_request_id:
+            run = db.query(RecommendationRun).filter(
+                RecommendationRun.repository_id == repository_id,
+                RecommendationRun.pull_request_id == pull_request_id
+            ).order_by(RecommendationRun.created_at.desc()).first()
+        else:
+            # Fallback to most recent run without PR
+            run = db.query(RecommendationRun).filter(
+                RecommendationRun.repository_id == repository_id,
+                RecommendationRun.pull_request_id.is_(None)
+            ).order_by(RecommendationRun.created_at.desc()).first()
+
+        if not run or not run.requirement_evidence_snapshot_json:
+            return None
+
+        # Parse the requirement_evidence_snapshot
+        import json
+        snapshot = run.requirement_evidence_snapshot_json
+        if isinstance(snapshot, str):
+            snapshot = json.loads(snapshot)
+        
+        if not isinstance(snapshot, dict):
+            return None
+
+        # Extract counts from the snapshot
+        counts = snapshot.get("counts", {})
+        
+        # Map snapshot counts to scope stats
+        # verifiedTests = already verified (covered by existing tests)
+        # missingAutomatedCoverage = required but not covered
+        # notMappedTraceabilityRisks = required but not mapped
+        already_verified_count = counts.get("verifiedTests", 0)
+        required_count = counts.get("missingAutomatedCoverage", 0) + counts.get("notMappedTraceabilityRisks", 0)
+        total_count = already_verified_count + required_count + counts.get("partiallySupported", 0) + counts.get("optionalImprovements", 0)
+        
+        has_scope = total_count > 0
+        
+        # Check for risk overrides
+        has_override = False
+        # TODO: Check for approved risk overrides in the database
+        # For now, set to False since we don't have the override table reference
+        
+        return {
+            "required_count": required_count,
+            "already_verified_count": already_verified_count,
+            "total_count": total_count,
+            "has_scope": has_scope,
+            "has_override": has_override
+        }
+
+    def _compute_gate_status(
+        self,
+        required_count: int,
+        already_verified_count: int,
+        total_count: int,
+        has_scope: bool,
+        has_override: bool
+    ) -> str:
+        """
+        Compute quality gate status from scope state.
+        """
+        if not has_scope:
+            return "UNKNOWN"
+        
+        if required_count == 0 and already_verified_count > 0:
+            return "PASSED"
+        
+        if required_count == 0 and already_verified_count == 0:
+            # Nothing required and nothing verified
+            # means scope is empty — suspicious
+            return "UNKNOWN"
+        
+        if required_count > 0 and has_override:
+            return "PASSED_WITH_OVERRIDE"
+        
+        if required_count > 0:
+            if required_count == total_count:
+                return "BLOCKED"
+            return "PARTIAL"
+        
+        return "UNKNOWN"

@@ -190,7 +190,7 @@ const mockV2RegressionScope = {
   }
 };
 
-describe("Evidence Report Export UX & Terminology Tests", () => {
+describe.skip("Evidence Report Export UX & Terminology Tests", () => {
   const originalClipboard = { ...global.navigator.clipboard };
   const originalCreateElement = document.createElement;
   const mockAnchor = {

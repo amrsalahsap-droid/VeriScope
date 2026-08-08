@@ -27,6 +27,8 @@ class TestRegressionEvidenceAPI:
         mock_run.id = run_id
         mock_run.pull_request_id = pr_id
         mock_run.repository_id = uuid.uuid4()
+        mock_run.requirement_evidence_snapshot_json = "{}"
+        mock_run.evidence_fingerprint = "dummy_fingerprint"
         
         # Missing or empty changed_files in snapshot
         mock_snapshot = MagicMock()
@@ -97,6 +99,8 @@ class TestRegressionEvidenceAPI:
         mock_run.id = run_id
         mock_run.pull_request_id = pr_id
         mock_run.repository_id = uuid.uuid4()
+        mock_run.requirement_evidence_snapshot_json = "{}"
+        mock_run.evidence_fingerprint = "dummy_fingerprint"
         mock_run.input_snapshot = MagicMock(changed_files=[{"filename": "test.py"}])
         
         # Explicitly ensure no description field
@@ -162,6 +166,8 @@ class TestRegressionEvidenceAPI:
         mock_run.id = run_id
         mock_run.pull_request_id = pr_id
         mock_run.repository_id = uuid.uuid4()
+        mock_run.requirement_evidence_snapshot_json = "{}"
+        mock_run.evidence_fingerprint = "dummy_fingerprint"
         mock_run.input_snapshot = MagicMock(changed_files=[])
         
         mock_pr = MagicMock(spec=PullRequest)

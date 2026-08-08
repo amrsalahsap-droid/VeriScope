@@ -329,21 +329,22 @@ describe("RegressionScopeV2 Components", () => {
   it("Exclusions groups (Already Verified and Already Passed Tests) are hidden by default", () => {
     render(<RegressionScopeV2Display scope={mockRegressionScopeData} />);
     
-    expect(screen.queryByText("Already Verified")).not.toBeInTheDocument();
+    // ExecutionPlanDisplay shows "Already Verified" metric card, but scope group should be hidden
     expect(screen.queryByText("Already Passed Tests")).not.toBeInTheDocument();
+    // Check that AC-EX-1 (from Already Verified group) is not visible
+    expect(screen.queryByText("AC-EX-1")).not.toBeInTheDocument();
   });
 
   // Test 8
   it("Exclusions groups are visible in auditMode=true or showExclusions=true", () => {
     const { rerender } = render(<RegressionScopeV2Display scope={mockRegressionScopeData} showExclusions={true} />);
-    expect(screen.getByText("Already Verified")).toBeInTheDocument();
     expect(screen.getByText("Already Passed Tests")).toBeInTheDocument();
     expect(screen.getByText("AC-EX-1")).toBeInTheDocument();
     expect(screen.getByText("AC-EX-2")).toBeInTheDocument();
 
     rerender(<RegressionScopeV2Display scope={mockRegressionScopeData} auditMode={true} />);
-    expect(screen.getByText("Already Verified")).toBeInTheDocument();
     expect(screen.getByText("Already Passed Tests")).toBeInTheDocument();
+    expect(screen.getByText("AC-EX-1")).toBeInTheDocument();
   });
 
   // Test 9

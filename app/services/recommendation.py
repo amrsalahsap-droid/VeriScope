@@ -12,15 +12,79 @@ from app.config import settings
 
 
 def _serialize_datetime(obj: Any) -> Any:
-    """Recursively convert datetime objects to ISO strings for JSON serialization."""
+    """Recursively convert datetime objects and Pydantic models to JSON-friendly structures."""
     if isinstance(obj, datetime):
         return obj.isoformat()
+    elif hasattr(obj, "model_dump"):
+        return _serialize_datetime(obj.model_dump())
+    elif hasattr(obj, "dict"):
+        return _serialize_datetime(obj.dict())
     elif isinstance(obj, dict):
         return {k: _serialize_datetime(v) for k, v in obj.items()}
     elif isinstance(obj, list):
         return [_serialize_datetime(item) for item in obj]
     else:
         return obj
+
+def _serialize_changed_files_snapshot(pr: Any) -> Any:
+    """Serialize changed files snapshot for PR package auditability."""
+    from app.models.pull_request import PullRequestChangedFile
+    if not pr or not hasattr(pr, 'id'):
+        return []
+    
+    # Import here to avoid circular dependency
+    from app.db.session import SessionLocal
+    db = SessionLocal()
+    try:
+        changed_files = db.query(PullRequestChangedFile).filter(
+            PullRequestChangedFile.pull_request_id == pr.id
+        ).all()
+        
+        return [
+            {
+                "file_path": cf.file_path,
+                "status": cf.status,
+                "additions": cf.additions,
+                "deletions": cf.deletions,
+                "previous_filename": cf.previous_filename,
+                "file_sha": cf.file_sha,
+                "patch_summary": cf.patch_summary,
+                "patch_hash": cf.patch_hash,
+                "patch_size": cf.patch_size
+            }
+            for cf in changed_files
+        ]
+    finally:
+        db.close()
+
+def _is_pr_package_ready(pr: Any) -> bool:
+    """Check if PR package is ready for confident regression generation."""
+    if not pr:
+        return False
+    
+    # PR must exist
+    if not hasattr(pr, 'id') or not pr.id:
+        return False
+    
+    # head_commit_sha must exist
+    if not hasattr(pr, 'head_commit_sha') or not pr.head_commit_sha:
+        return False
+    
+    # changed_files_count must be > 0
+    if not hasattr(pr, 'changed_files_count') or not pr.changed_files_count or pr.changed_files_count <= 0:
+        return False
+    
+    # PullRequestChangedFile records must exist
+    from app.models.pull_request import PullRequestChangedFile
+    from app.db.session import SessionLocal
+    db = SessionLocal()
+    try:
+        file_count = db.query(PullRequestChangedFile).filter(
+            PullRequestChangedFile.pull_request_id == pr.id
+        ).count()
+        return file_count > 0
+    finally:
+        db.close()
 from app.models.recommendation import (
     RecommendationRun,
     RecommendationTest,
@@ -69,6 +133,8 @@ class RecommendationService:
 
     def create_recommendation_run(self, run_in: RecommendationRunCreate) -> RecommendationRun:
         """Generate and persist an immutable recommendation run along with tests, reasons, lineage, and inputs snapshot."""
+        import logging
+        logger = logging.getLogger("veriscope.recommendation")
         # 1. Verify repository exists
         db_repo = self.repo_repository.get(run_in.repository_id)
         if not db_repo:
@@ -174,6 +240,70 @@ class RecommendationService:
             pull_request_id=db_pr.id
         )
         
+        # Part 3: Create PullRequestSnapshot if it doesn't exist (for manual/test data scenarios)
+        if not pr_evidence.pr_snapshot_id:
+            from app.models.pull_request import PullRequestSnapshot, PullRequestChangedFile
+            from app.models.artifact import RawArtifact
+
+            # Get changed files for snapshot
+            changed_files_db = self.db.query(PullRequestChangedFile).filter(
+                PullRequestChangedFile.pull_request_id == db_pr.id
+            ).all()
+            
+            # Create snapshot artifact
+            files_payload = [
+                {
+                    "filename": f.file_path,
+                    "status": f.status,
+                    "additions": f.additions,
+                    "deletions": f.deletions,
+                    "previous_filename": f.previous_filename,
+                    "sha": f.file_sha
+                }
+                for f in changed_files_db
+            ]
+            
+            snapshot_artifact = RawArtifact(
+                artifact_type="github_pr_snapshot",
+                repository_id=db_pr.repository_id,
+                storage_path=f"pr_snapshot_{db_pr.id}_{datetime.utcnow().isoformat()}.json",
+                artifact_metadata={"files": files_payload, "head_commit_sha": db_pr.head_commit_sha}
+            )
+            self.db.add(snapshot_artifact)
+            self.db.flush()
+            
+            # Calculate evidence fingerprint
+            evidence_fingerprint = hashlib.sha256(
+                f"{db_pr.head_commit_sha}|{','.join(sorted([f.file_path for f in changed_files_db]))}".encode("utf-8")
+            ).hexdigest()
+            
+            # Create snapshot
+            snapshot = PullRequestSnapshot(
+                pull_request_id=db_pr.id,
+                repository_id=db_pr.repository_id,
+                head_commit_sha=db_pr.head_commit_sha,
+                github_pr_updated_at=db_pr.github_updated_at,
+                snapshot_reason="recommendation_generation",
+                snapshot_schema_version="pr_snapshot.v1",
+                normalization_engine_version="1.0.0",
+                evidence_fingerprint=evidence_fingerprint,
+                snapshot_artifact_id=snapshot_artifact.id,
+                files_raw_artifact_id=snapshot_artifact.id,
+                evidence_health_status=db_pr.evidence_health_status or "HEALTHY",
+                sync_integrity_status=db_pr.sync_integrity_status or "FULL_SUCCESS",
+                evidence_consistency_status=db_pr.evidence_consistency_status or "CONSISTENT",
+                evidence_truncated=db_pr.evidence_truncated or False,
+                truncation_reason=db_pr.truncation_reason,
+                unsafe_for_optimization=db_pr.unsafe_for_optimization or False,
+                evidence_generated_at=datetime.utcnow(),
+                evidence_expires_at=datetime.utcnow() + timedelta(hours=24)
+            )
+            self.db.add(snapshot)
+            self.db.flush()
+            
+            pr_evidence.pr_snapshot_id = snapshot.id
+            logger.info(f"Created PullRequestSnapshot {snapshot.id} for PR {db_pr.id} during recommendation generation")
+        
         # Add sync evidence gaps to PR evidence if any
         if sync_result.evidence_gaps:
             pr_evidence.readiness_reasons.extend(sync_result.evidence_gaps)
@@ -190,12 +320,12 @@ class RecommendationService:
             f"errors={len(sync_result.errors)}, warnings={len(sync_result.warnings)}"
         )
 
-        changed_files = [f.file_path for f in pr_evidence.changed_files]
-        if not changed_files and run_in.changed_files:
-            changed_files = run_in.changed_files
-            if any("insufficient" in f for f in changed_files):
-                pr_evidence.evidence_health_status = "INSUFFICIENT"
-            pr_evidence.unsafe_for_optimization = db_pr.unsafe_for_optimization or False
+        changed_files = [f.file_path for f in pr_evidence.changed_files if f.file_path and f.file_path.strip()]
+        # PR impact analysis is grounded only in persisted, provider-synced paths.
+        # Request payload counts or ad-hoc paths are not sufficient evidence for matching.
+        if not changed_files:
+            pr_evidence.evidence_health_status = "INSUFFICIENT"
+            pr_evidence.unsafe_for_optimization = True
             pr_evidence.readiness_reasons = [
                 r for r in pr_evidence.readiness_reasons
                 if "No changed files" not in r and "changed files are missing" not in r
@@ -313,6 +443,162 @@ class RecommendationService:
         ).all()
         tcs_map = {str(tc.id): tc for tc in db_test_cases}
         tcs_by_identity = {tc.stable_identity: tc for tc in db_test_cases}
+
+        # Populate Traceability Graph edges for the current PR
+        from app.services.changed_file_behavior_matcher import ChangedFileBehaviorMatcher
+        from app.services.traceability_graph_service import TraceabilityGraphService
+        from app.models.behavior import Behavior
+        from app.models.journey import Journey
+        from app.models.behavior_evidence import BehaviorEvidence
+        from app.models.journey_behavior import JourneyBehavior
+        
+        behaviors_for_graph = self.db.query(Behavior).filter(
+            Behavior.repository_id == run_in.repository_id,
+            Behavior.is_deleted == False
+        ).all()
+        journeys_for_graph = self.db.query(Journey).filter(
+            Journey.repository_id == run_in.repository_id,
+            Journey.is_deleted == False
+        ).all()
+        journey_behaviors_for_graph = self.db.query(JourneyBehavior).all()
+        behavior_evidences_for_graph = self.db.query(BehaviorEvidence).all()
+        
+        matcher_for_graph = ChangedFileBehaviorMatcher(db=self.db)
+        matched_behs = matcher_for_graph.match_changed_files(
+            changed_files=changed_files,
+            behaviors=behaviors_for_graph,
+            evidences=behavior_evidences_for_graph,
+            journey_behaviors=journey_behaviors_for_graph,
+            journeys=journeys_for_graph
+        )
+        for mb in matched_behs:
+            TraceabilityGraphService.upsert_edge(
+                db=self.db,
+                repository_id=run_in.repository_id,
+                pull_request_id=db_pr.id,
+                source_node_type="ChangedFile",
+                source_node_id=mb["file_path"],
+                target_node_type="ProductBehavior",
+                target_node_id=mb["behavior_id"],
+                edge_type="changed_file_impacts_behavior",
+                edge_source=mb["signal_type"].lower(),
+                confidence=mb["score"],
+                review_status="system_suggested"
+            )
+            
+        # behavior_covers_ac edges
+        from app.models.business_behavior_mapping import BusinessBehaviorMapping
+        bb_mappings_for_graph = self.db.query(BusinessBehaviorMapping).join(Behavior).filter(
+            Behavior.repository_id == run_in.repository_id
+        ).all()
+        for bm in bb_mappings_for_graph:
+            TraceabilityGraphService.upsert_edge(
+                db=self.db,
+                repository_id=run_in.repository_id,
+                pull_request_id=db_pr.id,
+                source_node_type="ProductBehavior",
+                source_node_id=str(bm.behavior_id),
+                target_node_type="AcceptanceCriterion",
+                target_node_id=str(bm.acceptance_criterion_id),
+                edge_type="behavior_covers_ac",
+                edge_source="business_behavior_mapping",
+                confidence=bm.match_confidence or 0.9,
+                review_status="system_suggested"
+            )
+            
+        # ac_covered_by_test edges
+        from app.services.ac_test_mapping_service import ACTestMappingService
+        mapping_svc = ACTestMappingService()
+        mapping_res = mapping_svc.build_mappings_for_pr(
+            db=self.db,
+            repository_id=run_in.repository_id,
+            pull_request_id=db_pr.id
+        )
+        
+        # behavior_covered_by_test edges
+        from app.models.behavior_scenario_coverage import BehaviorScenarioCoverage
+        scenario_coverages_for_graph = self.db.query(BehaviorScenarioCoverage).filter(
+            BehaviorScenarioCoverage.repository_id == run_in.repository_id
+        ).all()
+        
+        for sc in scenario_coverages_for_graph:
+            for bm in bb_mappings_for_graph:
+                if bm.behavior_scenario_id == sc.behavior_scenario_id:
+                    for test_ident in (sc.existing_tests or []):
+                        tc_obj = tcs_by_identity.get(test_ident)
+                        if tc_obj:
+                            TraceabilityGraphService.upsert_edge(
+                                db=self.db,
+                                repository_id=run_in.repository_id,
+                                pull_request_id=db_pr.id,
+                                source_node_type="ProductBehavior",
+                                source_node_id=str(bm.behavior_id),
+                                target_node_type="TestCase",
+                                target_node_id=str(tc_obj.id),
+                                edge_type="behavior_covered_by_test",
+                                edge_source="behavior_scenario_coverage",
+                                confidence=0.9,
+                                review_status="system_suggested"
+                            )
+                            
+        for tc in db_test_cases:
+            if tc.behavior_key:
+                matching_beh = next((b for b in behaviors_for_graph if b.slug == tc.behavior_key or str(b.id) == tc.behavior_key), None)
+                if matching_beh:
+                    TraceabilityGraphService.upsert_edge(
+                        db=self.db,
+                        repository_id=run_in.repository_id,
+                        pull_request_id=db_pr.id,
+                        source_node_type="ProductBehavior",
+                        source_node_id=str(matching_beh.id),
+                        target_node_type="TestCase",
+                        target_node_id=str(tc.id),
+                        edge_type="behavior_covered_by_test",
+                        edge_source="test_case_behavior_key",
+                        confidence=1.0,
+                        review_status="user_confirmed"
+                    )
+
+        # Collect graph-derived candidate tests
+        from app.models.acceptance_criterion import AcceptanceCriterion
+        graph_candidates = set()
+        active_ac_ids = [str(ac.id) for ac in self.db.query(AcceptanceCriterion).filter(
+            AcceptanceCriterion.pull_request_id == db_pr.id,
+            AcceptanceCriterion.status == "ACTIVE"
+        ).all()]
+        
+        ac_to_test_edges = TraceabilityGraphService.find_edges(
+            db=self.db,
+            repository_id=run_in.repository_id,
+            pull_request_id=db_pr.id,
+            source_node_type="AcceptanceCriterion",
+            target_node_type="TestCase",
+            is_active=True
+        )
+        for edge in ac_to_test_edges:
+            if edge.source_node_id in active_ac_ids:
+                graph_candidates.add(edge.target_node_id)
+                
+        impacted_beh_ids = [str(edge.target_node_id) for edge in TraceabilityGraphService.find_edges(
+            db=self.db,
+            repository_id=run_in.repository_id,
+            pull_request_id=db_pr.id,
+            source_node_type="ChangedFile",
+            target_node_type="ProductBehavior",
+            is_active=True
+        )]
+        
+        beh_to_test_edges = TraceabilityGraphService.find_edges(
+            db=self.db,
+            repository_id=run_in.repository_id,
+            pull_request_id=db_pr.id,
+            source_node_type="ProductBehavior",
+            target_node_type="TestCase",
+            is_active=True
+        )
+        for edge in beh_to_test_edges:
+            if edge.source_node_id in impacted_beh_ids:
+                graph_candidates.add(edge.target_node_id)
 
         # Get engine version (V3 is the default)
         engine_version_str = getattr(run_in, "engine_version", "v3.0.0") or "v3.0.0"
@@ -450,7 +736,12 @@ class RecommendationService:
                     "LOW": sum(1 for r in journey_risks if r.confidence == "LOW"),
                 },
                 "high_risk_journeys": [
-                    {"journey_id": r.journey_id, "journey_name": r.journey_name, "risk_level": r.risk_level, "risk_reason": r.risk_reason}
+                    {
+                        "journey_id": r.journey_id,
+                        "journey_name": {str(j.id): j.name for j in journeys}.get(str(r.journey_id), "Unknown Journey"),
+                        "risk_level": r.risk_level,
+                        "risk_reason": r.risk_reason
+                    }
                     for r in journey_risks if r.risk_level in ["HIGH", "CRITICAL"]
                 ],
             },
@@ -496,6 +787,19 @@ class RecommendationService:
             behavior_coverages=behavior_coverage_snapshot_early["behavior_coverages"]
         )
         
+        # Check for unmapped ACs and add to coverage gaps
+        if 'mapping_res' in locals() and mapping_res and mapping_res.get("unmapped_ac_list"):
+            fallback_decision.evidence_quality = "LOW"
+            if "NEEDS_MAPPING_REVIEW" not in fallback_decision.reasons:
+                fallback_decision.reasons.append("NEEDS_MAPPING_REVIEW")
+            for unmapped_ac in mapping_res["unmapped_ac_list"]:
+                behavior_coverage_gaps_early.append({
+                    "scenario_title": f"Coverage Gap: {unmapped_ac['stable_ac_key']}",
+                    "behavior_name": unmapped_ac['ac_title'],
+                    "priority": "MUST",
+                    "reason": f"Acceptance Criterion {unmapped_ac['stable_ac_key']} has no mapped automated test cases."
+                })
+        
         behavior_intelligence = {
             "behavior_coverages": behavior_coverage_snapshot_early["behavior_coverages"],
             "behavior_coverage_gaps": behavior_coverage_gaps_early,
@@ -527,6 +831,23 @@ class RecommendationService:
             logger = logging.getLogger("veriscope.recommendation")
             logger.exception(f"Failed to execute SMEOrchestrator early in recommendation: {exc}")
 
+        # Get business_behavior_mappings early for both V2 and V3
+        from app.models.business_behavior_mapping import BusinessBehaviorMapping
+        from app.models.behavior import Behavior
+        business_behavior_mappings = self.db.query(BusinessBehaviorMapping).join(Behavior).filter(
+            Behavior.repository_id == run_in.repository_id
+        ).all()
+
+        # Get behavior_scenario_coverages early for both V2 and V3
+        from app.models.behavior_scenario_coverage import BehaviorScenarioCoverage
+        behavior_scenario_coverages = self.db.query(BehaviorScenarioCoverage).filter(
+            BehaviorScenarioCoverage.repository_id == run_in.repository_id
+        ).all()
+
+        test_coverage_links = []
+        ac_coverage_report = None
+        heuristic_bundle = None
+
         if engine_version_str in ("v3.0.0", "v3"):
             from app.services.recommendation_logic_v3 import RecommendationLogicV3
             v3_recs = RecommendationLogicV3.generate_recommendations(
@@ -536,6 +857,21 @@ class RecommendationService:
                 workspace=db_repo.workspace,
                 sme_orchestrated=orchestrated
             )
+            
+            # Ensure all graph candidates are represented in v3_recs
+            v3_test_ids = {r["test_identifier"] for r in v3_recs}
+            for tc_id_str in graph_candidates:
+                tc = tcs_map.get(tc_id_str)
+                if tc and tc.stable_identity not in v3_test_ids:
+                    v3_recs.append({
+                        "test_identifier": tc.stable_identity,
+                        "source_signal": "TRACEABILITY_GRAPH",
+                        "reason": "Mapped via Traceability Graph",
+                        "reason_details": {},
+                        "priority": 85.0,
+                        "estimated_duration_seconds": 5.0,
+                        "confidence": "HIGH"
+                    })
 
             class MockRankedCandidateTest:
                 def __init__(self, **kwargs):
@@ -590,10 +926,6 @@ class RecommendationService:
             dep_expansion = type("MockDep", (), {"expanded_files": [], "dependency_state_hash": "empty_v3"})()
             history_failures_used = []
             adjusted_bundle = type("MockAdj", (), {"adjusted_candidates": [], "flaky_profiles_used": [], "reasoning_entries": [], "test_cases": []})()
-            behavior_scenario_coverages = []
-            test_coverage_links = []
-            business_behavior_mappings = []
-            ac_coverage_report = None
         else:
             # 4b. Fragility Amplification Matrix Check
             from app.models.fragility_pattern import FragilityPattern
@@ -660,6 +992,19 @@ class RecommendationService:
                             reason_type="direct_file_coverage",
                             reason_details={"coverage_report_id": str(coverage_evidence.coverage_report_id)}
                         )
+
+            # Inject graph candidates into candidate_inputs (V2)
+            for tc_id_str in graph_candidates:
+                tc = tcs_map.get(tc_id_str)
+                if tc:
+                    add_candidate(
+                        tc_id=tc.id,
+                        reasons=["Mapped via Traceability Graph"],
+                        base_priority=0.85,
+                        sources=["TRACEABILITY_GRAPH"],
+                        reason_type="graph_coverage",
+                        reason_details={}
+                    )
 
             # 5b. Resolve Fragility Memory Breakages
             from app.services.fragility_memory_service import FragilityMemoryService
@@ -895,7 +1240,7 @@ class RecommendationService:
                         None
                     )
                     if scenario_coverage:
-                        test_ids = scenario_coverage.test_mappings.get("test_ids", [])
+                        test_ids = list(scenario_coverage.existing_tests or [])
                         ac_id = str(mapping.acceptance_criterion_id)
                         for test_id in test_ids:
                             if test_id not in test_to_ac_mappings:
@@ -1200,7 +1545,12 @@ class RecommendationService:
                     "LOW": sum(1 for r in journey_risks if r.confidence == "LOW"),
                 },
                 "high_risk_journeys": [
-                    {"journey_id": r.journey_id, "journey_name": r.journey_name, "risk_level": r.risk_level, "risk_reason": r.risk_reason}
+                    {
+                        "journey_id": r.journey_id,
+                        "journey_name": {str(j.id): j.name for j in journeys}.get(str(r.journey_id), "Unknown Journey"),
+                        "risk_level": r.risk_level,
+                        "risk_reason": r.risk_reason
+                    }
                     for r in journey_risks if r.risk_level in ["HIGH", "CRITICAL"]
                 ],
             },
@@ -1352,20 +1702,50 @@ class RecommendationService:
         
         # Add behavior_coverage_matrix to impact_profile for API response
         impact_profile["behavior_coverage_matrix"] = behavior_coverage_matrix
-        
+
+        # Structured requirement package (Input 2) from the input snapshot
+        requirement_package = input_snapshot_resp.requirement_package
+        requirement_groups = input_snapshot_resp.requirement_groups or []
+        structured_acceptance_criteria = input_snapshot_resp.acceptance_criteria or []
+
+        # Add structured business requirement package (Input 2) to impact_profile
+        impact_profile["requirement_package"] = _serialize_datetime(requirement_package)
+        impact_profile["requirement_groups"] = _serialize_datetime(requirement_groups)
+        impact_profile["acceptance_criteria_count"] = len(structured_acceptance_criteria)
+        impact_profile["requirement_groups_count"] = len(requirement_groups)
+        impact_profile["requirement_package_id"] = requirement_package.get("id") if requirement_package else None
+
         # Generate business intent coverage matrix
         from app.services.business_intent_coverage_matrix_generator import BusinessIntentCoverageMatrixGenerator
         from app.services.acceptance_criteria_coverage_resolver import AcceptanceCriteriaCoverageResolver
         from app.services.acceptance_criteria_extractor import AcceptanceCriteriaExtractor
         from app.services.business_behavior_mapper import BusinessBehaviorMapper
         from app.services.expected_behavior_scenario_generator import ExpectedBehaviorScenarioGenerator
-        
-        # Extract acceptance criteria from PR description or use manual override
+
+        # Extract acceptance criteria from PR description or use structured requirement package
         ac_extractor = AcceptanceCriteriaExtractor(db=self.db)
 
-        # Prefer manually pasted AC if available
-        if manual_acceptance_criteria and len(manual_acceptance_criteria) > 0:
-            # Convert manual AC snapshot dicts to objects so downstream services can use attribute access
+        # Prefer structured requirement package ACs (with stable_ac_key) if available
+        if structured_acceptance_criteria and len(structured_acceptance_criteria) > 0:
+            from types import SimpleNamespace
+            acceptance_criteria = []
+            for ac in structured_acceptance_criteria:
+                ac_data = ac if isinstance(ac, dict) else vars(ac)
+                acceptance_criteria.append(SimpleNamespace(
+                    id=ac_data.get("id"),
+                    text=ac_data.get("text", ""),
+                    normalized_key=ac_data.get("normalized_key"),
+                    stable_ac_key=ac_data.get("stable_ac_key"),
+                    criterion_type=ac_data.get("criterion_type"),
+                    source=ac_data.get("source", "MANUAL_USER_INPUT"),
+                    confidence=ac_data.get("confidence", 1.0),
+                    evidence_excerpt=ac_data.get("evidence_excerpt"),
+                    priority=ac_data.get("priority", "SHOULD"),
+                    requirement_group_id=ac_data.get("requirement_group_id"),
+                ))
+            ac_evidence_gap = None  # No gap when structured ACs are available
+        elif manual_acceptance_criteria and len(manual_acceptance_criteria) > 0:
+            # Fallback to legacy BusinessIntentOverride ACs (without stable_ac_key)
             from types import SimpleNamespace
             acceptance_criteria = []
             for ac in manual_acceptance_criteria:
@@ -1374,15 +1754,17 @@ class RecommendationService:
                     id=ac_data.get("id"),
                     text=ac_data.get("text", ""),
                     normalized_key=ac_data.get("normalized_key"),
+                    stable_ac_key=ac_data.get("stable_ac_key"),
                     criterion_type=ac_data.get("criterion_type"),
                     source=ac_data.get("source", "MANUAL_USER_INPUT"),
                     confidence=ac_data.get("confidence", 1.0),
                     evidence_excerpt=ac_data.get("evidence_excerpt"),
                     priority=ac_data.get("priority", "SHOULD"),
+                    requirement_group_id=ac_data.get("requirement_group_id"),
                 ))
             ac_evidence_gap = None  # No gap when AC is manually provided
         else:
-            # Fall back to PR description extraction
+            # Fall back to PR description extraction (legacy)
             acceptance_criteria, ac_evidence_gap = ac_extractor.extract_from_pr_description(
                 pr_description=db_pr.title if db_pr else "",
                 repository_id=str(run_in.repository_id),
@@ -1433,7 +1815,7 @@ class RecommendationService:
         ac_coverage_resolver = AcceptanceCriteriaCoverageResolver(db=self.db)
         ac_coverage_report = ac_coverage_resolver.resolve_coverage(
             acceptance_criteria=acceptance_criteria,
-            existing_tests=adjusted_bundle.test_cases,
+            existing_tests=db_test_cases,
             behavior_scenario_coverages=behavior_scenario_coverages,
             suggested_scenarios=[],
             test_coverage_links=test_coverage_links,
@@ -1657,6 +2039,149 @@ class RecommendationService:
         
         impact_profile["completeness_assessment"] = completeness_assessment
 
+        # Input 2 snapshot data from the structured requirement package
+        requirement_package_id = None
+        requirement_package_snapshot = None
+        requirement_groups_snapshot = None
+        acceptance_criteria_snapshot = None
+        stable_ac_keys_snapshot = None
+        requirement_package_ready = False
+
+        if input_snapshot_resp.requirement_package:
+            requirement_package_snapshot = input_snapshot_resp.requirement_package
+            req_id_str = requirement_package_snapshot.get("id")
+            if req_id_str:
+                try:
+                    if isinstance(req_id_str, UUID):
+                        requirement_package_id = req_id_str
+                    else:
+                        requirement_package_id = UUID(str(req_id_str))
+                except ValueError:
+                    requirement_package_id = req_id_str
+            requirement_groups_snapshot = input_snapshot_resp.requirement_groups
+            acceptance_criteria_snapshot = input_snapshot_resp.acceptance_criteria
+            stable_ac_keys_snapshot = [
+                ac.get("stable_ac_key")
+                for ac in (acceptance_criteria_snapshot or [])
+                if ac.get("stable_ac_key")
+            ]
+            requirement_package_ready = bool(
+                requirement_package_snapshot and
+                acceptance_criteria_snapshot and
+                len(acceptance_criteria_snapshot) > 0
+            )
+
+        # Debug logs for generation inputs
+        logger.info(
+            "[RECOMMENDATION_GENERATION_INPUTS] repository_id=%s pull_request_id=%s "
+            "head_commit_sha=%s changed_files_count=%d requirement_package_id=%s "
+            "requirement_groups_count=%d acceptance_criteria_count=%d stable_ac_keys_count=%d "
+            "input_readiness_status=%s",
+            run_in.repository_id,
+            db_pr.id,
+            db_pr.head_commit_sha if db_pr else None,
+            len(changed_files),
+            requirement_package_id,
+            len(requirement_groups_snapshot) if requirement_groups_snapshot else 0,
+            len(acceptance_criteria_snapshot) if acceptance_criteria_snapshot else 0,
+            len(stable_ac_keys_snapshot) if stable_ac_keys_snapshot else 0,
+            readiness_assessment.readiness_level if hasattr(readiness_assessment, 'readiness_level') else "UNKNOWN"
+        )
+        logger.info(
+            "[RECOMMENDATION_GENERATION_CONTEXT] has_pr_package=%s has_changed_files=%s "
+            "has_business_requirements=%s has_stable_ac_ids=%s missing_inputs=%s",
+            bool(db_pr and db_pr.head_commit_sha),
+            len(changed_files) > 0,
+            requirement_package_ready,
+            bool(stable_ac_keys_snapshot),
+            [inp.get("key", "unknown") for inp in (readiness_assessment.missing_inputs if hasattr(readiness_assessment, 'missing_inputs') else [])]
+        )
+
+        # Construct changed_file_behavior_mappings
+        changed_file_behavior_mappings = []
+        if behavior_impact_res and "impacted_behaviors" in behavior_impact_res:
+            for ib in behavior_impact_res["impacted_behaviors"]:
+                for file_path in ib.get("impacted_files", []):
+                    changed_file_behavior_mappings.append({
+                        "file_path": file_path,
+                        "behavior_id": ib["behavior_id"],
+                        "behavior_name": ib["behavior_name"],
+                        "impact_level": ib["impact_level"],
+                        "impact_type": ib["impact_type"],
+                        "confidence": ib["confidence"]
+                    })
+        
+        behavior_context_status = "READY"
+        if hasattr(readiness_assessment, 'available_inputs') and readiness_assessment.available_inputs:
+            for item in readiness_assessment.available_inputs:
+                item_id = getattr(item, "input_id", None) or (item.get("input_id") if isinstance(item, dict) else None)
+                if item_id == "INPUT_3":
+                    behavior_context_status = getattr(item, "status", "READY") or (item.get("status") if isinstance(item, dict) else "READY")
+                    break
+
+        # Populate behavior-aware fields in impact_profile
+        impacted_behs = behavior_impact_res.get("impacted_behaviors", []) if behavior_impact_res else []
+        impact_profile["impacted_behaviors"] = _serialize_datetime(impacted_behs)
+        impact_profile["impacted_behavior_count"] = len(impacted_behs)
+        impact_profile["changed_file_behavior_mappings"] = changed_file_behavior_mappings
+        
+        req_beh_mappings = []
+        if business_behavior_mappings:
+            for m in business_behavior_mappings:
+                ac_id = getattr(m, "acceptance_criterion_id", None) or (m.get("acceptance_criterion_id") if isinstance(m, dict) else None)
+                beh_id = getattr(m, "behavior_id", None) or (m.get("behavior_id") if isinstance(m, dict) else None)
+                ac_obj = next((ac for ac in acceptance_criteria if getattr(ac, "id", None) == ac_id or (ac.get("id") if isinstance(ac, dict) else None) == ac_id), None) if acceptance_criteria else None
+                ac_text = getattr(ac_obj, "text", "") if ac_obj else ""
+                ac_key = getattr(ac_obj, "stable_ac_key", "") if ac_obj else ""
+                req_beh_mappings.append({
+                    "acceptance_criterion_id": str(ac_id) if ac_id else None,
+                    "acceptance_criterion_text": ac_text,
+                    "stable_ac_key": ac_key,
+                    "behavior_id": str(beh_id) if beh_id else None,
+                    "behavior_name": next((b.name for b in behaviors if str(b.id) == str(beh_id)), None) if behaviors else None,
+                    "match_confidence": getattr(m, "match_confidence", 0.5) or (m.get("match_confidence") if isinstance(m, dict) else 0.5),
+                    "reason": getattr(m, "reason", "") or (m.get("reason") if isinstance(m, dict) else "")
+                })
+        impact_profile["requirement_behavior_mappings"] = req_beh_mappings
+        
+        beh_reasons = []
+        for ib in impacted_behs:
+            beh_reasons.append(f"Behavior '{ib['behavior_name']}' is impacted ({ib['impact_level']}) because: {ib['impact_reason']}")
+        impact_profile["behavior_based_reasons"] = beh_reasons
+        
+        missing_scenarios = []
+        if 'behavior_coverage_gaps_early' in locals() and behavior_coverage_gaps_early:
+            for gap in behavior_coverage_gaps_early:
+                missing_scenarios.append({
+                    "scenario_title": gap.get("scenario_title") or gap.get("title"),
+                    "behavior_name": gap.get("behavior_name"),
+                    "priority": gap.get("priority", "MUST"),
+                    "reason": gap.get("reason", "No test coverage detected.")
+                })
+        impact_profile["missing_behavior_scenarios"] = missing_scenarios
+        
+        impact_profile["behavior_coverage_summary"] = {
+            "total_behaviors": len(behaviors) if behaviors else 0,
+            "impacted_behaviors_count": len(impacted_behs),
+            "uncovered_behaviors_count": len(behavior_intelligence["behavior_coverages"]) - sum(1 for c in behavior_intelligence["behavior_coverages"] if c.get("coverage_status") == "COVERED") if ('behavior_intelligence' in locals() and behavior_intelligence and "behavior_coverages" in behavior_intelligence) else 0,
+        }
+        
+        impact_profile["behavior_context_status"] = behavior_context_status
+        impact_profile["behavior_map_snapshot_hash"] = input_snapshot_resp.input_snapshot_hash if input_snapshot_resp else None
+
+        # Compute test inventory snapshot hash
+        test_inventory = input_snapshot_resp.test_inventory or []
+        test_inventory_dicts = [t if isinstance(t, dict) else (t.model_dump() if hasattr(t, "model_dump") else getattr(t, "__dict__", {})) for t in test_inventory]
+        test_inventory_snapshot_str = json.dumps(test_inventory_dicts, sort_keys=True, default=str)
+        test_inventory_snapshot_hash = hashlib.sha256(test_inventory_snapshot_str.encode("utf-8")).hexdigest()
+        test_inventory_status = "READY"
+        if not test_inventory:
+            test_inventory_status = "MISSING"
+        else:
+            missing_meta = [t for t in test_inventory_dicts if not t.get("stable_identity") or not t.get("source") or not t.get("test_type")]
+            if missing_meta:
+                test_inventory_status = "PARTIAL"
+
         db_run = RecommendationRun(
             id=uuid.uuid4(),
             repository_id=run_in.repository_id,
@@ -1724,9 +2249,58 @@ class RecommendationService:
             },
             generated_from_repository_id=run_in.repository_id,
             generated_from_pull_request_id=db_pr.id,
-            generation_context_version="v1.0"
+            generation_context_version="v2.0",
+            # Generation gate fields
+            generation_mode=getattr(run_in, 'generation_mode', None) or "confident",
+            is_draft=(getattr(run_in, 'generation_mode', None) == "draft"),
+            # Part 2: Direct PR snapshot fields for Input 1 auditability
+            head_commit_sha_at_generation=db_pr.head_commit_sha if db_pr else None,
+            base_commit_sha_at_generation=getattr(db_pr, 'base_commit_sha', None) if db_pr else None,
+            merge_commit_sha_at_generation=getattr(db_pr, 'merge_commit_sha', None) if db_pr else None,
+            changed_files_snapshot_json=_serialize_changed_files_snapshot(db_pr) if db_pr else None,
+            pr_package_ready_at_generation=_is_pr_package_ready(db_pr) if db_pr else False,
+            input_package_version="v2.0",
+            # Input 2 (Business Requirements) snapshot fields
+            requirement_package_id_at_generation=requirement_package_id,
+            requirement_package_snapshot_json=_serialize_datetime(requirement_package_snapshot),
+            requirement_groups_snapshot_json=_serialize_datetime(requirement_groups_snapshot),
+            acceptance_criteria_snapshot_json=_serialize_datetime(acceptance_criteria_snapshot),
+            stable_ac_keys_snapshot_json=_serialize_datetime(stable_ac_keys_snapshot),
+            requirement_package_ready_at_generation=requirement_package_ready,
+            # Input 3 (Behavior Mapping) snapshot fields
+            product_behavior_map_snapshot_json=_serialize_datetime(input_snapshot_resp.behaviors),
+            behavior_areas_snapshot_json=_serialize_datetime(input_snapshot_resp.journeys),
+            behavior_evidence_snapshot_json=_serialize_datetime(input_snapshot_resp.behavior_evidences),
+            changed_file_behavior_mappings_snapshot_json=_serialize_datetime(changed_file_behavior_mappings),
+            requirement_behavior_mappings_snapshot_json=_serialize_datetime(input_snapshot_resp.business_behavior_mappings),
+            behavior_map_source_commit_sha=db_pr.head_commit_sha if db_pr else None,
+            behavior_map_generated_at=datetime.utcnow(),
+            behavior_context_status=behavior_context_status,
+            # Input 4 (Test Case Inventory) snapshot fields
+            test_inventory_snapshot_json=_serialize_datetime(input_snapshot_resp.test_inventory),
+            stable_test_ids_snapshot_json=_serialize_datetime(
+                [getattr(t, "stable_identity", None) or (t.get("stable_identity") if isinstance(t, dict) else None) for t in (input_snapshot_resp.test_inventory or []) if (getattr(t, "stable_identity", None) or (isinstance(t, dict) and t.get("stable_identity")))]
+            ),
+            test_inventory_source_snapshot_json=_serialize_datetime(
+                [getattr(t, "source", None) or (t.get("source") if isinstance(t, dict) else None) for t in (input_snapshot_resp.test_inventory or []) if (getattr(t, "source", None) or (isinstance(t, dict) and t.get("source")))]
+            ),
+            test_inventory_snapshot_hash=test_inventory_snapshot_hash,
+            test_inventory_generated_at=datetime.utcnow(),
+            test_inventory_status_at_generation=test_inventory_status,
         )
         self.repo.create_run(db_run)
+
+        logger.info(
+            "[RECOMMENDATION_GENERATION_OUTPUT] run_id=%s head_commit_sha_at_generation=%s "
+            "changed_files_snapshot_count=%d requirement_groups_snapshot_count=%d "
+            "acceptance_criteria_snapshot_count=%d generation_status=%s",
+            db_run.id,
+            db_run.head_commit_sha_at_generation,
+            len(db_run.changed_files_snapshot_json) if db_run.changed_files_snapshot_json else 0,
+            len(db_run.requirement_groups_snapshot_json) if db_run.requirement_groups_snapshot_json else 0,
+            len(db_run.acceptance_criteria_snapshot_json) if db_run.acceptance_criteria_snapshot_json else 0,
+            db_run.recommendation_mode or "UNKNOWN"
+        )
 
         # 13b. Persist Journey Intelligence Snapshot
         from app.models.journey_intelligence_snapshot import JourneyIntelligenceSnapshot
@@ -1827,6 +2401,7 @@ class RecommendationService:
         from app.repositories.scenario_intent import ScenarioIntentRepository
         
         intent_repo = ScenarioIntentRepository(self.db)
+        has_low_confidence_test = False
         
         for t in ranked_bundle.ranked_candidates:
             tc_id_str = str(t.test_case_id)
@@ -1878,6 +2453,121 @@ class RecommendationService:
 
             # Persist clean, durable test record
             tc = tcs_map.get(tc_id_str)
+            
+            # Resolve execution status per test
+            status_val = "NOT_EXECUTED_FOR_CURRENT_PR"
+            action_val = "RUN_NOW"
+            included_val = not t.is_excluded
+
+            if tc:
+                from app.models.test_result import TestRun
+                tr_latest_current = self.db.query(TestResult).join(TestRun).filter(
+                    TestResult.test_case_id == tc.id,
+                    TestRun.repository_id == run_in.repository_id,
+                    TestRun.commit_sha == db_pr.head_commit_sha
+                ).order_by(TestRun.created_at.desc()).first()
+                # Fallback: some TestRun records use head_commit_sha column instead
+                if not tr_latest_current and db_pr.head_commit_sha:
+                    try:
+                        tr_latest_current = self.db.query(TestResult).join(TestRun).filter(
+                            TestResult.test_case_id == tc.id,
+                            TestRun.repository_id == run_in.repository_id,
+                            TestRun.head_commit_sha == db_pr.head_commit_sha
+                        ).order_by(TestRun.created_at.desc()).first()
+                    except Exception:
+                        pass
+
+                if tr_latest_current:
+                    status_lower = tr_latest_current.status.lower()
+                    if status_lower in ("passed", "success"):
+                        status_val = "ALREADY_PASSED_CURRENT_PR"
+                        action_val = "NO_RERUN_NEEDED"
+                        included_val = False
+                    elif status_lower in ("failed", "failure", "error"):
+                        status_val = "FAILED_CURRENT_PR"
+                        action_val = "BLOCK_RELEASE_OR_INVESTIGATE"
+                        included_val = True
+                    elif status_lower in ("skipped", "skip"):
+                        status_val = "SKIPPED_CURRENT_PR"
+                        action_val = "RUN_NOW"
+                        included_val = True
+                else:
+                    tr_any_past = self.db.query(TestResult).join(TestRun).filter(
+                        TestResult.test_case_id == tc.id,
+                        TestRun.repository_id == run_in.repository_id
+                    ).order_by(TestRun.created_at.desc()).first()
+
+                    if tr_any_past:
+                        status_val = "STALE_RESULT_RERUN_REQUIRED"
+                        action_val = "RUN_NOW"
+                        included_val = True
+                    else:
+                        score_val = t.priority_score
+                        if score_val >= 80.0 or score_val >= 0.8:
+                            status_val = "MUST_RUN"
+                        elif score_val >= 50.0 or score_val >= 0.5:
+                            status_val = "SHOULD_RUN"
+                        else:
+                            status_val = "OPTIONAL"
+                        action_val = "RUN_NOW"
+                        included_val = True
+            
+            # Check high-confidence evidence path
+            from app.services.traceability_graph_service import TraceabilityGraphService
+            path_trace = TraceabilityGraphService.get_evidence_path_for_recommendation(
+                db=self.db,
+                repository_id=run_in.repository_id,
+                pull_request_id=db_pr.id,
+                test_id=t.stable_identity
+            )
+            is_high_conf = len(path_trace) > 0 and all(
+                step.get("confidence", 1.0) is None or step.get("confidence", 1.0) >= 0.8
+                for step in path_trace if "confidence" in step
+            )
+            if not is_high_conf:
+                has_low_confidence_test = True
+
+            # Derive mapping_uncertainty from the review_status of any AC→Test or
+            # Behavior→Test edge in the evidence path. Unconfirmed mappings
+            # (system_suggested / needs_review / pending_review / unresolved) must
+            # be flagged so the UI can surface a mapping review prompt.
+            _UNCONFIRMED_STATUSES = {"system_suggested", "needs_review", "pending_review", "unresolved"}
+            mapping_uncertainty_val = None
+            for _step in path_trace:
+                _rs = _step.get("review_status")
+                if _rs in _UNCONFIRMED_STATUSES:
+                    mapping_uncertainty_val = _rs
+                    break
+
+            # If no path exists, also check the raw AC→Test edges directly for this test
+            if mapping_uncertainty_val is None and tc:
+                from app.models.traceability_edge import TraceabilityEdge
+                _direct_edges = self.db.query(TraceabilityEdge).filter(
+                    TraceabilityEdge.repository_id == run_in.repository_id,
+                    TraceabilityEdge.target_node_type == "TestCase",
+                    TraceabilityEdge.target_node_id == str(tc.id),
+                    TraceabilityEdge.is_active == True
+                ).all()
+                for _edge in _direct_edges:
+                    if _edge.review_status in _UNCONFIRMED_STATUSES:
+                        mapping_uncertainty_val = _edge.review_status
+                        break
+
+            # Promote to NEEDS_MAPPING_REVIEW when:
+            #   - mapping is unconfirmed (system_suggested / needs_review)
+            #   - AND no execution evidence for the current PR yet (NOT_EXECUTED*)
+            # Tests that already have current-PR execution evidence keep their execution
+            # status (FAILED / PASSED / SKIPPED) regardless of mapping confidence.
+            if (
+                mapping_uncertainty_val is not None
+                and status_val in ("NOT_EXECUTED_FOR_CURRENT_PR", "MUST_RUN", "SHOULD_RUN", "OPTIONAL")
+            ):
+                status_val = "NEEDS_MAPPING_REVIEW"
+                action_val = "CONFIRM_MAPPING_THEN_RUN"
+
+            if t.is_excluded:
+                included_val = False
+
             db_recommended_test = RecommendedTest(
                 id=uuid.uuid4(),
                 recommendation_run_id=db_run.id,
@@ -1889,11 +2579,19 @@ class RecommendationService:
                 reason=t.reasons[0] if engine_version_str in ("v3.0.0", "v3") else ("No direct coverage match found; selected tests using historical/path fallback." if not has_direct_coverage else (t.reasons[0] if t.reasons else "Recommended via algorithm fallback.")),
                 source_signal=t.evidence_sources[0] if t.evidence_sources else "UNKNOWN",
                 estimated_duration_seconds=t.execution_cost,
-                included=not t.is_excluded,
+                included=included_val,
                 warning=t.flaky_status if t.flaky_status in ("unstable", "quarantined") else None,
+                candidate_status=status_val,
+                active_action=action_val,
+                mapping_uncertainty=mapping_uncertainty_val,
+                evidence_path=path_trace if path_trace else None,
                 created_at=datetime.utcnow()
             )
             self.db.add(db_recommended_test)
+            
+        if has_low_confidence_test:
+            db_run.evidence_quality = "LOW"
+            db_run.recommendation_reasoning_summary += " | Warning: Low trust / NEEDS_MAPPING_REVIEW - Recommended test cases lack high-confidence evidence path."
 
         # 14.5 Generate and Persist structural explanations
         if 'v3_recs' not in locals() or not v3_recs:
@@ -2062,17 +2760,21 @@ class RecommendationService:
                     "priority": wi.priority
                 })
         
-        # Get acceptance criteria
+        # Get acceptance criteria (with stable_ac_key and requirement_group_id)
         from app.models.acceptance_criterion import AcceptanceCriterion
         ac_list = self.db.query(AcceptanceCriterion).filter(
-            AcceptanceCriterion.pull_request_id == db_pr.id
+            AcceptanceCriterion.pull_request_id == db_pr.id,
+            AcceptanceCriterion.status == "ACTIVE"
         ).all()
         for ac in sorted(ac_list, key=lambda x: str(x.id)):
             acceptance_criteria_snapshot.append({
                 "id": str(ac.id),
                 "text": ac.text,
+                "stable_ac_key": ac.stable_ac_key,
+                "normalized_key": ac.normalized_key,
                 "criterion_type": ac.criterion_type,
                 "source": ac.source,
+                "requirement_group_id": str(ac.requirement_group_id) if ac.requirement_group_id else None,
                 "external_work_item_id": None
             })
         
@@ -2104,6 +2806,19 @@ class RecommendationService:
         if "external_context_evidence_gaps" in impact_profile:
             external_context_gaps_snapshot = impact_profile["external_context_evidence_gaps"]
         
+        # Compute test inventory snapshot hash
+        test_inventory = input_snapshot_resp.test_inventory or []
+        test_inventory_dicts = [t if isinstance(t, dict) else (t.model_dump() if hasattr(t, "model_dump") else getattr(t, "__dict__", {})) for t in test_inventory]
+        test_inventory_snapshot_str = json.dumps(test_inventory_dicts, sort_keys=True, default=str)
+        test_inventory_snapshot_hash = hashlib.sha256(test_inventory_snapshot_str.encode("utf-8")).hexdigest()
+        test_inventory_status = "READY"
+        if not test_inventory:
+            test_inventory_status = "MISSING"
+        else:
+            missing_meta = [t for t in test_inventory_dicts if not t.get("stable_identity") or not t.get("source") or not t.get("test_type")]
+            if missing_meta:
+                test_inventory_status = "PARTIAL"
+
         db_snapshot = RecommendationInputSnapshot(
             recommendation_run_id=db_run.id,
             changed_files=changed_files,
@@ -2111,7 +2826,8 @@ class RecommendationService:
                 {"test_case_id": tc_id_str} for tc_id_str in coverage_evidence.direct_test_mappings
             ],
             heuristic_mappings_used=[
-                {"test_case_id": str(h.test_case_id), "type": h.heuristic_type} for h in (heuristic_bundle.heuristic_test_candidates if 'heuristic_bundle' in locals() else [])
+                {"test_case_id": str(h.test_case_id), "type": h.heuristic_type}
+                for h in (heuristic_bundle.heuristic_test_candidates if heuristic_bundle else [])
             ],
             dependency_files_expanded=dep_expansion.expanded_files,
             coverage_links_used=[
@@ -2129,6 +2845,15 @@ class RecommendationService:
             external_requirement_coverage=external_requirement_coverage_snapshot,
             integration_sync_status=integration_sync_status_snapshot,
             external_context_gaps=external_context_gaps_snapshot,
+            requirement_package=_serialize_datetime(input_snapshot_resp.requirement_package),
+            requirement_groups=_serialize_datetime(input_snapshot_resp.requirement_groups),
+            stable_ac_keys=_serialize_datetime(stable_ac_keys_snapshot),
+            business_behavior_mappings=_serialize_datetime(input_snapshot_resp.business_behavior_mappings),
+            behavior_scenario_coverages=_serialize_datetime(input_snapshot_resp.behavior_scenario_coverages),
+            test_inventory=_serialize_datetime(test_inventory),
+            test_inventory_snapshot_hash=test_inventory_snapshot_hash,
+            test_inventory_snapshot_generated_at=datetime.utcnow(),
+            test_inventory_status_at_generation=test_inventory_status,
             created_at=datetime.utcnow()
         )
         self.db.add(db_snapshot)

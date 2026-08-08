@@ -21,7 +21,7 @@ class BusinessBehaviorMapper:
     # Confidence thresholds
     HIGH_CONFIDENCE_THRESHOLD = 0.8
     MEDIUM_CONFIDENCE_THRESHOLD = 0.5
-    LOW_CONFIDENCE_THRESHOLD = 0.3
+    LOW_CONFIDENCE_THRESHOLD = 0.2
     
     # Synonym mappings for behavior matching
     BEHAVIOR_SYNONYMS = {
@@ -353,6 +353,11 @@ class BusinessBehaviorMapper:
         if not self.db:
             self.db = db
         
+        # Guard against None inputs
+        business_change_summary = business_change_summary or ""
+        acceptance_criteria_text = acceptance_criteria_text or ""
+        affected_users_journeys = affected_users_journeys or ""
+
         # Combine all text for analysis
         combined_text = f"{business_change_summary} {acceptance_criteria_text}"
         if affected_users_journeys:

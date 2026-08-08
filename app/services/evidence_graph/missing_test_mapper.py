@@ -10,6 +10,9 @@ from app.services.regression_evidence_classifier import (
     RequirementNode,
     EvidenceClassification,
 )
+from app.schemas.regression_scope_v2 import DetailedScenario
+from app.services.evidence_graph.recommendation_detail_builder import build_detailed_scenario
+from app.services.evidence_graph.rationale_builder import build_rationale
 
 
 class MissingTestGenerationError(Exception):
@@ -33,6 +36,9 @@ class MissingTestCard:
     best_rejected_candidate: str = ""
     best_rejected_candidate_score: float = 0.0
     best_rejected_candidate_rejection_reason: str = ""
+    detailed_scenario: Optional[DetailedScenario] = None
+    risk_rationale: str = ""
+
 
 
 class MissingTestMapper:
@@ -164,6 +170,42 @@ class MissingTestMapper:
         # Extract best rejected candidate metadata
         best_rejected_candidate, best_rejected_score, best_rejected_reason = self._extract_best_rejected_candidate(req, match_table)
 
+        # Gather existing test names from match table for untested check
+        existing_test_names = set()
+        if match_table:
+            for entry in match_table:
+                if getattr(entry, "candidate_test_title", None):
+                    existing_test_names.add(entry.candidate_test_title)
+
+        # Build detailed scenario
+        scenarios = build_detailed_scenario(
+            source="REQUIREMENT_GAP",
+            requirement_node=req,
+            coverage_gap_info=None,
+            flow_name=req.flow,
+            existing_tests=existing_test_names
+        )
+        detailed_scenario = scenarios[0] if scenarios else None
+
+        # Build rationale
+        existing_test_info = None
+        if match_table:
+            entry = next((e for e in match_table if e.requirement_id == req.requirement_id), None)
+            if entry:
+                existing_test_info = {
+                    "name": entry.candidate_test_title,
+                    "covers": "the basic behavior",
+                    "count": len([e for e in match_table if e.requirement_id == req.requirement_id])
+                }
+
+        risk_rationale = build_rationale(
+            source="REQUIREMENT_GAP",
+            requirement_node=req,
+            change_summary=None,
+            existing_test_info=existing_test_info,
+            gap_description=req.title
+        )
+
         return MissingTestCard(
             requirement_id=req.requirement_id,
             readable_id=req.readable_id,
@@ -177,7 +219,9 @@ class MissingTestMapper:
             why_current_pr_execution_did_not_cover_it=why_current_pr_did_not_cover,
             best_rejected_candidate=best_rejected_candidate,
             best_rejected_candidate_score=best_rejected_score,
-            best_rejected_candidate_rejection_reason=best_rejected_reason
+            best_rejected_candidate_rejection_reason=best_rejected_reason,
+            detailed_scenario=detailed_scenario,
+            risk_rationale=risk_rationale
         )
 
     def _generate_test_objective(self, req: RequirementNode) -> str:

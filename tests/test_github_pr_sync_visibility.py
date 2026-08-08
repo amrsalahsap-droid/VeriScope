@@ -339,6 +339,44 @@ class TestPRSyncVisibility:
         db_session.delete(pr)
         db_session.commit()
 
+    # ------------------------------------------------------------------
+    # Test 9: GET /github/repositories/{repo_id}/pull-requests API Endpoint
+    # ------------------------------------------------------------------
+    def test_get_pull_requests_api_endpoint(self, db_session: Session, test_repository):
+        """GET /github/repositories/{repository_id}/pull-requests returns 200 and correctly serialized fields without raising a 500 error."""
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        db_session.query(PullRequest).filter(
+            PullRequest.github_pr_id == 8880009,
+            PullRequest.repository_id == test_repository.id
+        ).delete()
+        db_session.commit()
+
+        pr = _make_pr(test_repository.id, 8880009, 8009)
+        db_session.add(pr)
+        db_session.commit()
+        db_session.refresh(pr)
+
+        client = TestClient(app)
+        response = client.get(f"/github/repositories/{test_repository.id}/pull-requests")
+        assert response.status_code == 200
+        data = response.json()
+        assert "pull_requests" in data
+
+        prs = data["pull_requests"]
+        assert len(prs) >= 1
+        matched_prs = [p for p in prs if p["id"] == str(pr.id)]
+        assert len(matched_prs) == 1
+        matched_pr = matched_prs[0]
+        assert matched_pr["number"] == 8009
+        assert matched_pr["base_commit_sha"] is None
+        assert matched_pr["merge_commit_sha"] is None
+
+        db_session.delete(pr)
+        db_session.commit()
+
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

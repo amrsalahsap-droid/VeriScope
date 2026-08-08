@@ -11,7 +11,7 @@ export interface RegressionScopeV2DisplayProps {
   showExclusions?: boolean;
   auditMode?: boolean;
   compact?: boolean;
-  onModeChange?: (mode: "targeted" | "risk_based" | "full") => void;
+  onModeChange?: (mode: "targeted" | "risk_based" | "full_suite") => void;
   onOpenHistory?: (item: any) => void;
 }
 
@@ -32,19 +32,37 @@ export const RegressionScopeV2Display: React.FC<RegressionScopeV2DisplayProps> =
   const activeShowExclusions = showExclusions !== undefined ? showExclusions : localShowExclusions;
   const activeAuditMode = auditMode !== undefined ? auditMode : localAuditMode;
 
-  const currentMode = (scope.scope_type?.toLowerCase() as "targeted" | "risk_based" | "full") || "targeted";
+  const rawMode = scope.scope_type?.toLowerCase();
+  const currentMode = (rawMode === "full" || rawMode === "full_suite")
+    ? "full_suite"
+    : (rawMode as "targeted" | "risk_based" | "full_suite") || "targeted";
 
-  const handleModeChange = (mode: "targeted" | "risk_based" | "full") => {
+  const handleModeChange = (mode: "targeted" | "risk_based" | "full_suite") => {
     if (onModeChange) {
       onModeChange(mode);
     }
   };
 
+  React.useEffect(() => {
+    if (scope && scope.integrity) {
+      console.log("SCOPE_FINAL_INTEGRITY", {
+        status: scope.integrity.integrity_status,
+        totalUnique: scope.integrity.total_unique_logical_items,
+        bucketSum: scope.integrity.bucket_sum,
+        errors: scope.integrity.integrity_errors,
+        warnings: scope.integrity.integrity_warnings,
+        duplicateIdentities: scope.integrity.duplicate_identities
+      });
+    }
+  }, [scope]);
+
   // Extract items for each group
   const requiredItems = scope.groups?.[ScopeGroup.REQUIRED]?.items || [];
+  const reviewNeededItems = scope.groups?.[ScopeGroup.REVIEW_NEEDED]?.items || [];
   const recommendedItems = scope.groups?.[ScopeGroup.RECOMMENDED]?.items || [];
   const optionalItems = scope.groups?.[ScopeGroup.OPTIONAL]?.items || [];
   const safeToSkipItems = scope.groups?.[ScopeGroup.SAFE_TO_SKIP]?.items || [];
+  const deferredCoverageDebtItems = scope.groups?.[ScopeGroup.DEFERRED_COVERAGE_DEBT]?.items || [];
   
   const verifiedItems = scope.groups?.[ScopeGroup.EXCLUDED_ALREADY_VERIFIED]?.items 
     || scope.exclusions?.already_verified_items 
@@ -85,8 +103,8 @@ export const RegressionScopeV2Display: React.FC<RegressionScopeV2DisplayProps> =
 
       {/* Execution Plan & Settings Toolbar */}
       <div className="space-y-4">
-        {(scope.execution_plan || scope.executionPlan) && (
-          <ExecutionPlanDisplay executionPlan={scope.execution_plan || scope.executionPlan} compact={compact} />
+        {scope.execution_plan && (
+          <ExecutionPlanDisplay executionPlan={scope.execution_plan} compact={compact} verifiedCount={verifiedItems.length} />
         )}
 
         {/* Toolbar */}
@@ -151,6 +169,20 @@ export const RegressionScopeV2Display: React.FC<RegressionScopeV2DisplayProps> =
           compact={compact}
           onOpenHistory={onOpenHistory}
         />
+        
+        {/* REVIEW NEEDED */}
+        {reviewNeededItems.length > 0 && (
+          <ScopeGroupDisplay
+            title="Review Needed"
+            description="Passed execution with unknown freshness or mapping gaps requiring analysis."
+            group={ScopeGroup.REVIEW_NEEDED}
+            items={reviewNeededItems}
+            emptyMessage="No items require review."
+            auditMode={activeAuditMode}
+            compact={compact}
+            onOpenHistory={onOpenHistory}
+          />
+        )}
 
         {/* RECOMMENDED */}
         <ScopeGroupDisplay
@@ -176,8 +208,22 @@ export const RegressionScopeV2Display: React.FC<RegressionScopeV2DisplayProps> =
           onOpenHistory={onOpenHistory}
         />
 
-        {/* SAFE_TO_SKIP */}
-        {activeShowSafeToSkip && (
+        {/* DEFERRED COVERAGE DEBT */}
+        {deferredCoverageDebtItems.length > 0 && (
+          <ScopeGroupDisplay
+            title="Deferred Coverage Debt"
+            description="Lower-priority unmapped targets deferred to avoid release blocking."
+            group={ScopeGroup.DEFERRED_COVERAGE_DEBT}
+            items={deferredCoverageDebtItems}
+            emptyMessage="No deferred coverage debt."
+            auditMode={activeAuditMode}
+            compact={compact}
+            onOpenHistory={onOpenHistory}
+          />
+        )}
+
+        {/* SAFE_TO_SKIP - shown when showSafeToSkip is true */}
+        {activeShowSafeToSkip && safeToSkipItems.length > 0 && (
           <ScopeGroupDisplay
             title="Safe To Skip"
             description="Skipped test suites with no code coverage gaps or risk triggers."
@@ -191,29 +237,32 @@ export const RegressionScopeV2Display: React.FC<RegressionScopeV2DisplayProps> =
         )}
 
         {/* EXCLUSIONS */}
+        {/* Already Verified - shown when exclusions or audit mode */}
         {(activeShowExclusions || activeAuditMode) && (
-          <>
-            <ScopeGroupDisplay
-              title="Already Verified"
-              description="Exclusions already validated in the current run."
-              group={ScopeGroup.EXCLUDED_ALREADY_VERIFIED}
-              items={verifiedItems}
-              emptyMessage="No already verified items."
-              auditMode={activeAuditMode}
-              compact={compact}
-              onOpenHistory={onOpenHistory}
-            />
-            <ScopeGroupDisplay
-              title="Already Passed Tests"
-              description="Exclusions based on identical execution history."
-              group={ScopeGroup.EXCLUDED_ALREADY_PASSED_TESTS}
-              items={passedItems}
-              emptyMessage="No already passed tests."
-              auditMode={activeAuditMode}
-              compact={compact}
-              onOpenHistory={onOpenHistory}
-            />
-          </>
+          <ScopeGroupDisplay
+            title="Already Verified"
+            description="Tests passed on current commit. No action required."
+            group={ScopeGroup.EXCLUDED_ALREADY_VERIFIED}
+            items={verifiedItems}
+            emptyMessage="No already verified items."
+            auditMode={activeAuditMode}
+            compact={compact}
+            onOpenHistory={onOpenHistory}
+          />
+        )}
+        
+        {/* Already Passed Tests - shown when exclusions or audit mode */}
+        {(activeShowExclusions || activeAuditMode) && (
+          <ScopeGroupDisplay
+            title="Already Passed Tests"
+            description="Exclusions based on identical execution history."
+            group={ScopeGroup.EXCLUDED_ALREADY_PASSED_TESTS}
+            items={passedItems}
+            emptyMessage="No already passed tests."
+            auditMode={activeAuditMode}
+            compact={compact}
+            onOpenHistory={onOpenHistory}
+          />
         )}
       </div>
 

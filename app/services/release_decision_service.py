@@ -226,7 +226,64 @@ class ReleaseDecisionService:
         db.commit()
         db.refresh(decision)
 
+        # Record outcome signals for skipped required items when approved with override
+        if decision_status == "APPROVED_WITH_OVERRIDE":
+            ReleaseDecisionService._record_release_outcome(
+                db,
+                str(run.id),
+                decision_status,
+                data.get("skipped_required_items", []),
+                str(run.repository_id),
+                str(run.workspace_id) if run.workspace_id else None
+            )
+
         return decision
+
+    @staticmethod
+    def _record_release_outcome(
+        db: Session,
+        recommendation_run_id: str,
+        decision: str,
+        skipped_required_items: List[str],
+        repository_id: str,
+        workspace_id: str
+    ):
+        """
+        Record outcome signals for skipped items
+        when approved with override.
+        """
+        if decision != "APPROVED_WITH_OVERRIDE":
+            return
+        
+        from app.models.pattern_memory_v2 import PatternMemoryV2
+        import uuid
+        
+        for ac_key in skipped_required_items:
+            existing = db.query(PatternMemoryV2).filter(
+                PatternMemoryV2.pattern_key == ac_key,
+                PatternMemoryV2.repository_id == repository_id
+            ).first()
+            
+            if existing:
+                existing.usage_count += 1
+                existing.strength = min(
+                    1.0, 
+                    existing.strength + 0.1
+                )
+            else:
+                signal = PatternMemoryV2(
+                    id=uuid.uuid4(),
+                    repository_id=repository_id,
+                    workspace_id=workspace_id,
+                    pattern_key=ac_key,
+                    signal_type="OVERRIDE_WARNING",
+                    strength=0.3,
+                    confidence=0.5,
+                    usage_count=1
+                )
+                db.add(signal)
+        
+        db.commit()
 
     @staticmethod
     def reset_release_decision(

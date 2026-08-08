@@ -51,12 +51,24 @@ router = APIRouter(tags=["cicd-governance"])
 
 def require_permission(permission: str):
     """Dependency to check if user has required permission."""
-    def check(
+    async def check(
         workspace_id: uuid.UUID,
+        request: Request,
         repository_id: uuid.UUID = None,
         db: Session = Depends(get_db),
         current_user: User = Depends(get_current_user)
     ):
+        from fastapi import Request
+        
+        # Resolve repository_id from body for POST/PUT requests if not in path
+        if not repository_id and request.method in ("POST", "PUT", "PATCH"):
+            try:
+                body = await request.json()
+                if body and "repository_id" in body:
+                    repository_id = uuid.UUID(body["repository_id"])
+            except Exception:
+                pass
+
         result = GovernancePermissionService.require_permission(
             db=db,
             user_id=current_user.id,
@@ -299,8 +311,8 @@ def execute_bulk_operation(
             workspace_id=workspace_id,
             actor_id=current_user.id,
             operation_type=payload.operation,
-            success_count=result.success_count,
-            failure_count=result.failure_count
+            success_count=result.get("succeededCount", 0),
+            failure_count=result.get("failedCount", 0)
         )
     
     return result

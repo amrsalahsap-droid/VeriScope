@@ -71,10 +71,10 @@ class BehaviorCoverageAnalyzer:
                 reason_parts = []
                 suggested_action = "Automate Scenario validation"
 
-                # Gather existing test cases mapped
+                # Gather existing test cases mapped (ignore LOW confidence mappings)
                 existing_tests = [
                     {"test_identifier": m["test_identifier"], "confidence": m["confidence"], "source_signal": m["source_signal"]}
-                    for m in s_mappings
+                    for m in s_mappings if m["confidence"] in ["HIGH", "MEDIUM"]
                 ]
 
                 # Check if current PR executed and verified this scenario (via mapped tests or token match)

@@ -19,12 +19,16 @@ export async function GET(request: Request) {
       backendUrl.searchParams.set("repository_id", repositoryId);
     }
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
     const res = await fetch(backendUrl.toString(), {
       headers: {
         Authorization: `Bearer ${session.backendToken}`,
       },
       cache: "no-store",
+      signal: controller.signal,
     });
+    clearTimeout(timeoutId);
 
     const body = await res.json().catch(() => ({}));
 

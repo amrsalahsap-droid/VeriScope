@@ -30,7 +30,11 @@ class CICDPolicyPresetService:
             definition = get_preset_definition(preset_name)
             presets.append({
                 "name": preset_name,
-                "definition": definition
+                "description": definition.get("description", ""),
+                "risk_level": definition.get("risk_level", ""),
+                "recommended_use_case": definition.get("recommended_use_case", ""),
+                "settings": definition.get("settings", {}),
+                "impact": definition.get("impact", {})
             })
         return presets
     

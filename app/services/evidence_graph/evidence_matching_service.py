@@ -37,6 +37,7 @@ class MatchTableEntry:
     contradiction_rule_triggered: str = ""
     matching_dimensions: Dict[str, Any] = field(default_factory=dict)
     current_pr_execution_id: str = ""
+    mapping_type: str = "FUZZY"
 class EvidenceMatchingService:
     """Service for matching requirements to evidence using 6-layer pipeline."""
 
@@ -150,6 +151,70 @@ class EvidenceMatchingService:
             return MatchResult(score=0.0, diagnostics=diagnostics, test_id=test.test_id)
 
         # Step 2: Exact Signature Match
+        # Check if the test case has a declared_ac_id value
+        declared_ac_id = getattr(test, "declared_ac_id", None)
+        if not declared_ac_id and test.acceptance_criterion_metadata:
+            declared_ac_id = test.acceptance_criterion_metadata.get("acceptance_criterion_id") or test.acceptance_criterion_metadata.get("ac_id")
+
+        if declared_ac_id is not None:
+            from app.db.session import SessionLocal
+            from app.models.acceptance_criterion import AcceptanceCriterion
+            from sqlalchemy import func, or_
+            
+            matched_ac = None
+            try:
+                with SessionLocal() as db:
+                    curr_ac = db.query(AcceptanceCriterion).filter(AcceptanceCriterion.id == requirement.requirement_id).first()
+                    if curr_ac:
+                        repo_id = curr_ac.repository_id
+                        val = str(declared_ac_id).lower()
+                        
+                        model_cols = [c.name for c in AcceptanceCriterion.__table__.columns]
+                        filters = []
+                        if "normalized_key" in model_cols:
+                            filters.append(func.lower(AcceptanceCriterion.normalized_key) == val)
+                            filters.append(func.lower(AcceptanceCriterion.normalized_key).contains(val))
+                        if "external_id" in model_cols:
+                            filters.append(func.lower(AcceptanceCriterion.external_id) == val)
+                            filters.append(func.lower(AcceptanceCriterion.external_id).contains(val))
+                        if "label" in model_cols:
+                            filters.append(func.lower(AcceptanceCriterion.label) == val)
+                            filters.append(func.lower(AcceptanceCriterion.label).contains(val))
+                        if "text" in model_cols:
+                            filters.append(func.lower(AcceptanceCriterion.text) == val)
+                            filters.append(func.lower(AcceptanceCriterion.text).contains(val))
+                            
+                        matched_ac = db.query(AcceptanceCriterion).filter(
+                            AcceptanceCriterion.repository_id == repo_id,
+                            or_(*filters)
+                        ).first()
+            except Exception:
+                pass
+                
+            if matched_ac:
+                if str(matched_ac.id) == str(requirement.requirement_id):
+                    diagnostics["signals"].append("Direct ID match")
+                    diagnostics["layer_scores"]["direct_id"] = 1.0
+                    diagnostics["mapping_type"] = "DIRECT_AC_ID"
+                    diagnostics["matching_dimensions"] = self._get_matching_dimensions(requirement, test)
+                    return MatchResult(score=1.0, diagnostics=diagnostics, test_id=test.test_id)
+                else:
+                    return MatchResult(score=0.0, diagnostics=diagnostics, test_id=test.test_id)
+            else:
+                # Fallback to local python object matching if database query failed or returned None
+                val = str(declared_ac_id).lower()
+                if (val == requirement.requirement_id.lower() or
+                    val in requirement.requirement_id.lower() or
+                    val == requirement.readable_id.lower() or
+                    val in requirement.readable_id.lower() or
+                    val == requirement.title.lower() or
+                    val in requirement.title.lower()):
+                    diagnostics["signals"].append("Direct ID match")
+                    diagnostics["layer_scores"]["direct_id"] = 1.0
+                    diagnostics["mapping_type"] = "DIRECT_AC_ID"
+                    diagnostics["matching_dimensions"] = self._get_matching_dimensions(requirement, test)
+                    return MatchResult(score=1.0, diagnostics=diagnostics, test_id=test.test_id)
+
         exact_match_score = self._check_exact_signature_match(requirement, test)
         diagnostics["layer_scores"]["exact_signature"] = exact_match_score
         if exact_match_score >= 1.0:
@@ -253,6 +318,7 @@ class EvidenceMatchingService:
             contradiction_rule = best_result.diagnostics.get("contradiction_rule_triggered", "")
             matching_dimensions = best_result.diagnostics.get("matching_dimensions", {})
             execution_id = execution.test_id if execution else ""
+            mapping_type = best_result.diagnostics.get("mapping_type", "FUZZY")
 
             self.match_table.append(MatchTableEntry(
                 requirement_id=requirement.requirement_id,
@@ -265,7 +331,8 @@ class EvidenceMatchingService:
                 rejection_reason=rejection_reason,
                 contradiction_rule_triggered=contradiction_rule,
                 matching_dimensions=matching_dimensions,
-                current_pr_execution_id=execution_id
+                current_pr_execution_id=execution_id,
+                mapping_type=mapping_type
             ))
 
         is_confident = best_score >= self.AUTO_MATCH_THRESHOLD if best_result else False
@@ -668,6 +735,8 @@ class EvidenceMatchingService:
         """Normalize title for comparison with verb normalization and domain term preservation."""
         # Split camelCase first (using the original title's casing)
         normalized = re.sub(r'([a-z])([A-Z])', r'\1 \2', title)
+        # Remove leading numbering/prefixes like "7.", "AC-07", "07 -", "1 -"
+        normalized = re.sub(r'^(?:ac[- ]*\d+|\d+)[-.\s]*', '', normalized, flags=re.IGNORECASE)
         normalized = normalized.lower()
         normalized = re.sub(r'[_-]', ' ', normalized)
         normalized = re.sub(r'[^\w\s]', ' ', normalized)

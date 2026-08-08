@@ -81,7 +81,7 @@ export function mapBackendHealthToDisplay(
     case "READY":
       return {
         state: "Ready",
-        reason: "All required evidence is covered. No remaining gaps.",
+        reason: "Recommendation Generated. Current PR evidence processed. Review release blockers below.",
         cta: "Create Regression Scope",
         ctaAction: "create",
       };

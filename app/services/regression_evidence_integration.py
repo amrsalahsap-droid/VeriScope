@@ -64,6 +64,7 @@ class RegressionEvidenceIntegration:
                 parent_requirement_id=None,
                 scenario_signature=signature,
                 source_number=ac.source_number,  # Phase 6.4: Add source_number for manual evidence matching
+                database_ac_id=str(ac.id)  # Phase 6: Store database AC ID for evidence overlay cross-reference
             )
             requirement_nodes.append(req_node)
 
@@ -77,6 +78,16 @@ class RegressionEvidenceIntegration:
         """Build TestNodes from TestCase models."""
         if context is None:
             context = {}
+
+        # Bulk load DIRECT_AC_ID links for these test cases
+        tc_ids = [tc.id for tc in test_cases]
+        link_map = {}
+        if tc_ids:
+            links = self.db.query(FileTestLink).filter(
+                FileTestLink.test_case_id.in_(tc_ids),
+                FileTestLink.mapping_type == "DIRECT_AC_ID"
+            ).all()
+            link_map = {link.test_case_id: link.file_path for link in links}
 
         test_nodes = []
         for tc in test_cases:
@@ -94,6 +105,25 @@ class RegressionEvidenceIntegration:
             # Determine test type from stable_identity or suite_name
             test_type = self._determine_test_type(tc)
 
+            # Reconstruct acceptance_criterion_metadata and declared_ac_id
+            ac_metadata = None
+            declared_ac_id = None
+            if hasattr(tc, "acceptance_criterion_metadata") and tc.acceptance_criterion_metadata:
+                ac_metadata = tc.acceptance_criterion_metadata
+                declared_ac_id = ac_metadata.get("acceptance_criterion_id") or ac_metadata.get("ac_id")
+            elif tc.id in link_map:
+                declared_ac_id = link_map[tc.id]
+                ac_metadata = {
+                    "acceptance_criterion_id": declared_ac_id,
+                    "ac_id": declared_ac_id
+                }
+            elif hasattr(tc, "declared_ac_id") and tc.declared_ac_id:
+                declared_ac_id = tc.declared_ac_id
+                ac_metadata = {
+                    "acceptance_criterion_id": declared_ac_id,
+                    "ac_id": declared_ac_id
+                }
+
             test_node = TestNode(
                 test_id=str(tc.id),
                 title=tc.test_name,
@@ -106,7 +136,8 @@ class RegressionEvidenceIntegration:
                 scenario_signature=signature,
                 scenario_signature_hash=ScenarioSignatureGenerator.compute_signature_hash(signature),
                 properties=getattr(tc, "properties", {}),
-                acceptance_criterion_metadata=getattr(tc, "acceptance_criterion_metadata", None),
+                acceptance_criterion_metadata=ac_metadata,
+                declared_ac_id=declared_ac_id
             )
             test_nodes.append(test_node)
 
@@ -123,10 +154,41 @@ class RegressionEvidenceIntegration:
         if test_map is None:
             test_map = {}
 
+        # Bulk load DIRECT_AC_ID links for these test results
+        tc_ids = [tr.test_case_id for tr in test_results if tr.test_case_id]
+        link_map = {}
+        if tc_ids:
+            links = self.db.query(FileTestLink).filter(
+                FileTestLink.test_case_id.in_(tc_ids),
+                FileTestLink.mapping_type == "DIRECT_AC_ID"
+            ).all()
+            link_map = {link.test_case_id: link.file_path for link in links}
+
         execution_nodes = []
         for tr in test_results:
             # Find corresponding test node
             test_node = test_map.get(str(tr.test_case_id))
+
+            ac_metadata = None
+            declared_ac_id = None
+            if hasattr(tr, "acceptance_criterion_metadata") and tr.acceptance_criterion_metadata:
+                ac_metadata = tr.acceptance_criterion_metadata
+                declared_ac_id = ac_metadata.get("acceptance_criterion_id") or ac_metadata.get("ac_id")
+            elif test_node and getattr(test_node, "declared_ac_id", None):
+                declared_ac_id = test_node.declared_ac_id
+                ac_metadata = test_node.acceptance_criterion_metadata
+            elif tr.test_case_id in link_map:
+                declared_ac_id = link_map[tr.test_case_id]
+                ac_metadata = {
+                    "acceptance_criterion_id": declared_ac_id,
+                    "ac_id": declared_ac_id
+                }
+            elif hasattr(tr, "declared_ac_id") and tr.declared_ac_id:
+                declared_ac_id = tr.declared_ac_id
+                ac_metadata = {
+                    "acceptance_criterion_id": declared_ac_id,
+                    "ac_id": declared_ac_id
+                }
 
             execution_node = ExecutionNode(
                 test_id=str(tr.id),
@@ -140,7 +202,8 @@ class RegressionEvidenceIntegration:
                 mapped_test_node_id=str(tr.test_case_id) if tr.test_case else None,
                 mapped_requirement_ids=[],  # Will be populated by matching
                 properties=getattr(tr, "properties", {}),
-                acceptance_criterion_metadata=getattr(tr, "acceptance_criterion_metadata", None),
+                acceptance_criterion_metadata=ac_metadata,
+                declared_ac_id=declared_ac_id
             )
             execution_nodes.append(execution_node)
 

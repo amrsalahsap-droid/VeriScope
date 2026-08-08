@@ -288,6 +288,7 @@ class RecommendationLogicV3:
         from app.models.journey import Journey
         from app.models.behavior_evidence import BehaviorEvidence as BehaviorEvidenceModel
         from app.models.behavior_scenario import BehaviorScenario
+        from app.models.behavior_scenario_coverage import BehaviorScenarioCoverage
         from app.models.journey_behavior import JourneyBehavior
         from app.services.behavior_impact_analyzer import BehaviorImpactAnalyzer
 
@@ -300,6 +301,10 @@ class RecommendationLogicV3:
         repo_journey_behaviors = db.query(JourneyBehavior).all()
         repo_behavior_evidences = db.query(BehaviorEvidenceModel).all()
         repo_behavior_scenarios = db.query(BehaviorScenario).all()
+        # Use BehaviorScenarioCoverage for test-to-scenario linkage
+        repo_behavior_scenario_coverages = db.query(BehaviorScenarioCoverage).filter(
+            BehaviorScenarioCoverage.repository_id == repository_id
+        ).all()
 
         # Run behavior impact analysis
         behavior_impact_analyzer = BehaviorImpactAnalyzer(db=db)
@@ -512,8 +517,9 @@ class RecommendationLogicV3:
                         learning_score += 25
                         learning_signals.append("escaped_defect")
                     elif pm.signal_type == SIGNAL_TYPE_ROLLBACK:
-                        # Previous rollback: -10 (fragile)
-                        learning_score -= 10
+                        # Rollback signals indicate high-risk areas. 
+                        # Increase priority score, do not decrease it.
+                        learning_score += 30
                         learning_signals.append("rollback")
                     elif pm.signal_type == SIGNAL_TYPE_EXECUTION_RESULT:
                         # Execution result: small boost based on success rate
@@ -641,6 +647,20 @@ class RecommendationLogicV3:
                         matched_behavior_name = b_slug
                         break
 
+            # Word-level overlap fallback: all individual words of the behavior must
+            # appear in the test identifier (handles "Password Reset" vs "reset_password")
+            if not has_behavior_match:
+                import re as _re
+                _stop = {"", "test", "spec", "the", "a", "an", "of", "to", "in", "for"}
+                tc_words = set(_re.split(r"[^a-z0-9]", tc_lower)) - _stop
+                for b_name in impacted_behavior_names:
+                    b_words = set(_re.split(r"[^a-z0-9]", b_name.lower())) - _stop
+                    if b_words and b_words.issubset(tc_words):
+                        behavior_match_score = 25
+                        has_behavior_match = True
+                        matched_behavior_name = b_name
+                        break
+
             # Check if test matches any impacted journey (+30)
             for j_name in impacted_journey_names:
                 j_tokens = j_name.replace(" ", "").replace("-", "")
@@ -663,10 +683,11 @@ class RecommendationLogicV3:
             fragility_reasons = []
             has_fragility_signals = False
             
-            # Check if test is linked to fragile behavior via BehaviorScenario
-            test_behavior_scenarios = [bs for bs in repo_behavior_scenarios if bs.test_identifier == tc.stable_identity]
-            for bs in test_behavior_scenarios:
-                behavior_id_str = str(bs.behavior_id)
+            # Check if test is linked to fragile behavior via BehaviorScenarioCoverage
+            test_id_str = str(tc.id)
+            test_behavior_scenarios = [cov for cov in repo_behavior_scenario_coverages if test_id_str in (cov.existing_tests or [])]
+            for cov in test_behavior_scenarios:
+                behavior_id_str = str(cov.behavior_id)
                 if behavior_id_str in fragile_behavior_map:
                     frag_data = fragile_behavior_map[behavior_id_str]
                     # Impacted fragile behavior: +20
@@ -719,8 +740,12 @@ class RecommendationLogicV3:
                             has_fragility_signals = True
             
             # Check if test is linked to fragile scenario
-            for bs in test_behavior_scenarios:
-                scenario_key = bs.scenario_key
+            for cov in test_behavior_scenarios:
+                # Fetch the actual BehaviorScenario to get its title/key
+                scenario = next((s for s in repo_behavior_scenarios if s.id == cov.behavior_scenario_id), None)
+                if not scenario:
+                    continue
+                scenario_key = scenario.title  # Use title as key for fragility lookup
                 if scenario_key in fragile_scenario_map:
                     frag_data = fragile_scenario_map[scenario_key]
                     # Missing coverage pattern: +15

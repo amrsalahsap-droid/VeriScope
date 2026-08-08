@@ -2,8 +2,8 @@ import React from "react";
 import { Zap, Shield, Layers } from "lucide-react";
 
 export type ScopeModeSelectorProps = {
-  value: "targeted" | "risk_based" | "full";
-  onChange: (mode: "targeted" | "risk_based" | "full") => void;
+  value: "targeted" | "risk_based" | "full_suite";
+  onChange: (mode: "targeted" | "risk_based" | "full_suite") => void;
 };
 
 export const ScopeModeSelector: React.FC<ScopeModeSelectorProps> = ({
@@ -24,7 +24,7 @@ export const ScopeModeSelector: React.FC<ScopeModeSelectorProps> = ({
       icon: Shield,
     },
     {
-      id: "full" as const,
+      id: "full_suite" as const,
       label: "Full Suite",
       description: "Run complete validation",
       icon: Layers,

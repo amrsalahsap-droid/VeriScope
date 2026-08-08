@@ -43,6 +43,7 @@ export function AttachTestRun({
   const [showMismatchWarning, setShowMismatchWarning] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [showUpload, setShowUpload] = useState(false);
+  const [importMode, setImportMode] = useState<"INVENTORY_ONLY" | "CURRENT_PR_EXECUTION_RESULTS" | "BOTH">("INVENTORY_ONLY");
 
   const fetchTestRuns = async () => {
     setLoading(true);
@@ -106,38 +107,60 @@ export function AttachTestRun({
   };
 
   const handleUpload = async (file: File) => {
-    if (!pullRequestId) {
-      toast.error("Cannot upload", { description: "No pull request ID available" });
-      return;
+    // Validate requirements for CURRENT_PR_EXECUTION_RESULTS or BOTH modes
+    if (importMode === "CURRENT_PR_EXECUTION_RESULTS" || importMode === "BOTH") {
+      if (!pullRequestId) {
+        toast.error("Cannot upload", { description: "Pull request ID is required for this import mode" });
+        return;
+      }
+      if (!currentCommitSha) {
+        toast.error("Cannot upload", { description: "Commit SHA is required for this import mode" });
+        return;
+      }
     }
 
     setUploading(true);
     const formData = new FormData();
     formData.append("file", file);
+    formData.append("import_mode", importMode);
+    
     if (currentCommitSha) formData.append("commit_sha", currentCommitSha);
     if (currentBranch) formData.append("branch", currentBranch);
+    if (pullRequestId) formData.append("pull_request_id", pullRequestId);
 
     try {
       const response = await fetch(
-        `/api/repositories/${repositoryId}/pull-requests/${pullRequestId}/test-runs/upload`,
+        `/api/test-results/upload`,
         {
           method: "POST",
           body: formData,
         }
       );
 
-      if (!response.ok) throw new Error("Failed to upload test run");
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.detail || "Failed to upload test run");
+      }
 
       const data = await response.json();
-      toast.success("Test run uploaded", {
-        description: `${data.tests_total} tests processed (${data.tests_passed} passed)`,
-      });
+      
+      if (importMode === "INVENTORY_ONLY") {
+        toast.success("Test inventory updated", {
+          description: `${data.correlation_id ? `ID: ${data.correlation_id.slice(0, 8)}` : "Inventory updated successfully"}`,
+        });
+      } else {
+        toast.success("Test run uploaded", {
+          description: `${data.total_tests} tests processed (${data.passed_tests} passed)`,
+        });
+      }
 
-      // Refresh test runs list
-      await fetchTestRuns();
+      // Refresh test runs list if not INVENTORY_ONLY
+      if (importMode !== "INVENTORY_ONLY") {
+        await fetchTestRuns();
+      }
       setShowUpload(false);
     } catch (error) {
-      toast.error("Failed to upload test run", { description: "Please try again later." });
+      toast.error("Failed to upload test run", { description: error instanceof Error ? error.message : "Please try again later." });
     } finally {
       setUploading(false);
     }
@@ -190,6 +213,49 @@ export function AttachTestRun({
 
       {showUpload ? (
         <div className="space-y-3">
+          <div className="space-y-2">
+            <label className="text-xs text-zinc-400 font-medium">Import Mode</label>
+            <div className="grid grid-cols-3 gap-2">
+              <button
+                onClick={() => setImportMode("INVENTORY_ONLY")}
+                className={`px-3 py-2 rounded-lg text-xs border transition-colors ${
+                  importMode === "INVENTORY_ONLY"
+                    ? "bg-blue-950/30 border-blue-500/30 text-blue-300"
+                    : "bg-zinc-900/40 border-zinc-800/60 text-zinc-400 hover:bg-zinc-900/60"
+                }`}
+              >
+                <div className="font-medium mb-1">Inventory Only</div>
+                <div className="text-[9px] text-zinc-500">Update test inventory</div>
+              </button>
+              <button
+                onClick={() => setImportMode("CURRENT_PR_EXECUTION_RESULTS")}
+                className={`px-3 py-2 rounded-lg text-xs border transition-colors ${
+                  importMode === "CURRENT_PR_EXECUTION_RESULTS"
+                    ? "bg-blue-950/30 border-blue-500/30 text-blue-300"
+                    : "bg-zinc-900/40 border-zinc-800/60 text-zinc-400 hover:bg-zinc-900/60"
+                }`}
+              >
+                <div className="font-medium mb-1">PR Results</div>
+                <div className="text-[9px] text-zinc-500">Current PR execution</div>
+              </button>
+              <button
+                onClick={() => setImportMode("BOTH")}
+                className={`px-3 py-2 rounded-lg text-xs border transition-colors ${
+                  importMode === "BOTH"
+                    ? "bg-blue-950/30 border-blue-500/30 text-blue-300"
+                    : "bg-zinc-900/40 border-zinc-800/60 text-zinc-400 hover:bg-zinc-900/60"
+                }`}
+              >
+                <div className="font-medium mb-1">Both</div>
+                <div className="text-[9px] text-zinc-500">Inventory + execution</div>
+              </button>
+            </div>
+            {(importMode === "CURRENT_PR_EXECUTION_RESULTS" || importMode === "BOTH") && (
+              <div className="text-[10px] text-zinc-500">
+                Requires pull request ID and commit SHA
+              </div>
+            )}
+          </div>
           <div className="border-2 border-dashed border-zinc-700 rounded-lg p-6 text-center">
             <Upload className="w-8 h-8 text-zinc-500 mx-auto mb-2" />
             <p className="text-sm text-zinc-400 mb-3">Upload JUnit XML test results</p>

@@ -39,6 +39,20 @@ class SignalTypeEnum(str, Enum):
     current_pr_coverage = "current_pr_coverage"
     business_intent = "business_intent"
 
+class Strict12InputReadinessSchema(BaseModel):
+    generation_status: str
+    can_generate_draft: bool
+    can_generate_confident: bool
+    confidence_ceiling: str
+    blocking_inputs: List[str] = []
+    partial_inputs: List[str] = []
+    review_needed_inputs: List[str] = []
+    missing_confidence_boosters: List[str] = []
+    primary_reason: str = ""
+
+    class Config:
+        from_attributes = True
+
 class ReadinessSignal(BaseModel):
     key: str
     status: str
@@ -83,11 +97,13 @@ class ReadinessAssessmentResponse(BaseModel):
     primary_message: str
     secondary_message: str
 
-    # Confidence explanation fields
+    # Confidence explanation explanation fields
     confidence_reason: str = ""
     confidence_ceiling: str = "HIGH"
     confidence_blockers: List[str] = []
     confidence_limiters: List[ReadinessSignal] = []
+
+    strict_12_input_readiness: Optional[Strict12InputReadinessSchema] = None
 
     class Config:
         from_attributes = True
@@ -96,6 +112,40 @@ class ReadinessAssessmentCreate(BaseModel):
     """Request model for creating readiness assessment."""
     repository_id: str
     pull_request_id: Optional[str] = None
+
+class ChangedFileDetail(BaseModel):
+    file_path: str
+    status: str
+    additions: int
+    deletions: int
+    patch_summary: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+class PRPackageSchema(BaseModel):
+    status: str
+    head_commit_sha: Optional[str] = None
+    changed_files_count: int
+    changed_files: List[ChangedFileDetail] = []
+    blockers: List[str] = []
+    warnings: List[str] = []
+
+    class Config:
+        from_attributes = True
+
+class RecommendationAuditSchema(BaseModel):
+    status: str
+    has_snapshot: bool
+    has_direct_snapshot_json: bool
+    snapshot_head_sha: Optional[str] = None
+    current_head_sha: Optional[str] = None
+    is_stale: bool
+    stale_reason: Optional[str] = None
+    message: Optional[str] = None
+
+    class Config:
+        from_attributes = True
 
 class ReadinessSummaryResponse(BaseModel):
     """Summary response for readiness status."""
@@ -125,6 +175,12 @@ class ReadinessSummaryResponse(BaseModel):
     confidence_ceiling: str = "HIGH"
     confidence_blockers: List[str] = []
     confidence_limiters: List[ReadinessSignal] = []
+
+    # Part 6: PR Package and Recommendation Audit details
+    pr_package: Optional[PRPackageSchema] = None
+    recommendation_audit: Optional[RecommendationAuditSchema] = None
+
+    strict_12_input_readiness: Optional[Strict12InputReadinessSchema] = None
 
     class Config:
         from_attributes = True
@@ -177,6 +233,12 @@ class RecommendationReadinessGateResult(BaseModel):
     confidence_blockers: List[str] = []
     confidence_limiters: List[MissingInputSignal] = []
 
+    # Gate status fields
+    gate_status: str = "APPROVED"
+    gate_reason: str = ""
+
+    strict_12_input_readiness: Optional[Strict12InputReadinessSchema] = None
+
     class Config:
         from_attributes = True
 
@@ -210,6 +272,8 @@ class RecommendationReadinessGateResponse(BaseModel):
     confidence_ceiling: str = "HIGH"
     confidence_blockers: List[str] = []
     confidence_limiters: List[MissingInputSignal] = []
+
+    strict_12_input_readiness: Optional[Strict12InputReadinessSchema] = None
 
     class Config:
         from_attributes = True

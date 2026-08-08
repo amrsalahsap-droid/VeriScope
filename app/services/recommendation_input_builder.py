@@ -18,6 +18,8 @@ from app.models.behavior_evidence import BehaviorEvidence
 from app.models.journey_behavior import JourneyBehavior
 from app.models.business_intent import BusinessIntentOverride
 from app.models.acceptance_criterion import AcceptanceCriterion
+from app.models.requirement_package import RequirementPackage
+from app.models.requirement_group import RequirementGroup
 from app.services.repository_readiness import RepositoryReadinessService
 from app.schemas.recommendation import RecommendationInputSnapshotResponse
 
@@ -36,21 +38,22 @@ class RecommendationInputBuilder:
         coverage reports/file entries, readiness, fragility patterns) and generates
         an immutable snapshot with a deterministic SHA-256 hash.
         """
-        # 1. Load changed files sorted by file_path
-        changed_files_db = (
-            db.query(PullRequestChangedFile)
-            .filter(PullRequestChangedFile.pull_request_id == pull_request_id)
-            .order_by(PullRequestChangedFile.file_path.asc())
-            .all()
-        )
+        # 1. Load path-backed changed-file evidence for this PR.
+        pr_record = db.query(PullRequest).filter(PullRequest.id == pull_request_id).first()
+        from app.services.input_readiness_v2_service import InputReadinessV2Service
+        changed_files_evidence = InputReadinessV2Service.get_changed_files_evidence(db, pr_record) if pr_record else {
+            "changed_file_paths_available": False,
+            "changed_files_source": None,
+            "changed_files": [],
+        }
         changed_files = [
             {
-                "file_path": f.file_path,
-                "status": f.status,
-                "additions": f.additions,
-                "deletions": f.deletions
+                "file_path": changed_file["path"],
+                "status": changed_file["status"],
+                "additions": changed_file["additions"],
+                "deletions": changed_file["deletions"],
             }
-            for f in changed_files_db
+            for changed_file in changed_files_evidence["changed_files"]
         ]
 
         # 2. Load authoritative test inventory sorted by stable identity
@@ -63,9 +66,27 @@ class RecommendationInputBuilder:
         test_inventory = [
             {
                 "stable_identity": tc.stable_identity,
+                "canonical_identity_hash": tc.canonical_identity_hash,
+                "dedupe_key": tc.dedupe_key,
                 "suite_name": tc.suite_name,
                 "test_name": tc.test_name,
-                "framework_name": tc.framework_name
+                "raw_test_name": tc.raw_test_name,
+                "normalized_test_name": tc.normalized_test_name,
+                "framework_name": tc.framework_name,
+                "framework_version": tc.framework_version,
+                "test_type": tc.test_type,
+                "automation_status": tc.automation_status,
+                "source": tc.source,
+                "source_metadata_json": tc.source_metadata_json,
+                "file_path": tc.file_path,
+                "module_or_area": tc.module_or_area,
+                "owner": tc.owner,
+                "tags": tc.tags,
+                "is_active": tc.is_active,
+                "last_seen_at": tc.last_seen_at.isoformat() if tc.last_seen_at else None,
+                "last_seen_commit_sha": tc.last_seen_commit_sha,
+                "inventory_snapshot_sha": tc.inventory_snapshot_sha,
+                "confidence": tc.confidence,
             }
             for tc in test_cases
         ]
@@ -262,13 +283,68 @@ class RecommendationInputBuilder:
                 "created_at": bio_override.created_at.isoformat() if bio_override.created_at else None,
             }
 
-        # 13. Load structured acceptance criteria
+        # 13. Load structured requirement package (Input 2)
+        requirement_package_snapshot = None
+        requirement_groups_snapshot = []
+        requirement_package = (
+            db.query(RequirementPackage)
+            .filter(
+                RequirementPackage.repository_id == repository_id,
+                RequirementPackage.pull_request_id == pull_request_id
+            )
+            .first()
+        )
+        if requirement_package:
+            requirement_package_snapshot = {
+                "id": str(requirement_package.id),
+                "repository_id": str(requirement_package.repository_id),
+                "pull_request_id": str(requirement_package.pull_request_id),
+                "source_type": requirement_package.source_type,
+                "source_id": requirement_package.source_id,
+                "package_version": requirement_package.package_version,
+                "status": requirement_package.status,
+                "business_change_summary": requirement_package.business_change_summary,
+                "affected_journeys": requirement_package.affected_journeys,
+                "risk_notes": requirement_package.risk_notes,
+                "invalid_test_data_examples": requirement_package.invalid_test_data_examples,
+                "valid_test_data_examples": requirement_package.valid_test_data_examples,
+                "security_notes": requirement_package.security_notes,
+                "integration_notes": requirement_package.integration_notes,
+                "out_of_scope_notes": requirement_package.out_of_scope_notes,
+                "created_at": requirement_package.created_at.isoformat() if requirement_package.created_at else None,
+            }
+
+            # Load requirement groups for this package
+            groups_db = (
+                db.query(RequirementGroup)
+                .filter(RequirementGroup.requirement_package_id == requirement_package.id)
+                .order_by(RequirementGroup.group_number.asc())
+                .all()
+            )
+            for grp in groups_db:
+                requirement_groups_snapshot.append({
+                    "id": str(grp.id),
+                    "requirement_package_id": str(grp.requirement_package_id),
+                    "group_number": grp.group_number,
+                    "group_type": grp.group_type,
+                    "stable_group_key": grp.stable_group_key,
+                    "title": grp.title,
+                    "description": grp.description,
+                    "business_flow": grp.business_flow,
+                    "priority": grp.priority,
+                    "risk_level": grp.risk_level,
+                    "source_type": grp.source_type,
+                    "status": grp.status,
+                })
+
+        # 14. Load structured acceptance criteria (with stable_ac_key)
         acceptance_criteria_snapshot = []
         ac_rows = (
             db.query(AcceptanceCriterion)
             .filter(
                 AcceptanceCriterion.repository_id == repository_id,
-                AcceptanceCriterion.pull_request_id == pull_request_id
+                AcceptanceCriterion.pull_request_id == pull_request_id,
+                AcceptanceCriterion.status == "ACTIVE"
             )
             .order_by(AcceptanceCriterion.created_at.asc())
             .all()
@@ -278,14 +354,16 @@ class RecommendationInputBuilder:
                 "id": str(ac.id),
                 "text": ac.text,
                 "normalized_key": ac.normalized_key,
+                "stable_ac_key": ac.stable_ac_key,
                 "criterion_type": ac.criterion_type,
                 "source": ac.source,
                 "confidence": ac.confidence,
                 "evidence_excerpt": ac.evidence_excerpt,
+                "requirement_group_id": str(ac.requirement_group_id) if ac.requirement_group_id else None,
                 "created_at": ac.created_at.isoformat() if ac.created_at else None,
             })
 
-        # 14. Collect overall evidence counts
+        # 15. Collect overall evidence counts
         test_runs_count = db.query(func.count(TestRun.id)).filter(TestRun.repository_id == repository_id).scalar() or 0
         coverage_reports_count = db.query(func.count(CoverageReport.id)).filter(CoverageReport.repository_id == repository_id).scalar() or 0
 
@@ -300,10 +378,104 @@ class RecommendationInputBuilder:
             "behavior_evidences_count": len(behavior_evidences_snapshot),
             "journey_mappings_count": len(journey_mappings_snapshot),
             "acceptance_criteria_count": len(acceptance_criteria_snapshot),
+            "requirement_package_exists": int(requirement_package_snapshot is not None),
+            "requirement_groups_count": len(requirement_groups_snapshot),
         }
 
-        # 15. Compute deterministic SHA-256 hash of the content state
+        # 16. Compute deterministic SHA-256 hash of the content state
         # Excludes generated_at and input_snapshot_hash
+        # Get business_behavior_mappings
+        # Get business_behavior_mappings
+        from app.models.business_behavior_mapping import BusinessBehaviorMapping
+        mappings_db = db.query(BusinessBehaviorMapping).join(Behavior).filter(
+            Behavior.repository_id == repository_id
+        ).all()
+        business_behavior_mappings_snapshot = []
+        for m in mappings_db:
+            business_behavior_mappings_snapshot.append({
+                "id": str(m.id) if m.id else None,
+                "repository_id": str(repository_id),
+                "requirement_group_id": str(m.acceptance_criterion.requirement_group_id) if (m.acceptance_criterion and m.acceptance_criterion.requirement_group_id) else None,
+                "acceptance_criterion_id": str(m.acceptance_criterion_id) if m.acceptance_criterion_id else None,
+                "behavior_id": str(m.behavior_id),
+                "behavior_scenario_id": str(m.behavior_scenario_id) if m.behavior_scenario_id else None,
+                "pull_request_id": str(m.pull_request_id) if m.pull_request_id else None,
+                "match_confidence": float(m.match_confidence) if m.match_confidence is not None else 0.5,
+                "matched_terms": m.matched_terms,
+                "reason": m.reason,
+                "is_candidate_missing_scenario": m.is_candidate_missing_scenario,
+            })
+
+        # Get behavior_scenario_coverages
+        from app.models.behavior_scenario_coverage import BehaviorScenarioCoverage
+        coverages_db = db.query(BehaviorScenarioCoverage).filter(
+            BehaviorScenarioCoverage.repository_id == repository_id
+        ).all()
+        behavior_scenario_coverages_snapshot = []
+        for c in coverages_db:
+            behavior_scenario_coverages_snapshot.append({
+                "id": str(c.id) if c.id else None,
+                "repository_id": str(c.repository_id),
+                "behavior_id": str(c.behavior_id),
+                "behavior_scenario_id": str(c.behavior_scenario_id),
+                "recommendation_run_id": str(c.recommendation_run_id) if c.recommendation_run_id else None,
+                "coverage_status": c.coverage_status,
+                "current_pr_execution_status": c.current_pr_execution_status,
+                "confidence": c.confidence,
+                "reason": c.reason,
+                "existing_tests": c.existing_tests,
+                "suggested_scenarios": c.suggested_scenarios,
+                "coverage_files": c.coverage_files,
+            })
+
+        # Derive changed_file_behavior_mappings from behavior evidence paths vs changed files
+        changed_file_paths_set = {cf["file_path"].lower() for cf in changed_files}
+        changed_file_behavior_mappings_snapshot = []
+        for ev in behavior_evidences_db:
+            if ev.source_path and ev.source_path.lower() in changed_file_paths_set:
+                # Find the corresponding behavior
+                beh = next((b for b in behaviors_db if b.id == ev.behavior_id), None)
+                if beh:
+                    changed_file_behavior_mappings_snapshot.append({
+                        "file_path": ev.source_path,
+                        "behavior_id": str(beh.id),
+                        "behavior_name": beh.name,
+                        "behavior_slug": beh.slug,
+                        "impact_level": beh.risk_level or "MEDIUM",
+                        "confidence": ev.confidence or "MEDIUM",
+                        "evidence_type": ev.evidence_type,
+                    })
+
+        # Resolve PR head commit SHA from the same evidence-bound PR record.
+        behavior_map_source_commit_sha = pr_record.head_commit_sha if pr_record else None
+        behavior_map_generated_at = datetime.utcnow().isoformat()
+
+        # Derive behavior_context_status from readiness
+        behavior_context_status = "READY" if (
+            changed_files_evidence["changed_file_paths_available"]
+            and behaviors_snapshot
+            and business_behavior_mappings_snapshot
+        ) else ("PARTIAL" if behaviors_snapshot else "NOT_READY")
+
+        # Unmapped product files: changed files with no behavior evidence coverage
+        covered_file_paths = {m["file_path"].lower() for m in changed_file_behavior_mappings_snapshot}
+        unmapped_product_files = [
+            cf["file_path"] for cf in changed_files
+            if cf["file_path"].lower() not in covered_file_paths
+            and not cf["file_path"].endswith((".md", ".lock", ".json", ".yaml", ".yml", ".txt", ".toml"))
+        ]
+
+        # Unmapped requirement groups: groups with no BBM for any of their ACs
+        mapped_ac_ids = {m["acceptance_criterion_id"] for m in business_behavior_mappings_snapshot if m.get("acceptance_criterion_id")}
+        unmapped_requirement_groups = []
+        for grp_snap in requirement_groups_snapshot:
+            grp_ac_ids = [
+                ac["id"] for ac in acceptance_criteria_snapshot
+                if ac.get("requirement_group_id") == grp_snap["id"]
+            ]
+            if grp_ac_ids and not any(ac_id in mapped_ac_ids for ac_id in grp_ac_ids):
+                unmapped_requirement_groups.append(grp_snap["title"])
+
         content_state = {
             "repository_id": str(repository_id),
             "pull_request_id": str(pull_request_id),
@@ -320,13 +492,26 @@ class RecommendationInputBuilder:
             "behavior_evidences": behavior_evidences_snapshot,
             "journey_mappings": journey_mappings_snapshot,
             "business_intent_override": business_intent_override,
+            "requirement_package": requirement_package_snapshot,
+            "requirement_groups": requirement_groups_snapshot,
             "acceptance_criteria": acceptance_criteria_snapshot,
+            "stable_ac_keys": [ac.get("stable_ac_key") for ac in acceptance_criteria_snapshot if ac.get("stable_ac_key")],
+            "business_behavior_mappings": business_behavior_mappings_snapshot,
+            "behavior_scenario_coverages": behavior_scenario_coverages_snapshot,
+            "changed_file_behavior_mappings": changed_file_behavior_mappings_snapshot,
+            "changed_file_paths_available": changed_files_evidence["changed_file_paths_available"],
+            "changed_files_source": changed_files_evidence["changed_files_source"],
+            "behavior_map_source_commit_sha": behavior_map_source_commit_sha,
+            "behavior_map_generated_at": behavior_map_generated_at,
+            "behavior_context_status": behavior_context_status,
+            "unmapped_product_files": unmapped_product_files,
+            "unmapped_requirement_groups": unmapped_requirement_groups,
         }
 
         serialized = json.dumps(content_state, sort_keys=True, default=str)
         input_snapshot_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
-        # 16. Build and return schema response
+        # 17. Build and return schema response
         generated_at = datetime.utcnow()
 
         return RecommendationInputSnapshotResponse(
@@ -347,7 +532,20 @@ class RecommendationInputBuilder:
             behavior_confidence_summary=behavior_confidence_summary,
             journey_summary=journey_summary,
             business_intent_override=business_intent_override,
+            requirement_package=requirement_package_snapshot,
+            requirement_groups=requirement_groups_snapshot,
             acceptance_criteria=acceptance_criteria_snapshot,
+            stable_ac_keys=[ac.get("stable_ac_key") for ac in acceptance_criteria_snapshot if ac.get("stable_ac_key")],
+            business_behavior_mappings=business_behavior_mappings_snapshot,
+            behavior_scenario_coverages=behavior_scenario_coverages_snapshot,
+            changed_file_behavior_mappings=changed_file_behavior_mappings_snapshot,
+            changed_file_paths_available=changed_files_evidence["changed_file_paths_available"],
+            changed_files_source=changed_files_evidence["changed_files_source"],
+            behavior_map_source_commit_sha=behavior_map_source_commit_sha,
+            behavior_map_generated_at=behavior_map_generated_at,
+            behavior_context_status=behavior_context_status,
+            unmapped_product_files=unmapped_product_files,
+            unmapped_requirement_groups=unmapped_requirement_groups,
             generated_at=generated_at,
             input_snapshot_hash=input_snapshot_hash
         )

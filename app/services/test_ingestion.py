@@ -1,11 +1,14 @@
 import uuid
 import hashlib
 import time
+import logging
 from datetime import datetime
 from typing import Optional, Dict, Any, Tuple
 from sqlalchemy import func, inspect
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
+
+logger = logging.getLogger(__name__)
 
 from app.config import settings
 from app.models.test_result import TestCase, TestRun, TestResult
@@ -34,15 +37,37 @@ class TestIngestionService:
         request_origin: Optional[str] = None,
         evidence_source: Optional[str] = None,
         branch: Optional[str] = None,
-        source_context: Optional[str] = None
-    ) -> Tuple[TestRun, bool]:
+        source_context: Optional[str] = None,
+        import_mode: str = "BOTH",
+        run_name: Optional[str] = None
+    ) -> Tuple[Optional[TestRun], bool]:
         """
         Coordinates the complete, production-grade All-or-Nothing atomic ingestion workflow.
-        Returns the TestRun model and a boolean indicating if it was coalesced (duplicate).
+        
+        import_mode options:
+        - INVENTORY_ONLY: Updates TestCase inventory only, no TestRun/TestResult records
+        - CURRENT_PR_EXECUTION_RESULTS: Creates TestRun/TestResult records only
+        - BOTH: Updates inventory and creates execution records (default)
+        
+        Returns the TestRun model (or None for INVENTORY_ONLY) and a boolean indicating if it was coalesced (duplicate).
         """
         total_start = time.time()
         correlation_id = correlation_id or str(uuid.uuid4())
         evidence_source = evidence_source or EvidenceSource.MANUAL_UPLOAD.value
+        
+        # For INVENTORY_ONLY mode, skip fingerprint checks and TestRun creation
+        if import_mode == "INVENTORY_ONLY":
+            return self._ingest_inventory_only(
+                file_bytes=file_bytes,
+                filename=filename,
+                repository_id=repository_id,
+                commit_sha=commit_sha,
+                correlation_id=correlation_id,
+                source_correlation_id=source_correlation_id,
+                request_origin=request_origin,
+                branch=branch,
+                source_context=source_context
+            )
 
         self._emit_event(
             repository_id,
@@ -213,12 +238,15 @@ class TestIngestionService:
             "source_correlation_id": source_correlation_id,
             "request_origin": request_origin,
             "branch": branch,
+            "run_name": run_name,
             "source_context": source_context
         }
 
         try:
             # Atomic creation within open transaction block
             # First insert TestCase stubs per repository scoped constraint
+            from app.services.test_semantic_classifier import TestSemanticClassifier
+            classifier = TestSemanticClassifier(self.db)
             case_mappings = {}
             for tc in parsed_results["test_cases"]:
                 # Scoped query
@@ -245,11 +273,73 @@ class TestIngestionService:
                         identity_lineage_root_hash=tc["canonical_identity_hash"],
                         identity_version=1,
                         identity_resolution_strategy="EXACT",
-                        created_at=datetime.utcnow()
+                        test_type=tc.get("test_type"),
+                        automation_status=tc.get("automation_status", "UNKNOWN"),
+                        source=tc.get("source", "manual_junit_upload"),
+                        source_metadata_json=tc.get("source_metadata_json"),
+                        file_path=tc.get("file_path"),
+                        dedupe_key=tc.get("dedupe_key"),
+                        is_active=tc.get("is_active", True),
+                        last_seen_at=datetime.utcnow(),
+                        last_seen_commit_sha=commit_sha,
+                        inventory_snapshot_sha=normalized_execution_fingerprint,
+                        confidence=tc.get("confidence"),
+                        created_at=datetime.utcnow(),
+                        # Separate Taxonomy Fields
+                        test_nature=tc.get("test_nature"),
+                        primary_test_category=tc.get("primary_test_category"),
+                        suite_purpose=tc.get("suite_purpose"),
+                        risk_tags=tc.get("risk_tags"),
+                        execution_layer=tc.get("execution_layer"),
+                        import_source=tc.get("import_source"),
+                        execution_method=tc.get("execution_method"),
+                        framework=tc.get("framework"),
+                        external_ac_ref=tc.get("external_ac_ref")
                     )
                     self.db.add(test_case)
                     self.db.flush()
+                else:
+                    # Refresh inventory metadata on re-import
+                    test_case.last_seen_at = datetime.utcnow()
+                    test_case.last_seen_commit_sha = commit_sha
+                    test_case.inventory_snapshot_sha = normalized_execution_fingerprint
+                    test_case.is_active = True
+                    if tc.get("test_type"):
+                        test_case.test_type = tc["test_type"]
+                    if tc.get("automation_status"):
+                        test_case.automation_status = tc["automation_status"]
+                    if tc.get("source"):
+                        test_case.source = tc["source"]
+                    if tc.get("framework_name"):
+                        test_case.framework_name = tc["framework_name"]
+                    if tc.get("source_metadata_json"):
+                        test_case.source_metadata_json = tc["source_metadata_json"]
+                    if tc.get("file_path"):
+                        test_case.file_path = tc["file_path"]
+                    if tc.get("dedupe_key"):
+                        test_case.dedupe_key = tc["dedupe_key"]
+                    if tc.get("confidence") is not None:
+                        test_case.confidence = tc["confidence"]
+                    if tc.get("test_nature"):
+                        test_case.test_nature = tc["test_nature"]
+                    if tc.get("primary_test_category"):
+                        test_case.primary_test_category = tc["primary_test_category"]
+                    if tc.get("suite_purpose"):
+                        test_case.suite_purpose = tc["suite_purpose"]
+                    if tc.get("risk_tags") is not None:
+                        test_case.risk_tags = tc["risk_tags"]
+                    if tc.get("execution_layer"):
+                        test_case.execution_layer = tc["execution_layer"]
+                    if tc.get("import_source"):
+                        test_case.import_source = tc["import_source"]
+                    if tc.get("execution_method"):
+                        test_case.execution_method = tc["execution_method"]
+                    if tc.get("framework"):
+                        test_case.framework = tc["framework"]
+                    if tc.get("external_ac_ref"):
+                        test_case.external_ac_ref = tc["external_ac_ref"]
                 
+                classifier.classify_test_case(test_case)
                 case_mappings[tc["canonical_identity_hash"]] = test_case.id
 
             test_run = TestRun(
@@ -352,6 +442,21 @@ class TestIngestionService:
             test_run.ingestion_diagnostics = ingestion_diagnostics
 
             self.db.commit()
+
+            # Recompute recommendation run snapshots if DIRECT_AC_ID links were created
+            # This ensures coverageStatus reflects the new test-to-AC mappings
+            if pull_request_id:
+                try:
+                    from app.services.evidence_graph.requirement_evidence_graph_service import RequirementEvidenceGraphService
+                    graph_service = RequirementEvidenceGraphService(self.db)
+                    updated_count = graph_service.recompute_snapshot_for_pr(
+                        repository_id=str(repository_id),
+                        pull_request_id=str(pull_request_id)
+                    )
+                    if updated_count > 0:
+                        logger.info(f"Recomputed {updated_count} recommendation run snapshots after JUnit ingestion")
+                except Exception as e:
+                    logger.warning(f"Failed to recompute snapshots after JUnit ingestion: {e}")
 
             self._emit_event(
                 repository_id,
@@ -512,6 +617,189 @@ class TestIngestionService:
             db.rollback()
         finally:
             db.close()
+
+    def _ingest_inventory_only(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        repository_id: uuid.UUID,
+        commit_sha: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        source_correlation_id: Optional[str] = None,
+        request_origin: Optional[str] = None,
+        branch: Optional[str] = None,
+        source_context: Optional[str] = None
+    ) -> Tuple[None, bool]:
+        """
+        Ingests JUnit XML to update TestCase inventory only.
+        Does not create TestRun or TestResult records.
+        """
+        total_start = time.time()
+        correlation_id = correlation_id or str(uuid.uuid4())
+        
+        self._emit_event(
+            repository_id,
+            "junit_inventory_upload_received",
+            {
+                "filename": filename,
+                "correlation_id": correlation_id,
+                "source_correlation_id": source_correlation_id,
+                "request_origin": request_origin,
+                "import_mode": "INVENTORY_ONLY"
+            }
+        )
+        
+        # Size check
+        max_bytes = settings.MAX_JUNIT_XML_SIZE_MB * 1024 * 1024
+        if len(file_bytes) > max_bytes:
+            self._emit_event(
+                repository_id,
+                "junit_upload_rejected_size_limit",
+                {
+                    "filename": filename,
+                    "size_bytes": len(file_bytes),
+                    "limit_mb": settings.MAX_JUNIT_XML_SIZE_MB,
+                    "correlation_id": correlation_id
+                }
+            )
+            raise OversizedXMLException(
+                f"Payload too large: JUnit XML size {len(file_bytes) / 1024 / 1024:.2f} MB "
+                f"exceeds maximum allowed limit of {settings.MAX_JUNIT_XML_SIZE_MB} MB."
+            )
+        
+        # Parse XML
+        parse_start = time.time()
+        xml_str = file_bytes.decode("utf-8", errors="replace")
+        parsed_results = SafeJUnitParser.parse_xml(xml_str)
+        parsing_duration_ms = (time.time() - parse_start) * 1000
+        
+        # Update TestCase inventory
+        commit_start = time.time()
+        inventory_snapshot_sha = hashlib.sha256(xml_str.encode("utf-8")).hexdigest()
+        
+        try:
+            from app.services.test_semantic_classifier import TestSemanticClassifier
+            classifier = TestSemanticClassifier(self.db)
+            for tc in parsed_results["test_cases"]:
+                test_case = self.db.query(TestCase).filter(
+                    TestCase.repository_id == repository_id,
+                    TestCase.canonical_identity_hash == tc["canonical_identity_hash"]
+                ).first()
+                
+                if not test_case:
+                    test_case = TestCase(
+                        id=uuid.uuid4(),
+                        repository_id=repository_id,
+                        suite_name=tc["suite_name"],
+                        test_name=tc["test_name"],
+                        stable_identity=tc["stable_identity"],
+                        raw_test_name=tc["raw_test_name"],
+                        normalized_test_name=tc["normalized_test_name"],
+                        normalized_identity_strategy=tc["normalized_identity_strategy"],
+                        framework_name=tc["framework_name"],
+                        framework_version=tc["framework_version"],
+                        identity_normalization_version=tc["identity_normalization_version"],
+                        canonical_identity_hash=tc["canonical_identity_hash"],
+                        previous_identity_hash=None,
+                        identity_lineage_root_hash=tc["canonical_identity_hash"],
+                        identity_version=1,
+                        identity_resolution_strategy="EXACT",
+                        test_type=tc.get("test_type"),
+                        automation_status=tc.get("automation_status", "UNKNOWN"),
+                        source=tc.get("source", "manual_junit_upload"),
+                        source_metadata_json=tc.get("source_metadata_json"),
+                        file_path=tc.get("file_path"),
+                        dedupe_key=tc.get("dedupe_key"),
+                        is_active=tc.get("is_active", True),
+                        last_seen_at=datetime.utcnow(),
+                        last_seen_commit_sha=commit_sha,
+                        inventory_snapshot_sha=inventory_snapshot_sha,
+                        confidence=tc.get("confidence"),
+                        created_at=datetime.utcnow(),
+                        # Separate Taxonomy Fields
+                        test_nature=tc.get("test_nature"),
+                        primary_test_category=tc.get("primary_test_category"),
+                        suite_purpose=tc.get("suite_purpose"),
+                        risk_tags=tc.get("risk_tags"),
+                        execution_layer=tc.get("execution_layer"),
+                        import_source=tc.get("import_source"),
+                        execution_method=tc.get("execution_method"),
+                        framework=tc.get("framework"),
+                        external_ac_ref=tc.get("external_ac_ref")
+                    )
+                    self.db.add(test_case)
+                else:
+                    # Update existing test case metadata
+                    test_case.last_seen_at = datetime.utcnow()
+                    test_case.last_seen_commit_sha = commit_sha
+                    test_case.inventory_snapshot_sha = inventory_snapshot_sha
+                    test_case.is_active = True
+                    if tc.get("test_type"):
+                        test_case.test_type = tc["test_type"]
+                    if tc.get("automation_status"):
+                        test_case.automation_status = tc["automation_status"]
+                    if tc.get("source"):
+                        test_case.source = tc["source"]
+                    if tc.get("framework_name"):
+                        test_case.framework_name = tc["framework_name"]
+                    if tc.get("source_metadata_json"):
+                        test_case.source_metadata_json = tc["source_metadata_json"]
+                    if tc.get("file_path"):
+                        test_case.file_path = tc["file_path"]
+                    if tc.get("dedupe_key"):
+                        test_case.dedupe_key = tc["dedupe_key"]
+                    if tc.get("confidence") is not None:
+                        test_case.confidence = tc["confidence"]
+                    if tc.get("test_nature"):
+                        test_case.test_nature = tc["test_nature"]
+                    if tc.get("primary_test_category"):
+                        test_case.primary_test_category = tc["primary_test_category"]
+                    if tc.get("suite_purpose"):
+                        test_case.suite_purpose = tc["suite_purpose"]
+                    if tc.get("risk_tags") is not None:
+                        test_case.risk_tags = tc["risk_tags"]
+                    if tc.get("execution_layer"):
+                        test_case.execution_layer = tc["execution_layer"]
+                    if tc.get("import_source"):
+                        test_case.import_source = tc["import_source"]
+                    if tc.get("execution_method"):
+                        test_case.execution_method = tc["execution_method"]
+                    if tc.get("framework"):
+                        test_case.framework = tc["framework"]
+                    if tc.get("external_ac_ref"):
+                        test_case.external_ac_ref = tc["external_ac_ref"]
+                
+                classifier.classify_test_case(test_case)
+            
+            self.db.commit()
+            
+            self._emit_event(
+                repository_id,
+                "junit_inventory_ingestion_committed",
+                {
+                    "test_cases_updated": len(parsed_results["test_cases"]),
+                    "correlation_id": correlation_id
+                }
+            )
+            
+            return None, False
+            
+        except IntegrityError as e:
+            self.db.rollback()
+            self._emit_event(
+                repository_id,
+                "junit_inventory_ingestion_rolled_back",
+                {"error": str(e), "correlation_id": correlation_id}
+            )
+            raise e
+        except Exception as e:
+            self.db.rollback()
+            self._emit_event(
+                repository_id,
+                "junit_inventory_ingestion_rolled_back",
+                {"error": str(e), "correlation_id": correlation_id}
+            )
+            raise e
 
 def max_severity(curr: str, proposed: str) -> str:
     """Helper to pick highest severity."""

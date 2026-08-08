@@ -145,7 +145,8 @@ class ScenarioCoverageResolver:
             # Check coverage file entries
             for entry in coverage_file_entries:
                 if hasattr(entry, 'file_path') and entry.file_path.lower() in file_lower:
-                    if entry.line_coverage_percent and entry.line_coverage_percent > 0:
+                    line_cov = getattr(entry, 'line_coverage_percent', None) or getattr(entry, 'line_coverage_ratio', None)
+                    if line_cov and line_cov > 0:
                         direct_coverage_count += 1
                         break
             

@@ -28,11 +28,10 @@ class TestPasswordValidationPRGoldenTraceability:
 
     def test_golden_traceability_assertions(self):
         """Assert golden traceability rules for this PR."""
-        repo_id = '6224c501-8072-4c34-b733-ff1522a82203'
-        pr_id = 'a5e2a6aa-a644-41b4-8d7c-d8a7bd1e585f'
-        
-        pr = self.db.query(PullRequest).filter(PullRequest.id == pr_id).first()
-        assert pr is not None, "PR not found in database"
+        pr = self.db.query(PullRequest).filter(PullRequest.title == "Add password validation feature").first()
+        assert pr is not None, "Demo PR not found in database"
+        repo_id = str(pr.repository_id)
+        pr_id = str(pr.id)
 
         # Load AC text
         acs = self.db.query(AcceptanceCriterion).filter(
@@ -61,7 +60,14 @@ class TestPasswordValidationPRGoldenTraceability:
         requirements = [node for node in graph_service.ac_extraction_service.extract_acceptance_criteria(ac_text).requirement_nodes]
         graph_service._generate_signatures(requirements, test_nodes, execution_nodes)
         graph_service._match_evidence(requirements, test_nodes, execution_nodes)
-        graph_service._classify_requirements(requirements, test_nodes, execution_nodes, coverage_nodes)
+        graph_service._classify_requirements(
+            requirements, 
+            test_nodes, 
+            execution_nodes, 
+            coverage_nodes,
+            repository_id=repo_id,
+            pull_request_id=pr_id
+        )
 
         # 1. 25 parent requirements extracted
         assert len(requirements) == 25, f"Expected 25 requirements, got {len(requirements)}"

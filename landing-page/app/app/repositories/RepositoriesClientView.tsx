@@ -447,6 +447,13 @@ function RepoCard({ repo, onActionComplete }: { repo: Repo; onActionComplete?: (
 
   const evidenceIndicators: EvidenceIndicator[] = [
     {
+      label: "PR Package",
+      healthy: repo.latest_pr_synced_at && repo.active_pr_count > 0,
+      text: !repo.latest_pr_synced_at 
+        ? "Not synced" 
+        : (repo.active_pr_count > 0 ? "Ready" : "No PRs"),
+    },
+    {
       label: "PRs",
       healthy: repo.active_pr_count > 0,
       text: !repo.latest_pr_synced_at 

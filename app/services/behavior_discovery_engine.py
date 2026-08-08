@@ -201,23 +201,88 @@ class BehaviorDiscoveryEngine:
         
         return list(self.candidates.values())
     
+    # Specific product-flow patterns extracted from path segments.
+    # These take precedence over broad category patterns.
+    PRODUCT_FLOW_PATTERNS: Dict[str, str] = {
+        r"reset[ -_]?password": "Password Reset",
+        r"forgot[ -_]?password": "Password Reset",
+        r"recover[ -_]?password": "Password Reset",
+        r"sign[ -_]?up": "User Registration",
+        r"signup": "User Registration",
+        r"register": "User Registration",
+        r"create[ -_]?account": "User Registration",
+        r"sign[ -_]?in": "Authentication",
+        r"signin": "Authentication",
+        r"login": "Authentication",
+        r"log[ -_]?in": "Authentication",
+        r"subscription": "Subscription Management",
+        r"billing": "Billing",
+        r"checkout": "Checkout",
+        r"payment": "Payment",
+        r"notification": "Notifications",
+        r"profile": "User Profile",
+        r"settings": "User Settings",
+        r"admin": "Administration",
+        r"search": "Search",
+        r"upload": "File Upload",
+        r"api": "API Integration",
+        r"webhook": "Webhook",
+    }
+
+    # Generic category names that should NOT be created as standalone behaviors
+    GENERIC_CATEGORY_NAMES = {
+        "auth", "authentication", "user management", "user-management",
+        "notifications", "billing", "administration", "reporting", "search",
+        "file upload", "api integration", "integration", "tests",
+        "frontend", "backend", "components", "repository intelligence",
+    }
+
     def _normalize_behavior_name(self, text: str) -> Optional[str]:
         """Normalize text to a behavior name using pattern matching."""
         text_lower = text.lower()
-        
+
         # First try pattern library if available
         pattern_library = self._get_pattern_library()
         if pattern_library:
             matched_pattern = pattern_library.match_pattern(text)
             if matched_pattern:
                 return matched_pattern.name
-        
-        # Fall back to hardcoded patterns
+
+        # Prefer specific product-flow patterns over broad category patterns.
+        for pattern, behavior_name in self.PRODUCT_FLOW_PATTERNS.items():
+            if re.search(pattern, text_lower):
+                return behavior_name
+
+        # Fall back to broad category patterns only when no specific flow matched.
         for pattern, behavior_name in self.BEHAVIOR_PATTERNS.items():
             if re.search(pattern, text_lower):
                 return behavior_name
-        
+
         return None
+
+    def normalize_path(self, file_path: str) -> str:
+        """Normalize file path to use forward slashes and lowercased format."""
+        return file_path.replace("\\", "/").lower()
+
+    def _extract_product_flow_from_path(self, file_path: str) -> Optional[str]:
+        """Extract a specific product-flow behavior name from a file path segment.
+
+        This is more granular than _normalize_behavior_name and uses the full path
+        (e.g. src/app/api/auth/reset-password/route.ts -> 'Password Reset').
+        """
+        norm = self.normalize_path(file_path)
+        segments = norm.replace("/", " ").replace("-", " ").replace("_", " ").split()
+        full_text = " ".join(segments)
+
+        for pattern, behavior_name in self.PRODUCT_FLOW_PATTERNS.items():
+            if re.search(pattern, full_text):
+                return behavior_name
+
+        return None
+
+    def _is_generic_category_name(self, name: str) -> bool:
+        """Return True if the behavior name is a generic technical category."""
+        return name.lower().strip() in self.GENERIC_CATEGORY_NAMES
     
     def _get_or_create_candidate(self, behavior_name: str) -> DiscoveredBehaviorCandidate:
         """Get existing candidate or create new one."""
@@ -259,61 +324,101 @@ class BehaviorDiscoveryEngine:
     def _scan_routes(self, routes: List[str]) -> None:
         """Scan route paths for behavior patterns."""
         for route in routes:
-            behavior_name = self._normalize_behavior_name(route)
-            if behavior_name:
-                candidate = self._get_or_create_candidate(behavior_name)
+            flow_name = self._extract_product_flow_from_path(route)
+            if flow_name and not self._is_generic_category_name(flow_name):
+                candidate = self._get_or_create_candidate(flow_name)
                 candidate.add_evidence(BehaviorEvidence(
                     evidence_type="ROUTE",
                     source_path=route,
                     source_name=route,
                     confidence="HIGH",
                 ))
-    
+            else:
+                behavior_name = self._normalize_behavior_name(route)
+                if behavior_name and not self._is_generic_category_name(behavior_name):
+                    candidate = self._get_or_create_candidate(behavior_name)
+                    candidate.add_evidence(BehaviorEvidence(
+                        evidence_type="ROUTE",
+                        source_path=route,
+                        source_name=route,
+                        confidence="HIGH",
+                    ))
+
     def _scan_pages(self, pages: List[str]) -> None:
         """Scan page paths for behavior patterns."""
         for page in pages:
-            behavior_name = self._normalize_behavior_name(page)
-            if behavior_name:
-                candidate = self._get_or_create_candidate(behavior_name)
+            flow_name = self._extract_product_flow_from_path(page)
+            if flow_name and not self._is_generic_category_name(flow_name):
+                candidate = self._get_or_create_candidate(flow_name)
                 candidate.add_evidence(BehaviorEvidence(
                     evidence_type="PAGE",
                     source_path=page,
                     source_name=page,
                     confidence="HIGH",
                 ))
-    
+            else:
+                behavior_name = self._normalize_behavior_name(page)
+                if behavior_name and not self._is_generic_category_name(behavior_name):
+                    candidate = self._get_or_create_candidate(behavior_name)
+                    candidate.add_evidence(BehaviorEvidence(
+                        evidence_type="PAGE",
+                        source_path=page,
+                        source_name=page,
+                        confidence="HIGH",
+                    ))
+
     def _scan_folders(self, folders: List[str]) -> None:
         """Scan folder names for behavior patterns."""
         for folder in folders:
-            behavior_name = self._normalize_behavior_name(folder)
-            if behavior_name:
-                candidate = self._get_or_create_candidate(behavior_name)
+            flow_name = self._extract_product_flow_from_path(folder)
+            if flow_name and not self._is_generic_category_name(flow_name):
+                candidate = self._get_or_create_candidate(flow_name)
                 candidate.add_evidence(BehaviorEvidence(
                     evidence_type="MODULE",
                     source_path=folder,
                     source_name=folder,
                     confidence="MODERATE",
                 ))
-    
+            else:
+                behavior_name = self._normalize_behavior_name(folder)
+                if behavior_name and not self._is_generic_category_name(behavior_name):
+                    candidate = self._get_or_create_candidate(behavior_name)
+                    candidate.add_evidence(BehaviorEvidence(
+                        evidence_type="MODULE",
+                        source_path=folder,
+                        source_name=folder,
+                        confidence="MODERATE",
+                    ))
+
     def _scan_modules(self, modules: List[str]) -> None:
         """Scan module names for behavior patterns."""
         for module in modules:
-            behavior_name = self._normalize_behavior_name(module)
-            if behavior_name:
-                candidate = self._get_or_create_candidate(behavior_name)
+            flow_name = self._extract_product_flow_from_path(module)
+            if flow_name and not self._is_generic_category_name(flow_name):
+                candidate = self._get_or_create_candidate(flow_name)
                 candidate.add_evidence(BehaviorEvidence(
                     evidence_type="MODULE",
                     source_path=module,
                     source_name=module,
                     confidence="MODERATE",
                 ))
-    
+            else:
+                behavior_name = self._normalize_behavior_name(module)
+                if behavior_name and not self._is_generic_category_name(behavior_name):
+                    candidate = self._get_or_create_candidate(behavior_name)
+                    candidate.add_evidence(BehaviorEvidence(
+                        evidence_type="MODULE",
+                        source_path=module,
+                        source_name=module,
+                        confidence="MODERATE",
+                    ))
+
     def _scan_test_names(self, test_names: List[str]) -> None:
         """Scan test names for behavior patterns."""
         for test_name in test_names:
-            behavior_name = self._normalize_behavior_name(test_name)
-            if behavior_name:
-                candidate = self._get_or_create_candidate(behavior_name)
+            flow_name = self._extract_product_flow_from_path(test_name)
+            if flow_name and not self._is_generic_category_name(flow_name):
+                candidate = self._get_or_create_candidate(flow_name)
                 candidate.add_evidence(BehaviorEvidence(
                     evidence_type="TEST",
                     source_path=None,
@@ -321,6 +426,17 @@ class BehaviorDiscoveryEngine:
                     excerpt=test_name,
                     confidence="MODERATE",
                 ))
+            else:
+                behavior_name = self._normalize_behavior_name(test_name)
+                if behavior_name and not self._is_generic_category_name(behavior_name):
+                    candidate = self._get_or_create_candidate(behavior_name)
+                    candidate.add_evidence(BehaviorEvidence(
+                        evidence_type="TEST",
+                        source_path=None,
+                        source_name=test_name,
+                        excerpt=test_name,
+                        confidence="MODERATE",
+                    ))
     
     def _finalize_candidates(self) -> None:
         """Finalize all candidates with aggregate confidence."""

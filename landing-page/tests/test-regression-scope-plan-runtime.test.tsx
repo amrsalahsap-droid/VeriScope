@@ -176,17 +176,17 @@ describe("Regression Scope Plan Runtime", () => {
   });
 
   // Test 4: Full mode sends correct value
-  it("sends mode=full for Full Mode", async () => {
+  it("sends mode=full_suite for Full Suite", async () => {
     const mockFetch = global.fetch as jest.Mock;
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => makeScopeResponse({ scope_type: "FULL" }),
+      json: async () => makeScopeResponse({ scope_type: "FULL_SUITE" }),
     });
 
-    await simulateFetchScope(mockFetch, RUN_ID, "full");
+    await simulateFetchScope(mockFetch, RUN_ID, "full_suite");
 
     const url = (mockFetch.mock.calls[0][0] as string);
-    expect(url).toContain("mode=full");
+    expect(url).toContain("mode=full_suite");
   });
 
   // Test 5: Frontend extracts wrapper.scope (not the whole wrapper)

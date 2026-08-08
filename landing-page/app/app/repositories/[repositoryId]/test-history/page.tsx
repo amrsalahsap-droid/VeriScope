@@ -391,6 +391,8 @@ export default function TestHistoryPage({ params }: PageProps) {
       formData.append("branch", trimmedBranch);
       formData.append("run_name", trimmedRunName);
       formData.append("source", "MANUAL_UPLOAD");
+      const importMode = pullRequestId ? "BOTH" : "INVENTORY_ONLY";
+      formData.append("import_mode", importMode);
       if (pullRequestId) formData.append("pull_request_id", pullRequestId);
       if (sourceParam) formData.append("source_context", sourceParam);
 

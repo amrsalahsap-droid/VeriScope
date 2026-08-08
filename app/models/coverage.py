@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, ForeignKey, Integer, Float, UniqueConstraint, Index
+from sqlalchemy import Column, String, DateTime, ForeignKey, Integer, Float, Boolean, UniqueConstraint, Index
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from app.db.base import Base
@@ -16,10 +16,24 @@ class CoverageReport(Base):
     pull_request_id = Column(UUID(as_uuid=True), ForeignKey("pull_requests.id", ondelete="SET NULL"), nullable=True, index=True)
     raw_artifact_id = Column(UUID(as_uuid=True), ForeignKey("raw_artifacts.id", ondelete="SET NULL"), nullable=True)
 
+    # PR SHA context and freshness
+    current_pr_head_sha = Column(String, nullable=True)
+    commit_sha_source = Column(String, nullable=False, default="MANUAL")
+    sha_mismatch = Column(Boolean, nullable=False, default=False)
+    is_current = Column(Boolean, nullable=False, default=False)
+    coverage_uploaded_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    # Changed-file coverage context
+    changed_files_total = Column(Integer, nullable=False, default=0)
+    changed_files_with_coverage = Column(Integer, nullable=False, default=0)
+    changed_files_without_coverage = Column(Integer, nullable=False, default=0)
+    current_pr_coverage_confidence = Column(String, nullable=True)
+
     # Final Contract Evidence Fields
     format = Column(String, nullable=False, index=True)  # "LCOV", "COBERTURA"
     source = Column(String, nullable=False, index=True)  # "MANUAL_UPLOAD", "GITHUB_ACTIONS", "CI_ARTIFACT"
     branch = Column(String, nullable=True, index=True)
+    coverage_level = Column(String, nullable=False, index=True, default="RUN_LEVEL")  # "RUN_LEVEL", "TEST_FILE_LEVEL", "TEST_CASE_LEVEL"
     
     files_total = Column(Integer, nullable=False, default=0)
     covered_lines_total = Column(Integer, nullable=False, default=0)
@@ -107,16 +121,24 @@ class FileTestLink(Base):
     coverage_report_id = Column(UUID(as_uuid=True), ForeignKey("coverage_reports.id", ondelete="CASCADE"), nullable=False, index=True)
 
     file_path = Column(String, nullable=False, index=True) # Normalized source file path
-    test_case_id = Column(UUID(as_uuid=True), ForeignKey("test_cases.id", ondelete="CASCADE"), nullable=False, index=True)
+    test_case_id = Column(UUID(as_uuid=True), ForeignKey("test_cases.id", ondelete="CASCADE"), nullable=True, index=True)
+    stable_test_id = Column(String, nullable=True, index=True) # Stable test identifier for cross-run mapping
+    test_file_id = Column(UUID(as_uuid=True), ForeignKey("external_test_cases.id", ondelete="CASCADE"), nullable=True, index=True)
+
+    # Coverage data for this link
+    covered_lines = Column(JSONB, nullable=True, default=list) # Array of covered line numbers for this specific test
+    line_ranges = Column(JSONB, nullable=True, default=list) # Array of [start, end] line ranges
 
     # Resolution Metadata
     mapping_type = Column(String, nullable=False) # DIRECT, HEURISTIC_NAMING, HEURISTIC_PATH
     confidence_score = Column(String, nullable=False) # HIGH, MODERATE, LOW (based on heuristic strength)
+    source = Column(String, nullable=True) # Source of the mapping (e.g., "LCOV_PER_TEST", "COBERTURA_LINKAGE")
 
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     coverage_report = relationship("CoverageReport", back_populates="test_links")
     test_case = relationship("TestCase")
+    test_file = relationship("ExternalTestCase")
 
     __table_args__ = (
         UniqueConstraint("coverage_report_id", "file_path", "test_case_id", name="uq_file_test_links_report_file_test"),

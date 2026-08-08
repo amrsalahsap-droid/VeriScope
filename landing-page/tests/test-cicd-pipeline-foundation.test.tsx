@@ -37,30 +37,40 @@ describe('GitHubActionsSnippet', () => {
 
 describe('QualityGateBadge', () => {
   it('renders quality gate badge', () => {
-    render(<QualityGateBadge hasRequiredItems={false} isApproved={true} />);
+    render(<QualityGateBadge gateStatus="UNKNOWN" />);
     expect(screen.getByText(/Quality Gate:/)).toBeInTheDocument();
   });
 
-  it('shows PASSED when approved with no required items', () => {
-    render(<QualityGateBadge hasRequiredItems={false} isApproved={true} />);
+  it('shows PASSED when gate status is PASSED', () => {
+    render(<QualityGateBadge gateStatus="PASSED" />);
     expect(screen.getByText('Quality Gate: PASSED')).toBeInTheDocument();
   });
 
-  it('shows PARTIAL when required items exist', () => {
-    render(<QualityGateBadge hasRequiredItems={true} isApproved={false} />);
+  it('shows PARTIAL when gate status is PARTIAL', () => {
+    render(<QualityGateBadge gateStatus="PARTIAL" />);
     expect(screen.getByText('Quality Gate: PARTIAL')).toBeInTheDocument();
   });
 
-  it('shows UNKNOWN when no decision and no required items', () => {
-    render(<QualityGateBadge hasRequiredItems={false} isApproved={false} />);
+  it('shows UNKNOWN when gate status is UNKNOWN', () => {
+    render(<QualityGateBadge gateStatus="UNKNOWN" />);
     expect(screen.getByText('Quality Gate: UNKNOWN')).toBeInTheDocument();
   });
 
+  it('shows BLOCKED when gate status is BLOCKED', () => {
+    render(<QualityGateBadge gateStatus="BLOCKED" />);
+    expect(screen.getByText('Quality Gate: BLOCKED')).toBeInTheDocument();
+  });
+
+  it('shows PASSED (Override) when gate status is PASSED_WITH_OVERRIDE', () => {
+    render(<QualityGateBadge gateStatus="PASSED_WITH_OVERRIDE" />);
+    expect(screen.getByText('Quality Gate: PASSED (Override)')).toBeInTheDocument();
+  });
+
   it('PARTIAL quality gate is distinct from PASSED', () => {
-    const { rerender } = render(<QualityGateBadge hasRequiredItems={true} isApproved={false} />);
+    const { rerender } = render(<QualityGateBadge gateStatus="PARTIAL" />);
     expect(screen.getByText('Quality Gate: PARTIAL')).toBeInTheDocument();
     
-    rerender(<QualityGateBadge hasRequiredItems={false} isApproved={true} />);
+    rerender(<QualityGateBadge gateStatus="PASSED" />);
     expect(screen.getByText('Quality Gate: PASSED')).toBeInTheDocument();
   });
 });
@@ -84,12 +94,12 @@ describe('EvidenceArtifactDownloadButton', () => {
 
 describe('CICDPipelineRunsPanel', () => {
   it('renders CI/CD Runs section', () => {
-    render(<CICDPipelineRunsPanel pipelineRuns={[]} hasRequiredItems={false} isApproved={false} />);
+    render(<CICDPipelineRunsPanel pipelineRuns={[]} gateStatus="UNKNOWN" />);
     expect(screen.getByText('CI/CD Pipeline Runs')).toBeInTheDocument();
   });
 
   it('shows empty state when no pipeline runs exist', () => {
-    render(<CICDPipelineRunsPanel pipelineRuns={[]} hasRequiredItems={false} isApproved={false} />);
+    render(<CICDPipelineRunsPanel pipelineRuns={[]} gateStatus="UNKNOWN" />);
     expect(screen.getByText((content) => content.includes('No CI/CD runs yet'))).toBeInTheDocument();
   });
 
@@ -106,7 +116,7 @@ describe('CICDPipelineRunsPanel', () => {
       }
     ];
     
-    render(<CICDPipelineRunsPanel pipelineRuns={mockRuns} hasRequiredItems={true} isApproved={false} />);
+    render(<CICDPipelineRunsPanel pipelineRuns={mockRuns} gateStatus="PARTIAL" />);
     expect(screen.getByText('GITHUB_ACTIONS')).toBeInTheDocument();
     expect(screen.getByText('Run #12345')).toBeInTheDocument();
     expect(screen.getByText('abc123d')).toBeInTheDocument();
@@ -127,12 +137,12 @@ describe('CICDPipelineRunsPanel', () => {
       }
     ];
     
-    render(<CICDPipelineRunsPanel pipelineRuns={mockRuns} hasRequiredItems={true} isApproved={false} />);
+    render(<CICDPipelineRunsPanel pipelineRuns={mockRuns} gateStatus="PARTIAL" />);
     expect(screen.getByText('Download Evidence Artifact')).toBeInTheDocument();
   });
 
   it('hides artifact download button when no pipeline runs exist', () => {
-    render(<CICDPipelineRunsPanel pipelineRuns={[]} hasRequiredItems={false} isApproved={false} />);
+    render(<CICDPipelineRunsPanel pipelineRuns={[]} gateStatus="UNKNOWN" />);
     expect(screen.queryByText('Download Evidence Artifact')).not.toBeInTheDocument();
   });
 
@@ -149,7 +159,7 @@ describe('CICDPipelineRunsPanel', () => {
       }
     ];
     
-    render(<CICDPipelineRunsPanel pipelineRuns={mockRuns} hasRequiredItems={true} isApproved={false} />);
+    render(<CICDPipelineRunsPanel pipelineRuns={mockRuns} gateStatus="PARTIAL" />);
     expect(screen.getAllByText('Quality Gate: PARTIAL')).toHaveLength(2); // Header + row
     expect(screen.queryByText('Quality Gate: PASSED')).not.toBeInTheDocument();
   });

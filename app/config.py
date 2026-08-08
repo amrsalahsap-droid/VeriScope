@@ -24,6 +24,26 @@ class Settings(BaseSettings):
     S3_ACCESS_KEY: Optional[str] = None
     S3_SECRET_KEY: Optional[str] = None
 
+    AC_TEST_MAPPING_AI_ENABLED: bool = False
+    AC_TEST_MAPPING_AI_PROVIDER: str = "disabled"
+    AC_TEST_MAPPING_AI_MODEL: Optional[str] = None
+    AC_TEST_MAPPING_AI_API_KEY: Optional[str] = None
+    AC_TEST_MAPPING_AI_BASE_URL: Optional[str] = None
+    AC_TEST_MAPPING_AI_TIMEOUT_SECONDS: int = 15
+    AC_TEST_MAPPING_AI_MAX_CANDIDATES: int = 8
+    AC_TEST_MAPPING_AI_CONFIDENCE_THRESHOLD_STRONG: float = 0.85
+    AC_TEST_MAPPING_AI_CONFIDENCE_THRESHOLD_WEAK: float = 0.55
+    AC_TEST_MAPPING_AI_CACHE_ENABLED: bool = True
+    AC_TEST_MAPPING_AI_AUDIT_LOG_ENABLED: bool = True
+
+    # AC → Test Mapping auto-trust policy
+    AC_MAPPING_AUTO_TRUST_VERISCOPE_KEY: bool = True
+    AC_MAPPING_AUTO_TRUST_EVIDENCE_ALIGNED: bool = True
+    AC_MAPPING_AUTO_TRUST_MIN_CONFIDENCE: float = 0.85
+    AC_MAPPING_REQUIRE_REVIEW_FOR_METADATA_CONFLICT: bool = True
+    AC_MAPPING_REQUIRE_REVIEW_FOR_PARTIAL_SUPPORT: bool = True
+    AC_MAPPING_REQUIRE_REVIEW_FOR_NO_CANDIDATE: bool = True
+
     # Architecture V2 Feature Flag
     USE_ARCHITECTURE_V2: bool = False
 

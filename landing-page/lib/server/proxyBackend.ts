@@ -25,6 +25,7 @@ export async function proxyBackend({ method, path, request }: ProxyOptions) {
     const cleanBaseUrl = backendBaseUrl.replace(/\/+$/, "");
     const { search } = new URL(request.url);
     const backendUrl = `${cleanBaseUrl}${path}${search}`;
+    console.log("PROXY_BACKEND_REQUEST", { path, search, backendUrl });
 
     const headers: HeadersInit = {
       Authorization: `Bearer ${session.backendToken}`,

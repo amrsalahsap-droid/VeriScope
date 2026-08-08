@@ -113,17 +113,30 @@ router = APIRouter(tags=["governance-security"])
 def require_permission(permission: str):
     """Dependency to check if user has required permission."""
     def dependency(
+        workspace_id: uuid.UUID,
         db: Session = Depends(get_db),
         current_user: User = Depends(get_current_user)
     ) -> User:
-        # For now, implement basic permission check
-        # TODO: Integrate with GovernancePermissionService for full RBAC
-        # For Phase 8.13, we'll use role-based checks as a temporary measure
         from app.services.governance_permission_service import GovernancePermissionService
-        from app.models.governance_role_assignment import GovernanceRole
         
-        # Get user's roles in the workspace (will be passed from route parameter)
-        # This is a simplified check - full implementation will use workspace_id from route
+        result = GovernancePermissionService.require_permission(
+            db=db,
+            user_id=current_user.id,
+            permission=permission,
+            workspace_id=workspace_id,
+            actor_id=current_user.id
+        )
+        if not result["allowed"]:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "message": "You do not have permission to perform this governance action.",
+                    "permission_required": permission,
+                    "scope_checked": result.get("scope_checked"),
+                    "reason": result.get("reason"),
+                    "how_to_request_access": result.get("how_to_request_access")
+                }
+            )
         return current_user
     return dependency
 

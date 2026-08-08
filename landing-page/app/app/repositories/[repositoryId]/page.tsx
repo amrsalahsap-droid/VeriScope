@@ -30,7 +30,13 @@ import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import RecommendationReadinessPanel from "@/app/components/RecommendationReadinessPanel";
 import RecommendationCheckpointModal from "@/app/components/RecommendationCheckpointModal";
+import BusinessRequirementsModal from "@/components/requirements/business-requirements-modal";
+import { ImproveInputReadinessDrawer } from "@/components/readiness/ImproveInputReadinessDrawer";
 import { resolveRecommendationAction, getOptionalGapLabel } from "@/lib/readiness-cta-resolver";
+import { executeInputAction } from "@/lib/readiness/executeInputAction";
+import { PRPackageSummaryCard, InputReadinessBanner, MissingInputWarning } from "@/components/pr-package-readiness";
+import BusinessRequirementsReadinessCard from "@/components/requirements/business-requirements-readiness-card";
+import { normalizePRPackage, getBlockerMessage, getWarningMessage } from "@/lib/adapters/prPackageAdapter";
 
 export const dynamic = "force-dynamic";
 
@@ -79,6 +85,9 @@ interface PullRequest {
   source_branch: string;
   target_branch: string;
   state: string;
+  head_commit_sha?: string | null;
+  base_commit_sha?: string | null;
+  merge_commit_sha?: string | null;
   changed_files_count: number;
   last_synced_at: string | null;
   sync_status: string;
@@ -192,6 +201,9 @@ function calculatePRReadiness(pr: any, result: any) {
     latest_recommendation: {
       exists: pr.recommendation_status === "GENERATED",
       input_stale: isStale
+    },
+    recommendation_audit: {
+      status: pr.recommendation_status === "GENERATED" ? (isStale ? "OUTDATED" : "AUDITABLE") : "NO_RECOMMENDATION_YET"
     }
   });
   
@@ -310,8 +322,111 @@ export default function RepositoryDetailPage({ params }: PageProps) {
     statusCode?: number;
   } | null>(null);
 
-  // Store readiness data from the panel for use in PR rows
+  // Store readiness data from the panel for use in PR rows and evidence summary.
+  // Single source of truth: InputReadinessV2Panel emits the raw V2 response.
   const [selectedPRReadinessData, setSelectedPRReadinessData] = useState<any>(null);
+
+  // Modal states for input readiness CTAs
+  const [isBusinessReqModalOpen, setIsBusinessReqModalOpen] = useState(false);
+  const [isReadinessDrawerOpen, setIsReadinessDrawerOpen] = useState(false);
+
+  // Intelligence refresh progress state
+  const [refreshState, setRefreshState] = useState<"idle" | "running" | "success" | "partial" | "failed">("idle");
+  const [refreshStartedAt, setRefreshStartedAt] = useState<Date | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [refreshResult, setRefreshResult] = useState<any>(null);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+
+  // Run Repository Intelligence mutation (Input 3)
+  const runRepositoryIntelligence = useCallback(async () => {
+    if (!repositoryId || refreshState === "running") return;
+    const selectedPR = pullRequests.find((p) => p.id === selectedPullRequestId);
+    const headCommitSha = selectedPR ? selectedPR.head_commit_sha : null;
+    
+    setRefreshState("running");
+    setRefreshStartedAt(new Date());
+    setElapsedSeconds(0);
+    setRefreshResult(null);
+    setRefreshError(null);
+    
+    try {
+      const res = await fetch(`/api/repositories/${repositoryId}/intelligence/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          include_architecture: true,
+          include_behaviors: true,
+          include_journeys: true,
+          pull_request_id: selectedPullRequestId || null,
+          head_commit_sha: headCommitSha || null,
+        }),
+      });
+      const result = await res.json().catch(() => ({}));
+      setRefreshResult(result);
+
+      if (!res.ok) {
+        setRefreshState("failed");
+        setRefreshError(result?.error || result?.message || "Unknown error");
+        toast.error("Intelligence refresh failed", {
+          description: result?.error || result?.message || "Unknown error",
+        });
+        return;
+      }
+
+      const runStatus: string = result?.status ?? "SUCCESS";
+      const score: number | null = result?.score ?? null;
+      const maxScore: number | null = result?.max_score ?? null;
+      const partialErrors: Array<{ code: string; message: string }> = result?.partial_errors ?? [];
+      const failedSteps: string[] = result?.failed_steps ?? [];
+      const specificBehaviors: number = result?.specific_behaviors_created ?? 0;
+      const bbmCount: number = result?.business_behavior_mappings_created ?? 0;
+
+      if (runStatus === "SUCCESS" && score === maxScore) {
+        setRefreshState("success");
+        const scoreLabel = score !== null && maxScore !== null ? ` (${score}/${maxScore})` : "";
+        toast.success("Repository Intelligence refreshed" + scoreLabel, {
+          description:
+            specificBehaviors > 0
+              ? `${specificBehaviors} specific behavior${specificBehaviors !== 1 ? "s" : ""} mapped, ${bbmCount} requirement link${bbmCount !== 1 ? "s" : ""} created.`
+              : result?.message || "Intelligence refresh completed successfully.",
+        });
+      } else if (runStatus === "PARTIAL" || partialErrors.length > 0) {
+        setRefreshState("partial");
+        const topError = partialErrors[0];
+        toast.warning("Intelligence refresh completed with warnings", {
+          description:
+            topError?.message ||
+            (failedSteps.length > 0 ? `Steps with issues: ${failedSteps.join(", ")}` : result?.message),
+        });
+      } else {
+        setRefreshState("failed");
+        toast.error("Intelligence refresh failed", {
+          description: result?.message || "Refresh did not complete.",
+        });
+      }
+    } catch (err: any) {
+      setRefreshState("failed");
+      setRefreshError(err?.message || "Network error");
+      toast.error("Intelligence refresh error", {
+        description: err?.message || "Network error",
+      });
+    } finally {
+      setReadinessRefreshTrigger((n) => n + 1);
+    }
+  }, [repositoryId, selectedPullRequestId, pullRequests, refreshState]);
+
+  // Central CTA dispatcher — used by InputReadinessV2Panel, NBA section, PR row, banners
+  const handleInputAction = useCallback((actionOrInputId: string, _inputId?: string) => {
+    if (!repositoryId) return;
+    executeInputAction(actionOrInputId, {
+      repositoryId,
+      pullRequestId: selectedPullRequestId,
+      router,
+      openBusinessRequirementsModal: () => setIsBusinessReqModalOpen(true),
+      runRepositoryIntelligence,
+      toast: (title, opts) => toast(title, { description: opts?.description }),
+    });
+  }, [repositoryId, selectedPullRequestId, router, runRepositoryIntelligence]);
 
   // PR sync state
   const [isSyncingPullRequests, setIsSyncingPullRequests] = useState(false);
@@ -518,7 +633,7 @@ export default function RepositoryDetailPage({ params }: PageProps) {
   }, []);
 
   // Trigger recommendation for a PR (after checkpoint confirmation)
-  const triggerRecommendation = useCallback(async (prId: string) => {
+  const triggerRecommendation = useCallback(async (prId: string, generationMode?: string) => {
     if (!repositoryId) return;
 
     // Prevent double-submit
@@ -543,7 +658,8 @@ export default function RepositoryDetailPage({ params }: PageProps) {
             repository_id: repositoryId,
             pull_request_id: prId,
             triggered_by: "engineer-manual",
-            readiness_acknowledged: true
+            readiness_acknowledged: true,
+            mode: generationMode || "confident"
           })
         }
       );
@@ -714,11 +830,11 @@ export default function RepositoryDetailPage({ params }: PageProps) {
   }, [router, repositoryId, session?.backendToken, generationStatus]);
 
   // Handle checkpoint modal continue action
-  const handleCheckpointContinue = useCallback(() => {
+  const handleCheckpointContinue = useCallback((generationMode?: string) => {
     if (checkpointModal.action === "view" && checkpointModal.recommendationRunId) {
       router.push(`/app/recommendations/${checkpointModal.recommendationRunId}`);
     } else if (checkpointModal.pullRequestId) {
-      triggerRecommendation(checkpointModal.pullRequestId);
+      triggerRecommendation(checkpointModal.pullRequestId, generationMode);
     }
   }, [checkpointModal.action, checkpointModal.pullRequestId, checkpointModal.recommendationRunId, triggerRecommendation, router]);
 
@@ -754,6 +870,9 @@ export default function RepositoryDetailPage({ params }: PageProps) {
     }
   }, [repositoryId, selectedPullRequestId]);
 
+  // selectedPRReadinessData is updated by InputReadinessV2Panel via onReadinessDataChange.
+  // This single source of truth is used for the evidence summary, PR row, and drawer.
+
   // Auto-open readiness modal if openReadiness query param is set
   useEffect(() => {
     const openReadiness = searchParams.get("openReadiness");
@@ -784,6 +903,170 @@ export default function RepositoryDetailPage({ params }: PageProps) {
       autoSyncPullRequests();
     }
   }, [repo, repositoryId, autoSyncPullRequests]);
+
+  // Elapsed timer for intelligence refresh
+  useEffect(() => {
+    if (refreshState !== "running" || !refreshStartedAt) return;
+
+    const interval = setInterval(() => {
+      setElapsedSeconds(Math.floor((Date.now() - refreshStartedAt.getTime()) / 1000));
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [refreshState, refreshStartedAt]);
+
+  // Format elapsed time as mm:ss
+  const formatElapsed = (seconds: number): string => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  // Get progress message based on elapsed time
+  const getProgressMessage = (): string => {
+    if (elapsedSeconds < 30) {
+      return "Repository intelligence is running. This can take up to 2 minutes.";
+    } else if (elapsedSeconds < 90) {
+      return "Still working… Large repositories can take 1–2 minutes. Do not close this page.";
+    } else {
+      return "Almost there… Finalizing behavior mappings and readiness.";
+    }
+  };
+
+  // Intelligence refresh progress panel component
+  const IntelligenceRefreshProgressPanel = () => {
+    if (refreshState === "idle") return null;
+
+    if (refreshState === "running") {
+      return (
+        <div className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-4">
+          <div className="flex items-center gap-3">
+            <Loader2 className="w-5 h-5 text-zinc-400 animate-spin" />
+            <div>
+              <h3 className="text-sm font-semibold text-zinc-200">Refreshing Product Behavior Map…</h3>
+              <p className="text-xs text-zinc-500 mt-0.5">Elapsed: {formatElapsed(elapsedSeconds)}</p>
+            </div>
+          </div>
+          <div className="bg-zinc-950/50 border border-zinc-800/40 rounded-lg p-4">
+            <p className="text-xs text-zinc-400">Status:</p>
+            <p className="text-sm text-zinc-300 mt-1">{getProgressMessage()}</p>
+          </div>
+        </div>
+      );
+    }
+
+    if (refreshState === "success" && refreshResult) {
+      return (
+        <div className="bg-emerald-950/20 border border-emerald-800/40 rounded-xl p-5 space-y-4">
+          <div className="flex items-center gap-3">
+            <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+            <div>
+              <h3 className="text-sm font-semibold text-emerald-300">Product Behavior Map Ready</h3>
+              <p className="text-xs text-zinc-500 mt-0.5">
+                Score: {refreshResult.score}/{refreshResult.max_score}
+              </p>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3 text-xs">
+            <div className="bg-zinc-950/50 border border-zinc-800/40 rounded-lg p-3">
+              <p className="text-zinc-500">Specific behaviors created</p>
+              <p className="text-emerald-300 font-semibold mt-1">{refreshResult.specific_behaviors_created || 0}</p>
+            </div>
+            <div className="bg-zinc-950/50 border border-zinc-800/40 rounded-lg p-3">
+              <p className="text-zinc-500">Requirement mappings created</p>
+              <p className="text-emerald-300 font-semibold mt-1">{refreshResult.business_behavior_mappings_created || 0}</p>
+            </div>
+          </div>
+          {refreshResult.completed_steps && refreshResult.completed_steps.length > 0 && (
+            <div className="bg-zinc-950/50 border border-zinc-800/40 rounded-lg p-3">
+              <p className="text-xs text-zinc-500 mb-2">Completed steps:</p>
+              <div className="space-y-1">
+                {refreshResult.completed_steps.map((step: string) => (
+                  <div key={step} className="flex items-center gap-2 text-xs text-zinc-300">
+                    <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                    <span>{step.replace(/_/g, " ")}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    if (refreshState === "partial" && refreshResult) {
+      return (
+        <div className="bg-amber-950/20 border border-amber-800/40 rounded-xl p-5 space-y-4">
+          <div className="flex items-center gap-3">
+            <AlertTriangle className="w-5 h-5 text-amber-400" />
+            <div>
+              <h3 className="text-sm font-semibold text-amber-300">Product Behavior Map Partial</h3>
+              <p className="text-xs text-zinc-500 mt-0.5">
+                Score: {refreshResult.score}/{refreshResult.max_score}
+              </p>
+            </div>
+          </div>
+          {refreshResult.partial_errors && refreshResult.partial_errors.length > 0 && (
+            <div className="bg-zinc-950/50 border border-zinc-800/40 rounded-lg p-3">
+              <p className="text-xs text-zinc-500 mb-2">Reason:</p>
+              {refreshResult.partial_errors.map((error: any, idx: number) => (
+                <div key={idx} className="mb-2 last:mb-0">
+                  <p className="text-xs text-amber-300 font-medium">{error.code}</p>
+                  <p className="text-xs text-zinc-300 mt-0.5">{error.message}</p>
+                  {error.next_action && (
+                    <p className="text-xs text-zinc-400 mt-1">Next action: {error.next_action}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {refreshResult.failed_steps && refreshResult.failed_steps.length > 0 && (
+            <div className="bg-zinc-950/50 border border-zinc-800/40 rounded-lg p-3">
+              <p className="text-xs text-zinc-500 mb-2">Failed steps:</p>
+              {refreshResult.failed_steps.map((step: string) => (
+                <div key={step} className="flex items-center gap-2 text-xs text-rose-300">
+                  <XCircle className="w-3 h-3" />
+                  <span>{step.replace(/_/g, " ")}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    if (refreshState === "failed") {
+      return (
+        <div className="bg-rose-950/20 border border-rose-800/40 rounded-xl p-5 space-y-4">
+          <div className="flex items-center gap-3">
+            <XCircle className="w-5 h-5 text-rose-400" />
+            <div>
+              <h3 className="text-sm font-semibold text-rose-300">Product Behavior Map Refresh Failed</h3>
+            </div>
+          </div>
+          {refreshError && (
+            <div className="bg-zinc-950/50 border border-zinc-800/40 rounded-lg p-3">
+              <p className="text-xs text-zinc-500 mb-2">Error:</p>
+              <p className="text-xs text-rose-300">{refreshError}</p>
+            </div>
+          )}
+          {refreshResult?.failed_steps && refreshResult.failed_steps.length > 0 && (
+            <div className="bg-zinc-950/50 border border-zinc-800/40 rounded-lg p-3">
+              <p className="text-xs text-zinc-500 mb-2">Failed step:</p>
+              {refreshResult.failed_steps.map((step: string) => (
+                <div key={step} className="flex items-center gap-2 text-xs text-rose-300">
+                  <XCircle className="w-3 h-3" />
+                  <span>{step.replace(/_/g, " ")}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    return null;
+  };
 
   function getReadinessBadge(state: string | null | undefined) {
     const safeState = state || "UNKNOWN";
@@ -1025,6 +1308,24 @@ export default function RepositoryDetailPage({ params }: PageProps) {
       </div>
 
 
+      {/* Part 5: Selected PR Change Package Card - Using normalized PR package adapter */}
+      {selectedPullRequestId && selectedPRReadinessData && (() => {
+        const selectedPR = pullRequests.find(pr => pr.id === selectedPullRequestId);
+        const normalizedPRPackage = normalizePRPackage(selectedPR, selectedPRReadinessData);
+        return <PRPackageSummaryCard prPackage={normalizedPRPackage} />;
+      })()}
+
+      {/* Business Requirements Readiness Card */}
+      {selectedPullRequestId && (
+        <BusinessRequirementsReadinessCard
+          repositoryId={repo.id}
+          pullRequestId={selectedPullRequestId}
+        />
+      )}
+
+      {/* Intelligence Refresh Progress Panel */}
+      <IntelligenceRefreshProgressPanel />
+
       {/* Recommendation Readiness Panel */}
       <RecommendationReadinessPanel
         repositoryId={repo.id}
@@ -1033,30 +1334,79 @@ export default function RepositoryDetailPage({ params }: PageProps) {
         pullRequestId={selectedPullRequestId}
         refreshTrigger={readinessRefreshTrigger}
         onReadinessDataChange={setSelectedPRReadinessData}
+        onAction={handleInputAction}
+        runRepositoryIntelligence={runRepositoryIntelligence}
+        refreshState={refreshState}
       />
 
-      {/* Selected PR Evidence Summary */}
+      {/* Part 7: Selected PR Evidence Summary — V2 readiness model */}
       {selectedPullRequestId && selectedPRReadinessData ? (
-        <div className="flex items-center gap-4 text-xs text-zinc-500 px-3 py-2 bg-zinc-900/20 border border-zinc-800/40 rounded-lg">
+        <div className="flex items-center gap-3 text-xs text-zinc-500 px-3 py-2 bg-zinc-900/20 border border-zinc-800/40 rounded-lg flex-wrap">
           <span className="font-medium text-zinc-400">Selected PR Evidence</span>
           <span>·</span>
           {(() => {
-            const selectedPR = pullRequests.find(pr => pr.id === selectedPullRequestId);
+            const v2 = selectedPRReadinessData;
+            const getInputStatus = (id: string) =>
+              v2.inputs?.find((i: any) => i.input_id === id)?.status ?? "MISSING";
+
+            const i1Status = getInputStatus("INPUT_1");
+            const i2Status = getInputStatus("INPUT_2");
+            const i4Status = getInputStatus("INPUT_4");
+            const i4Input = v2.inputs?.find((i: any) => i.input_id === "INPUT_4");
+            const i4Details = i4Input?.details as any;
+            const i4BasicStatus = i4Details?.basic_inventory_status ?? "UNKNOWN";
+            const i4IntelligenceStatus = i4Details?.overall_intelligence_status ?? "UNKNOWN";
+            const i5Status = getInputStatus("INPUT_5");
+            const i6Status = getInputStatus("INPUT_6");
+            const i7Status = getInputStatus("INPUT_7");
+
+            const statusColor = (s: string) =>
+              s === "READY" ? "text-emerald-400"
+              : s === "PARTIAL" ? "text-amber-400"
+              : s === "STALE" ? "text-orange-400"
+              : s === "NEEDS_REVIEW" ? "text-amber-400"
+              : "text-rose-400";
+
+            const genStatusLabel: Record<string, string> = {
+              BLOCKED: "Blocked",
+              DRAFT_ONLY: "Draft Only",
+              MINIMUM_READY: "Min. Ready",
+              CONFIDENT_READY: "Confident",
+              HIGH_CONFIDENCE_READY: "High Confidence",
+            };
+            const genStatusColor: Record<string, string> = {
+              BLOCKED: "text-rose-400",
+              DRAFT_ONLY: "text-amber-400",
+              MINIMUM_READY: "text-zinc-300",
+              CONFIDENT_READY: "text-emerald-400",
+              HIGH_CONFIDENCE_READY: "text-emerald-300",
+            };
+
             return (
               <>
-                <span>PR diff: {selectedPR?.changed_files_count || 0} files</span>
+                <span className={`font-semibold ${genStatusColor[v2.generation_status] ?? "text-zinc-400"}`}>
+                  {genStatusLabel[v2.generation_status] ?? v2.generation_status}
+                </span>
                 <span>·</span>
-                <span>Tests: {selectedPRReadinessData.available_signals?.some((s: any) => s.key === "current_pr_execution") ? "linked" : "missing"}</span>
+                <span className={statusColor(i1Status)}>PR Package: {i1Status === "READY" ? "Ready" : i1Status === "PARTIAL" ? "Partial" : "Missing"}</span>
                 <span>·</span>
-                <span>Coverage: {selectedPRReadinessData.available_signals?.some((s: any) => s.key === "coverage_report") ? "linked" : "missing"}</span>
+                <span className={statusColor(i2Status)}>Requirements: {i2Status === "READY" ? "Ready" : i2Status === "PARTIAL" ? "Partial" : i2Status === "NEEDS_REVIEW" ? "Needs Review" : "Missing"}</span>
                 <span>·</span>
-                <span>AC: {selectedPRReadinessData.available_signals?.some((s: any) => s.key === "acceptance_criteria") ? "available" : "missing"}</span>
+                <span className={statusColor(i4BasicStatus)}>Test Inventory: {i4BasicStatus === "READY" ? "Ready" : i4BasicStatus === "PARTIAL" ? "Partial" : "Missing"}</span>
                 <span>·</span>
-                <span>Recommendation: {(() => {
-                  const pr = pullRequests.find(p => p.id === selectedPullRequestId);
-                  if (pr?.recommendation_status === "GENERATED") return "generated";
-                  return "not generated";
-                })()}</span>
+                <span className={statusColor(i4IntelligenceStatus)}>Test Intelligence: {i4IntelligenceStatus === "READY" ? "Ready" : i4IntelligenceStatus === "PARTIAL" ? "Partial" : "Missing"}</span>
+                <span>·</span>
+                <span className={statusColor(i5Status)}>AC/Test Mapping: {i5Status === "READY" ? "Ready" : i5Status === "PARTIAL" ? "Partial" : i5Status === "NEEDS_REVIEW" ? "Review Needed" : "Missing"}</span>
+                <span>·</span>
+                <span className={statusColor(i6Status)}>PR Execution: {i6Status === "READY" ? "Ready" : i6Status === "STALE" ? "Stale" : "Missing"}</span>
+                <span>·</span>
+                <span className={statusColor(i7Status)}>Coverage: {i7Status === "READY" ? "Ready" : i7Status === "HISTORICAL_ONLY" ? "Historical Only" : i7Status === "STALE" ? "Stale" : i7Status === "PARTIAL" ? "Partial" : "Missing"}</span>
+                <span>·</span>
+                <span className="font-mono">{Math.round(v2.evidence_completeness ?? 0)}% evidence completeness</span>
+                <span>·</span>
+                <span className={statusColor(v2.release_confidence ?? "LOW")}>Release Confidence: {v2.release_confidence?.toLowerCase() ?? "low"}</span>
+                <span>·</span>
+                <span className={statusColor(v2.confidence_ceiling ?? "LOW")}>Ceiling: {v2.confidence_ceiling?.toLowerCase() ?? "low"}</span>
               </>
             );
           })()}
@@ -1165,31 +1515,61 @@ export default function RepositoryDetailPage({ params }: PageProps) {
               const result = recommendationResults.get(pr.id);
               const isRunning = runningRecommendation === pr.id;
               
-              // Use readiness data from panel if this is the selected PR, otherwise fall back to calculation
+              // Normalize PR package data
+              const normalizedPRPackage = normalizePRPackage(
+                pr, 
+                pr.id === selectedPullRequestId ? selectedPRReadinessData : undefined
+              );
+              
+              // Use V2 readiness data for selected PR, fall back for others
               let readiness;
               if (pr.id === selectedPullRequestId && selectedPRReadinessData) {
+                const v2 = selectedPRReadinessData;
+                const genStatus: Record<string, string> = {
+                  BLOCKED: "Blocked",
+                  DRAFT_ONLY: "Draft Only",
+                  MINIMUM_READY: "Minimum Ready",
+                  CONFIDENT_READY: "Ready",
+                  HIGH_CONFIDENCE_READY: "Ready",
+                };
+                const genConfidence: Record<string, string> = {
+                  BLOCKED: "LOW",
+                  DRAFT_ONLY: "LOW",
+                  MINIMUM_READY: "MEDIUM",
+                  CONFIDENT_READY: "HIGH",
+                  HIGH_CONFIDENCE_READY: "HIGH",
+                };
                 readiness = {
-                  readinessLevel: selectedPRReadinessData.readiness_level === "HIGH_CONFIDENCE_READY" ? "Ready" 
-                    : selectedPRReadinessData.readiness_level === "MINIMUM_READY" ? "Minimum Ready"
-                    : selectedPRReadinessData.readiness_level === "BLOCKED" ? "Blocked"
-                    : selectedPRReadinessData.readiness_level?.replace(/_/g, " ") || "Ready",
-                  expectedConfidence: selectedPRReadinessData.expected_confidence || "HIGH",
-                  missingSignals: selectedPRReadinessData.missing_inputs?.map((i: any) => i.label) || [],
-                  isStale: false,
+                  readinessLevel: genStatus[v2.generation_status] ?? v2.generation_status?.replace(/_/g, " ") ?? "Unknown",
+                  expectedConfidence: genConfidence[v2.generation_status] ?? v2.confidence_level ?? "LOW",
+                  releaseConfidence: v2.release_confidence ?? null,
+                  evidenceCompleteness: v2.evidence_completeness ?? null,
+                  confidenceCeilingReason: v2.confidence_ceiling_reason ?? null,
+                  missingSignals: v2.blockers?.map((b: any) => b.input_id) ?? [],
+                  isStale: normalizedPRPackage.snapshotStatus === "OUTDATED",
                   latestRecommendationTime: null,
                   ctaAction: resolveRecommendationAction({
-                    readiness_level: selectedPRReadinessData.readiness_level,
-                    expected_confidence: selectedPRReadinessData.expected_confidence,
-                    readiness_score: selectedPRReadinessData.readiness_score,
-                    can_generate: selectedPRReadinessData.can_generate,
-                    blocking_inputs: selectedPRReadinessData.confidence_blockers?.map((b: string) => ({ key: b, label: b })) || [],
-                    missing_inputs: selectedPRReadinessData.missing_inputs || [],
-                    optional_inputs: selectedPRReadinessData.missing_inputs?.filter((s: any) => s.severity === "OPTIONAL") || [],
+                    readiness_level: v2.generation_status === "BLOCKED" ? "BLOCKED"
+                      : v2.generation_status === "DRAFT_ONLY" ? "MINIMUM_READY"
+                      : "HIGH_CONFIDENCE_READY",
+                    expected_confidence: genConfidence[v2.generation_status] ?? "LOW",
+                    readiness_score: v2.confidence_score ?? 0,
+                    can_generate: v2.can_generate === "YES",
+                    blocking_inputs: v2.blockers?.map((b: any) => ({ key: b.input_id, label: b.input_id })) ?? [],
+                    missing_inputs: v2.inputs?.filter((i: any) => i.status === "MISSING").map((i: any) => ({ key: i.input_id, label: i.label, severity: i.is_hard_blocker ? "REQUIRED" : "RECOMMENDED" })) ?? [],
+                    optional_inputs: v2.inputs?.filter((i: any) => i.status === "MISSING" && !i.is_hard_blocker).map((i: any) => ({ key: i.input_id, label: i.label })) ?? [],
                     latest_recommendation: {
                       exists: pr.recommendation_status === "GENERATED",
-                      input_stale: false
-                    }
-                  })
+                      input_stale: normalizedPRPackage.snapshotStatus === "OUTDATED",
+                    },
+                    pr_package: {
+                      readiness_status: normalizedPRPackage.status as any,
+                      blockers: normalizedPRPackage.blockers,
+                      warnings: normalizedPRPackage.warnings,
+                      snapshot_is_stale: normalizedPRPackage.snapshotStatus === "OUTDATED",
+                    },
+                    recommendation_audit: undefined,
+                  }),
                 };
               } else {
                 readiness = calculatePRReadiness(pr, result);
@@ -1198,6 +1578,17 @@ export default function RepositoryDetailPage({ params }: PageProps) {
               const readinessStyling = getReadinessStyling(readiness.readinessLevel);
               const confidenceStyling = getConfidenceStyling(readiness.expectedConfidence);
               const ReadinessIcon = readinessStyling.icon;
+              
+              // PR package status styling
+              const getPRPackageStatusColor = (status: string) => {
+                switch (status) {
+                  case "READY": return "text-emerald-400";
+                  case "BLOCKED": return "text-rose-400";
+                  case "OUTDATED": return "text-orange-400";
+                  case "PARTIAL": return "text-amber-400";
+                  default: return "text-zinc-400";
+                }
+              };
               
               return (
                 <div 
@@ -1212,15 +1603,37 @@ export default function RepositoryDetailPage({ params }: PageProps) {
                         <span className="text-sm text-zinc-300 truncate">{pr.title}</span>
                       </div>
 
-                      {/* Single status line: readiness · confidence */}
+                      {/* Single status line: generation status · release confidence · evidence completeness · PR package */}
                       <div className="flex items-center gap-2 mb-2 text-xs">
                         <span className={`${readinessStyling.textColor} font-medium`}>
                           {readiness.readinessLevel}
                         </span>
+                        {(readiness as any).releaseConfidence && (
+                          <>
+                            <span className="text-zinc-600">·</span>
+                            <span className={`${confidenceStyling.textColor} font-medium`}>
+                              Release Confidence: {(readiness as any).releaseConfidence.toLowerCase()}
+                            </span>
+                          </>
+                        )}
+                        {(readiness as any).evidenceCompleteness != null && (
+                          <>
+                            <span className="text-zinc-600">·</span>
+                            <span className="text-zinc-400">
+                              {Math.round((readiness as any).evidenceCompleteness)}% complete
+                            </span>
+                          </>
+                        )}
                         <span className="text-zinc-600">·</span>
-                        <span className={`${confidenceStyling.textColor} font-medium`}>
-                          {readiness.expectedConfidence.toLowerCase()} confidence
+                        <span className={`${getPRPackageStatusColor(normalizedPRPackage.status)} font-medium`}>
+                          PR Package: {normalizedPRPackage.status}
                         </span>
+                        {normalizedPRPackage.headShaShort && (
+                          <>
+                            <span className="text-zinc-600">·</span>
+                            <span className="text-zinc-400">head {normalizedPRPackage.headShaShort}</span>
+                          </>
+                        )}
                         {readiness.isStale && (
                           <>
                             <span className="text-zinc-600">·</span>
@@ -1297,7 +1710,11 @@ export default function RepositoryDetailPage({ params }: PageProps) {
                             <Button
                               size="sm"
                               variant="outline"
-                              onClick={(e) => { e.stopPropagation(); showCheckpointModal(pr.id, "generate"); }}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedPullRequestId(pr.id);
+                                setIsReadinessDrawerOpen(true);
+                              }}
                               className="border-rose-600 bg-rose-700 hover:bg-rose-600 text-rose-100"
                               aria-label={ctaAction.primaryLabel}
                             >
@@ -1365,6 +1782,33 @@ export default function RepositoryDetailPage({ params }: PageProps) {
         action={checkpointModal.action}
         recommendationRunId={checkpointModal.recommendationRunId}
         generationStatus={generationStatus}
+        runRepositoryIntelligence={runRepositoryIntelligence}
+        refreshState={refreshState}
+      />
+
+      {/* Business Requirements Modal — Input 2 CTA target */}
+      <BusinessRequirementsModal
+        isOpen={isBusinessReqModalOpen}
+        onClose={() => setIsBusinessReqModalOpen(false)}
+        onSuccess={() => {
+          setIsBusinessReqModalOpen(false);
+          setReadinessRefreshTrigger((n) => n + 1);
+        }}
+        repositoryId={repositoryId || ""}
+        pullRequestId={selectedPullRequestId}
+      />
+
+      {/* Improve Input Readiness Drawer — replaces old Resolve Blocking Inputs modal */}
+      <ImproveInputReadinessDrawer
+        isOpen={isReadinessDrawerOpen}
+        onClose={() => setIsReadinessDrawerOpen(false)}
+        readinessData={selectedPRReadinessData}
+        onAction={handleInputAction}
+        onGenerate={() => {
+          if (selectedPullRequestId) {
+            showCheckpointModal(selectedPullRequestId, "generate");
+          }
+        }}
       />
     </div>
   );

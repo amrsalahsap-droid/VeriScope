@@ -22,6 +22,9 @@ from app.models.journey import Journey
 from app.models.integration_connection import IntegrationConnection
 from app.models.recommendation import RecommendationRun, RecommendationOutcome
 from app.models.fragility_pattern import FragilityPattern
+from app.models.requirement_package import RequirementPackage
+from app.models.requirement_group import RequirementGroup
+from app.models.acceptance_criterion import AcceptanceCriterion
 from app.services.signal_metadata import calculate_confidence_and_ceiling
 
 logger = logging.getLogger(__name__)
@@ -61,6 +64,9 @@ class RecommendationReadinessService:
 
         logger.info(f"Assessing readiness for repo {repository_id}, pr {pull_request_id}")
         
+        # 0. Get AC coverage status from snapshot if recommendation run exists
+        ac_coverage_stats = self._get_ac_coverage_stats(repository_id, pull_request_id)
+        
         # 1. Assess signals in detail (Task 2)
         signals = self._assess_signals_details(repository_id, pull_request_id)
         
@@ -99,11 +105,12 @@ class RecommendationReadinessService:
         
         release_confidence_ceiling = "HIGH"
             
-        if not has_source or not has_diff:
+        blocked_states = signals.get("acceptance_criteria", {}).get("blocked_states", [])
+        if not has_source or not has_diff or blocked_states:
             can_generate = False
             readiness_level = "BLOCKED"
             expected_confidence = "LOW"
-            logger.info(f"BLOCKED: has_source={has_source}, has_diff={has_diff}")
+            logger.info(f"BLOCKED: has_source={has_source}, has_diff={has_diff}, blocked_states={blocked_states}")
         else:
             can_generate = True
             
@@ -196,29 +203,50 @@ class RecommendationReadinessService:
                 available_inputs.append(sig)
             else:
                 missing_inputs.append(sig)
-                if key in ("source_code", "pull_request_diff"):
+                if key in ("source_code", "pull_request_diff") or (key == "acceptance_criteria" and sig["status"] == "BLOCKED"):
                     blocking_inputs.append(sig)
                 elif key in strongly_recommended_keys:
                     recommended_inputs.append(sig)
                     
-        # 4. Generate messages
-        primary_messages = {
-            "BLOCKED": "Recommendation generation is blocked. Critical input signals are missing.",
-            "MINIMUM_READY": "Minimum ready. Veriscope can generate recommendations, but confidence is low.",
-            "EVIDENCE_READY": "Evidence ready. Good test and coverage evidence is available.",
-            "REGRESSION_READY": "Regression ready. Full behavioral and test evidence is available.",
-            "HIGH_CONFIDENCE_READY": "High confidence ready. Comprehensive coverage and validation data are present."
-        }
-        secondary_messages = {
-            "BLOCKED": "Please configure repository access and pull request diff to proceed.",
-            "MINIMUM_READY": "Add test history and code coverage reports to improve confidence.",
-            "EVIDENCE_READY": "Add architecture graph and behavior catalog to trace regressions.",
-            "REGRESSION_READY": "Attach current PR test results and paste acceptance criteria to reach high confidence.",
-            "HIGH_CONFIDENCE_READY": "Veriscope is ready to generate recommendations with high accuracy."
-        }
-        
-        primary_message = primary_messages.get(readiness_level, "Readiness check complete.")
-        secondary_message = secondary_messages.get(readiness_level, "")
+        # 4. Generate messages - use AC coverage stats if available
+        if ac_coverage_stats and ac_coverage_stats["total"] > 0:
+            # Use AC-based health messages
+            total = ac_coverage_stats["total"]
+            covered = ac_coverage_stats["covered"]
+            missing = ac_coverage_stats["missing"]
+            partial = ac_coverage_stats["partial"]
+            
+            if missing == 0:
+                health = "Ready"
+                primary_message = f"All {total} acceptance criteria have passing test evidence."
+                secondary_message = "Coverage is complete. You can proceed with confidence."
+            elif missing < total:
+                health = "Partial"
+                primary_message = f"{covered} of {total} acceptance criteria have evidence. {missing} require review."
+                secondary_message = "Some acceptance criteria lack test evidence. Review the gaps before proceeding."
+            else:  # missing == total
+                health = "Incomplete"
+                primary_message = "No acceptance criteria have linked test evidence."
+                secondary_message = "Upload test results to generate scope and identify coverage gaps."
+        else:
+            # Fallback to signal-based messages
+            primary_messages = {
+                "BLOCKED": "Recommendation generation is blocked. Critical input signals are missing.",
+                "MINIMUM_READY": "Minimum ready. Veriscope can generate recommendations, but confidence is low.",
+                "EVIDENCE_READY": "Evidence ready. Good test and coverage evidence is available.",
+                "REGRESSION_READY": "Regression ready. Full behavioral and test evidence is available.",
+                "HIGH_CONFIDENCE_READY": "High confidence ready. Comprehensive coverage and validation data are present."
+            }
+            secondary_messages = {
+                "BLOCKED": "Please configure repository access and pull request diff to proceed.",
+                "MINIMUM_READY": "Add test history and code coverage reports to improve confidence.",
+                "EVIDENCE_READY": "Add architecture graph and behavior catalog to trace regressions.",
+                "REGRESSION_READY": "Attach current PR test results and paste acceptance criteria to reach high confidence.",
+                "HIGH_CONFIDENCE_READY": "Veriscope is ready to generate recommendations with high accuracy."
+            }
+            
+            primary_message = primary_messages.get(readiness_level, "Readiness check complete.")
+            secondary_message = secondary_messages.get(readiness_level, "")
         
         # Readiness score calculation with weighted signal values
         signal_weights = {
@@ -278,10 +306,22 @@ class RecommendationReadinessService:
             signal_statuses=signal_statuses
         )
         
+        # Call strict 12-input readiness service
+        from app.services.input_readiness_v2_service import InputReadinessV2Service
+        v2_service = InputReadinessV2Service(self.db)
+        strict_12 = v2_service.assess(
+            repository_id=str(repository_id),
+            pull_request_id=str(pull_request_id) if pull_request_id else None
+        )
+
+        readiness_level = strict_12.generation_status
+        expected_confidence = strict_12.confidence_level
+        confidence_ceiling = strict_12.confidence_ceiling
+        release_confidence_ceiling = strict_12.confidence_ceiling
+        can_generate = (strict_12.can_generate in ("YES", "DRAFT_ONLY"))
+        primary_message = strict_12.primary_message
+
         # Override expected_confidence with calculated value
-        expected_confidence = confidence_calc["expected_confidence"]
-        confidence_ceiling = confidence_calc["confidence_ceiling"]
-        release_confidence_ceiling = confidence_ceiling
         confidence_reason = confidence_calc["confidence_reason"]
         generation_blockers = confidence_calc["generation_blockers"]
         confidence_limiters = confidence_calc["confidence_limiters"]
@@ -293,10 +333,11 @@ class RecommendationReadinessService:
         
         # Save to DB (map new enums to closest DB enums)
         db_readiness_level = readiness_level
-        if readiness_level == "MINIMUM_READY":
+        if readiness_level in ("MINIMUM_READY", "DRAFT_ONLY", "REVIEW_NEEDED"):
             db_readiness_level = "CONNECTED"
-        elif readiness_level == "REGRESSION_READY":
+        elif readiness_level in ("REGRESSION_READY", "CONFIDENT_READY"):
             db_readiness_level = "RECOMMENDATION_READY"
+
             
         # Gap analysis (old format gaps for compatibility)
         blocking_gaps = []
@@ -305,6 +346,9 @@ class RecommendationReadinessService:
             blocking_gaps.append("Source code access is required for any recommendation")
         if not has_diff:
             blocking_gaps.append("Pull request diff is required to analyze changes")
+        if blocked_states:
+            for state in blocked_states:
+                blocking_gaps.append(f"Acceptance criteria blocked: {state}")
         for key in strongly_recommended_keys:
             if key not in available_signal_keys:
                 optional_gaps.append(f"Missing {key} signal.")
@@ -366,6 +410,8 @@ class RecommendationReadinessService:
                     break
         assessment.confidence_limiters = confidence_limiters_signals
         
+        assessment.strict_12_input_readiness = strict_12
+
         self.db.expunge(assessment)
         logger.info(f"Readiness assessment complete: {readiness_level}, score {readiness_score}")
         return assessment
@@ -529,9 +575,21 @@ class RecommendationReadinessService:
             signal_statuses=signal_statuses
         )
         
-        expected_confidence = confidence_calc["expected_confidence"]
-        confidence_ceiling = confidence_calc["confidence_ceiling"]
-        release_confidence_ceiling = confidence_ceiling
+        # Call strict 12-input readiness service
+        from app.services.input_readiness_v2_service import InputReadinessV2Service
+        v2_service = InputReadinessV2Service(self.db)
+        strict_12 = v2_service.assess(
+            repository_id=str(assessment.repository_id),
+            pull_request_id=str(assessment.pull_request_id) if assessment.pull_request_id else None
+        )
+
+        readiness_level = strict_12.generation_status
+        expected_confidence = strict_12.confidence_level
+        confidence_ceiling = strict_12.confidence_ceiling
+        release_confidence_ceiling = strict_12.confidence_ceiling
+        primary_message = strict_12.primary_message
+        assessment.can_generate = (strict_12.can_generate in ("YES", "DRAFT_ONLY"))
+
         confidence_reason = confidence_calc["confidence_reason"]
         generation_blockers = confidence_calc["generation_blockers"]
         confidence_limiters = confidence_calc["confidence_limiters"]
@@ -565,8 +623,75 @@ class RecommendationReadinessService:
                     confidence_limiters_signals.append(sig)
                     break
         assessment.confidence_limiters = confidence_limiters_signals
+        
+        assessment.strict_12_input_readiness = strict_12
+        
         self.db.expunge(assessment)
         return assessment
+
+    def _get_ac_coverage_stats(self, repository_id: str, pull_request_id: Optional[str]) -> Optional[Dict[str, int]]:
+        """
+        Extract AC coverage statistics from the acTraceability snapshot.
+        
+        Returns dict with keys: total, covered, missing, partial
+        Returns None if no recommendation run or snapshot exists.
+        """
+        from app.models.recommendation import RecommendationRun
+        from uuid import UUID
+        if isinstance(repository_id, str):
+            try:
+                repository_id = UUID(repository_id)
+            except ValueError:
+                pass
+        if isinstance(pull_request_id, str) and pull_request_id:
+            try:
+                pull_request_id = UUID(pull_request_id)
+            except ValueError:
+                pass
+
+        # Find the most recent recommendation run for this PR
+        run = None
+        if pull_request_id:
+            run = self.db.query(RecommendationRun).filter(
+                RecommendationRun.repository_id == repository_id,
+                RecommendationRun.pull_request_id == pull_request_id
+            ).order_by(RecommendationRun.created_at.desc()).first()
+        else:
+            # Fallback to most recent run without PR
+            run = self.db.query(RecommendationRun).filter(
+                RecommendationRun.repository_id == repository_id,
+                RecommendationRun.pull_request_id.is_(None)
+            ).order_by(RecommendationRun.created_at.desc()).first()
+
+        if not run or not run.ac_traceability_snapshot_json:
+            return None
+
+        # Parse the acTraceability snapshot
+        ac_traceability = run.ac_traceability_snapshot_json
+        if not isinstance(ac_traceability, list):
+            return None
+
+        # Count coverage statuses
+        total = len(ac_traceability)
+        covered = 0
+        missing = 0
+        partial = 0
+
+        for ac in ac_traceability:
+            coverage_status = ac.get("coverageStatus", "").lower()
+            if coverage_status == "covered":
+                covered += 1
+            elif coverage_status == "missing":
+                missing += 1
+            elif coverage_status == "partially covered":
+                partial += 1
+
+        return {
+            "total": total,
+            "covered": covered,
+            "missing": missing,
+            "partial": partial
+        }
 
     def _assess_signals_details(self, repository_id: str, pull_request_id: Optional[str]) -> Dict[str, dict]:
         from uuid import UUID
@@ -615,8 +740,25 @@ class RecommendationReadinessService:
         # 2. pull_request_diff
         has_diff = False
         diff_count = 0
+        pr_package_readiness = {
+            "status": "READY",
+            "blockers": [],
+            "warnings": []
+        }
+        
         if pr:
-            # Check changed_files_count first
+            # Part 5: PR Package Readiness Checks
+            # Check PR_EXISTS
+            if not pr:
+                pr_package_readiness["status"] = "BLOCKED"
+                pr_package_readiness["blockers"].append("PR_EXISTS")
+            
+            # Check HEAD_SHA_PRESENT
+            if not pr.head_commit_sha:
+                pr_package_readiness["status"] = "BLOCKED"
+                pr_package_readiness["blockers"].append("HEAD_SHA_MISSING")
+            
+            # Check CHANGED_FILES_PRESENT
             if pr.changed_files_count and pr.changed_files_count > 0:
                 has_diff = True
                 diff_count = pr.changed_files_count
@@ -628,22 +770,41 @@ class RecommendationReadinessService:
                 if changed_files > 0:
                     has_diff = True
                     diff_count = changed_files
-                # Fallback: check stored changed_files JSON if available
-                elif hasattr(pr, 'changed_files') and pr.changed_files:
-                    if isinstance(pr.changed_files, list):
-                        diff_count = len(pr.changed_files)
-                        has_diff = diff_count > 0
-                    elif isinstance(pr.changed_files, dict) and 'files' in pr.changed_files:
-                        diff_count = len(pr.changed_files['files'])
-                        has_diff = diff_count > 0
-
+                else:
+                    pr_package_readiness["status"] = "BLOCKED"
+                    pr_package_readiness["blockers"].append("CHANGED_FILES_MISSING")
+            
+            # Check CHANGED_FILE_PATHS_VALID
+            if has_diff:
+                changed_files_db = self.db.query(PullRequestChangedFile).filter(
+                    PullRequestChangedFile.pull_request_id == pr.id
+                ).all()
+                invalid_paths = [f.file_path for f in changed_files_db if not f.file_path or f.file_path.strip() == ""]
+                if invalid_paths:
+                    pr_package_readiness["status"] = "PARTIAL"
+                    pr_package_readiness["warnings"].append("CHANGED_FILE_PATH_INVALID")
+            
+            # Check for truncation
+            if pr.evidence_truncated:
+                pr_package_readiness["status"] = "PARTIAL"
+                pr_package_readiness["warnings"].append("LARGE_DIFF_TRUNCATED")
+            
+            # Check for patch missing
+            changed_files_db = self.db.query(PullRequestChangedFile).filter(
+                PullRequestChangedFile.pull_request_id == pr.id
+            ).all()
+            missing_patch = [f.file_path for f in changed_files_db if not f.patch_summary]
+            if missing_patch:
+                pr_package_readiness["warnings"].append("PATCH_MISSING")
+        
         signals["pull_request_diff"] = {
             "key": "pull_request_diff",
             "status": "AVAILABLE" if has_diff else "MISSING",
             "evidence_count": diff_count,
             "linked_to_current_pr": True,
             "explanation": f"Pull request contains {diff_count} changed files." if has_diff else "No pull request changes found.",
-            "estimated_confidence_gain": 0.0
+            "estimated_confidence_gain": 0.0,
+            "pr_package_readiness": pr_package_readiness
         }
 
         # 3. architecture_graph
@@ -847,55 +1008,105 @@ class RecommendationReadinessService:
         # 10. acceptance_criteria
         has_ac_record = False
         ac_count = 0
+        blocked_states = []
         struct_ac_count = 0
         bio_ac_count = 0
         work_item_ac_items = []
 
         if pr:
-            # Source 1: structured AC rows (repository_id + pull_request_id for correctness)
-            struct_ac_count = self.db.query(AcceptanceCriterion).filter(
-                AcceptanceCriterion.repository_id == repository_id,
-                AcceptanceCriterion.pull_request_id == pr.id
-            ).count()
-            ac_count += struct_ac_count
+            # 1. RequirementPackage check
+            pkg = self.db.query(RequirementPackage).filter(
+                RequirementPackage.repository_id == repository_id,
+                RequirementPackage.pull_request_id == pr.id
+            ).first()
+            if not pkg:
+                blocked_states.append("REQUIREMENT_PACKAGE_MISSING")
+            else:
+                # 2. RequirementGroup check
+                groups = self.db.query(RequirementGroup).filter(
+                    RequirementGroup.requirement_package_id == pkg.id
+                ).all()
+                if not groups:
+                    blocked_states.append("NO_REQUIREMENT_GROUPS")
+                else:
+                    # 3. Check group stable keys
+                    for g in groups:
+                        if not g.stable_group_key:
+                            blocked_states.append("AMBIGUOUS_GROUP_MAPPING")
+                            break
+                    
+                    # 4. Check stable keys on confirmed ACs and generated unaccepted ACs
+                    all_acs = self.db.query(AcceptanceCriterion).filter(
+                        AcceptanceCriterion.repository_id == repository_id,
+                        AcceptanceCriterion.pull_request_id == pr.id
+                    ).all()
+                    ac_count = len(all_acs)
+                    
+                    if ac_count == 0:
+                        blocked_states.append("AC_MISSING")
+                    
+                    for g in groups:
+                        ac_keys = [ac.stable_ac_key for ac in g.acceptance_criteria if ac.stable_ac_key]
+                        if len(ac_keys) != len(set(ac_keys)):
+                            blocked_states.append("DUPLICATE_AC_WITHIN_GROUP")
+                    
+                    for ac in all_acs:
+                        if ac.status == "ACCEPTED" and not ac.stable_ac_key:
+                            blocked_states.append("AC_WITHOUT_STABLE_ID")
+                        if ac.source == "GENERATED" and ac.status == "NEEDS_REVIEW":
+                            blocked_states.append("GENERATED_AC_NOT_ACCEPTED")
+            
+            # Check legacy fallback if pkg is missing
+            struct_ac_count = 0
+            bio_ac_count = 0
+            work_item_ac_count = 0
+            work_item_ac_items = []
+            
+            if not pkg:
+                struct_ac_count = self.db.query(AcceptanceCriterion).filter(
+                    AcceptanceCriterion.repository_id == repository_id,
+                    AcceptanceCriterion.pull_request_id == pr.id
+                ).count()
+                ac_count += struct_ac_count
 
-            # Source 2: BusinessIntentOverride with acceptance_criteria field
-            bio_ac_count = self.db.query(BusinessIntentOverride).filter(
-                BusinessIntentOverride.pull_request_id == pr.id,
-                BusinessIntentOverride.is_active == True,
-                BusinessIntentOverride.acceptance_criteria.isnot(None)
-            ).count()
-            # Only count BIO AC if no structured rows already captured it (avoid double-counting)
-            if struct_ac_count == 0:
-                ac_count += bio_ac_count
+                bio_ac_count = self.db.query(BusinessIntentOverride).filter(
+                    BusinessIntentOverride.pull_request_id == pr.id,
+                    BusinessIntentOverride.is_active == True,
+                    BusinessIntentOverride.acceptance_criteria.isnot(None)
+                ).count()
+                if struct_ac_count == 0:
+                    ac_count += bio_ac_count
 
-            # Source 3: ExternalWorkItem with acceptance_criteria
-            work_item_ac_items = self.db.query(ExternalWorkItem).join(
-                PullRequestWorkItemLink, PullRequestWorkItemLink.external_work_item_id == ExternalWorkItem.id
-            ).filter(
-                PullRequestWorkItemLink.pull_request_id == pr.id,
-                ExternalWorkItem.acceptance_criteria.isnot(None)
-            ).all()
-            for wi in work_item_ac_items:
-                if isinstance(wi.acceptance_criteria, list):
-                    if len(wi.acceptance_criteria) > 0:
-                        ac_count += len(wi.acceptance_criteria)
-                elif isinstance(wi.acceptance_criteria, str):
-                    if wi.acceptance_criteria.strip():
-                        ac_count += 1
+                work_item_ac_items = self.db.query(ExternalWorkItem).join(
+                    PullRequestWorkItemLink, PullRequestWorkItemLink.external_work_item_id == ExternalWorkItem.id
+                ).filter(
+                    PullRequestWorkItemLink.pull_request_id == pr.id,
+                    ExternalWorkItem.acceptance_criteria.isnot(None)
+                ).all()
+                for wi in work_item_ac_items:
+                    if isinstance(wi.acceptance_criteria, list):
+                        if len(wi.acceptance_criteria) > 0:
+                            ac_count += len(wi.acceptance_criteria)
+                            work_item_ac_count += len(wi.acceptance_criteria)
+                    elif isinstance(wi.acceptance_criteria, str):
+                        if wi.acceptance_criteria.strip():
+                            ac_count += 1
+                            work_item_ac_count += 1
+            
+            blocked_states = list(set(blocked_states))
+            has_ac_record = (ac_count > 0) and (not blocked_states)
 
-            has_ac_record = ac_count > 0
-
-        ac_status = "AVAILABLE" if has_ac_record else "MISSING"
-        ac_exp = f"Acceptance criteria available for requirement coverage ({ac_count} criteria)." if has_ac_record else "Requirement coverage cannot be proven without acceptance criteria."
+        ac_status = "BLOCKED" if blocked_states else ("AVAILABLE" if has_ac_record else "MISSING")
+        ac_exp = f"Acceptance criteria blocked: {', '.join(blocked_states)}" if blocked_states else (f"Acceptance criteria available for requirement coverage ({ac_count} criteria)." if has_ac_record else "Requirement coverage cannot be proven without acceptance criteria.")
         signals["acceptance_criteria"] = {
             "key": "acceptance_criteria",
             "label": "Acceptance Criteria",
             "status": ac_status,
             "evidence_count": ac_count,
-            "linked_to_current_pr": True if has_ac_record else False,
+            "linked_to_current_pr": True if (has_ac_record and not blocked_states) else False,
             "explanation": ac_exp,
-            "estimated_confidence_gain": 10.0 if not has_ac_record else 0.0
+            "estimated_confidence_gain": 10.0 if not has_ac_record else 0.0,
+            "blocked_states": blocked_states
         }
 
         logger.info(f"AC Detection: pr_id={pr.id if pr else None}, repo_id={repository_id}, struct_ac_count={struct_ac_count}, bio_ac_count={bio_ac_count}, work_item_ac_count={len(work_item_ac_items)}, total_ac_count={ac_count}, has_ac_record={has_ac_record}")

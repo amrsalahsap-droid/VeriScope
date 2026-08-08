@@ -3,6 +3,7 @@
 Determines whether each acceptance criterion is covered by existing tests,
 suggested scenarios, or missing.
 """
+import uuid
 from typing import List, Dict, Any, Optional, Set
 from sqlalchemy.orm import Session
 
@@ -127,7 +128,8 @@ class AcceptanceCriteriaCoverageResolver:
             
             if scenario_coverage:
                 # Check if scenario has existing tests
-                existing_test_ids = scenario_coverage.test_mappings.get("test_ids", [])
+                # Filter to only string UUIDs (skip any dict objects from mapper)
+                existing_test_ids = [str(t) for t in (scenario_coverage.existing_tests or []) if isinstance(t, (str, uuid.UUID))]
                 
                 if existing_test_ids:
                     # Check if any test executed on current PR

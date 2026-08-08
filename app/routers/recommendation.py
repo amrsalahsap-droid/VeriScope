@@ -1,9 +1,12 @@
 from uuid import UUID
 from typing import Optional, List
 import os
+import logging
 from fastapi import APIRouter, Depends, status, HTTPException, Query
 from sqlalchemy.orm import Session
 from app.db.session import get_db
+
+logger = logging.getLogger(__name__)
 from app.schemas.recommendation import (
     RecommendationRunCreate,
     RecommendationRunResponse,
@@ -234,6 +237,88 @@ def list_recommendation_runs(
 def create_recommendation_run(generate_in: RecommendationGenerateRequest, db: Session = Depends(get_db)):
     """Generate and persist an immutable recommendation run."""
     service = RecommendationService(db)
+    
+    # Validate generation mode
+    mode = generate_in.mode or "confident"
+    if mode not in ["draft", "confident"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "INVALID_GENERATION_MODE",
+                "message": "Generation mode must be 'draft' or 'confident'",
+                "allowed_modes": ["draft", "confident"]
+            }
+        )
+    
+    # Check readiness — backend enforcement, not UI-only.
+    # evaluate() is called for BOTH modes so draft is also gated when Input 1 is absent.
+    # Any Exception from the readiness service is treated as BLOCKED for confident mode (fail-safe).
+    try:
+        from app.services.input_readiness_v2_service import InputReadinessV2Service
+        _readiness_svc = InputReadinessV2Service(db)
+        _readiness = _readiness_svc.assess(
+            repository_id=generate_in.repository_id,
+            pull_request_id=generate_in.pull_request_id
+        )
+    except Exception as _exc:
+        import logging
+        logging.getLogger("veriscope.api").warning(
+            f"InputReadinessV2 check raised an exception during generation gate: {_exc}"
+        )
+        if mode == "confident":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "CONFIDENT_GENERATION_NOT_ALLOWED",
+                    "reason": "Readiness check could not be completed. Use draft mode.",
+                    "allowed_modes": ["draft"],
+                    "blocking_inputs": [],
+                    "partial_inputs": [],
+                }
+            )
+        _readiness = None  # allow draft to fall through
+
+    if _readiness is not None:
+        if mode == "confident" and not _readiness.can_generate_confident:
+            blocking = _readiness.blocking_inputs or []
+            partial = _readiness.partial_inputs or []
+            primary_reason = _readiness.primary_reason or ""
+
+            if not primary_reason:
+                # inputs is a List[InputReadinessItem] — search by input_id
+                _input5 = next(
+                    (inp for inp in (_readiness.inputs or []) if getattr(inp, 'input_id', None) == "INPUT_5"),
+                    None
+                )
+                if _input5 and _input5.status in ("MISSING", "PARTIAL", "REVIEW_NEEDED", "NEEDS_REVIEW"):
+                    primary_reason = "AC \u2192 Test Mapping is partial and unconfirmed."
+                else:
+                    primary_reason = "Confident generation is not allowed with current readiness state."
+
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "CONFIDENT_GENERATION_NOT_ALLOWED",
+                    "reason": primary_reason,
+                    "allowed_modes": ["draft"] if _readiness.can_generate_draft else [],
+                    "blocking_inputs": blocking,
+                    "partial_inputs": partial,
+                    "generation_status": getattr(_readiness, 'generation_status', None),
+                }
+            )
+
+        if mode == "draft" and not _readiness.can_generate_draft:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "DRAFT_GENERATION_NOT_ALLOWED",
+                    "reason": "Minimum inputs (PR package) required for draft generation are missing.",
+                    "allowed_modes": [],
+                    "blocking_inputs": _readiness.blocking_inputs or [],
+                    "partial_inputs": [],
+                }
+            )
+    
     try:
         run_in = RecommendationRunCreate(
             repository_id=generate_in.repository_id,
@@ -241,7 +326,8 @@ def create_recommendation_run(generate_in: RecommendationGenerateRequest, db: Se
             changed_files=generate_in.changed_files,
             triggered_by=generate_in.triggered_by,
             engine_version=generate_in.engine_version,
-            readiness_acknowledged=generate_in.readiness_acknowledged
+            readiness_acknowledged=generate_in.readiness_acknowledged,
+            generation_mode=mode  # Pass mode to service
         )
         return service.create_recommendation_run(run_in)
     except HTTPException as exc:
@@ -522,6 +608,133 @@ def get_recommendation_run(
                 db.refresh(run)
 
     pr = db.query(PullRequest).filter(PullRequest.id == run.pull_request_id).first()
+    
+    # Part 6: Evaluate staleness and build PR package response
+    from app.services.recommendation_input_freshness_service import RecommendationInputFreshnessService
+    staleness_result = RecommendationInputFreshnessService.evaluate_recommendation_input_freshness(
+        db, run, pr
+    )
+    
+    # Resolve current usable changed-file evidence once for the package response.
+    from app.services.input_readiness_v2_service import InputReadinessV2Service
+    changed_files_evidence = InputReadinessV2Service.get_changed_files_evidence(db, pr) if pr else {
+        "changed_files_count": 0,
+        "changed_file_paths_available": False,
+        "changed_files": [],
+        "changed_files_source": None,
+        "head_commit_sha": None,
+        "evidence_successful": False,
+        "evidence_error": "Pull request is unavailable.",
+    }
+    changed_files_details = changed_files_evidence["changed_files"]
+    
+    # Build PR package readiness from snapshot or current state
+    pr_package_readiness = {
+        "status": "READY",
+        "blockers": [],
+        "warnings": []
+    }
+    
+    if pr:
+        # Fetch changed files database rows to be accurate
+        changed_files_db = db.query(PullRequestChangedFile).filter(
+            PullRequestChangedFile.pull_request_id == pr.id
+        ).order_by(PullRequestChangedFile.file_path.asc()).all()
+        
+        changed_files_count = pr.changed_files_count if pr.changed_files_count is not None else len(changed_files_db)
+
+        if not pr.head_commit_sha:
+            pr_package_readiness["status"] = "BLOCKED"
+            pr_package_readiness["blockers"].append("HEAD_SHA_MISSING")
+        elif changed_files_count <= 0:
+            pr_package_readiness["status"] = "BLOCKED"
+            pr_package_readiness["blockers"].append("CHANGED_FILES_MISSING")
+        elif not changed_files_evidence["changed_file_paths_available"]:
+            pr_package_readiness["status"] = "PARTIAL"
+            pr_package_readiness["warnings"].append("CHANGED_FILE_PATHS_UNAVAILABLE")
+        else:
+            pr_package_readiness["status"] = "READY"
+            if changed_files_evidence["changed_files_source"] == "cached_pr_package":
+                pr_package_readiness["warnings"].append("CHANGED_FILES_FROM_CACHE")
+
+        if pr.evidence_truncated:
+            pr_package_readiness["status"] = "PARTIAL"
+            pr_package_readiness["warnings"].append("LARGE_DIFF_TRUNCATED")
+            
+        # Check for patch missing warnings
+        missing_patch = [f.file_path for f in changed_files_db if not f.patch_summary]
+        if missing_patch:
+            pr_package_readiness["warnings"].append("PATCH_MISSING")
+    
+    # Generation-time readiness cannot override current missing changed-file paths.
+    if (
+        run.pr_package_ready_at_generation is not None
+        and changed_files_evidence["changed_file_paths_available"]
+    ):
+        pr_package_readiness["status"] = "READY" if run.pr_package_ready_at_generation else "BLOCKED"
+
+    # Compute recommendation_audit details
+    from app.models.pull_request import PullRequestSnapshot
+    audit_status = "UNKNOWN"
+    has_snapshot = False
+    has_direct_snapshot_json = False
+    snapshot_head_sha = None
+    is_stale = False
+    stale_reason = None
+    message = None
+
+    if not run:
+        audit_status = "NO_RECOMMENDATION_YET"
+        message = "No recommendation generated yet for this pull request."
+    else:
+        # Check for pr_snapshot_id linked to snapshot
+        snapshot = None
+        if run.pr_snapshot_id:
+            snapshot = db.query(PullRequestSnapshot).filter(
+                PullRequestSnapshot.id == run.pr_snapshot_id
+            ).first()
+
+        if snapshot:
+            has_snapshot = True
+            snapshot_head_sha = snapshot.head_commit_sha
+            
+            if pr and pr.head_commit_sha != snapshot.head_commit_sha:
+                audit_status = "OUTDATED"
+                is_stale = True
+                stale_reason = f"PR head commit SHA changed from {snapshot.head_commit_sha} to {pr.head_commit_sha}."
+                message = f"Generated from {snapshot.head_commit_sha[:7]} (outdated), current PR head is {pr.head_commit_sha[:7]}. Regenerate before signoff."
+            else:
+                audit_status = "AUDITABLE"
+                message = "Recommendation has an auditable PR package snapshot."
+        
+        # Fallback to direct snapshot JSON fields
+        elif run.head_commit_sha_at_generation and run.changed_files_snapshot_json:
+            has_direct_snapshot_json = True
+            snapshot_head_sha = run.head_commit_sha_at_generation
+            
+            if pr and pr.head_commit_sha != run.head_commit_sha_at_generation:
+                audit_status = "OUTDATED"
+                is_stale = True
+                stale_reason = f"PR head commit SHA changed from {run.head_commit_sha_at_generation} to {pr.head_commit_sha}."
+                message = f"Generated from {run.head_commit_sha_at_generation[:7]} (outdated), current PR head is {pr.head_commit_sha[:7]}. Regenerate before signoff."
+            else:
+                audit_status = "AUDITABLE"
+                message = "Recommendation has an auditable PR package snapshot."
+        
+        else:
+            audit_status = "LEGACY_NO_SNAPSHOT"
+            message = "Existing recommendation predates PR package snapshot support. Regenerate for auditability."
+
+    recommendation_audit_obj = {
+        "status": audit_status,
+        "has_snapshot": has_snapshot,
+        "has_direct_snapshot_json": has_direct_snapshot_json,
+        "snapshot_head_sha": snapshot_head_sha,
+        "current_head_sha": pr.head_commit_sha if pr else None,
+        "is_stale": is_stale,
+        "stale_reason": stale_reason,
+        "message": message
+    }
 
     # Generate plain-English explanations
     engine = RecommendationReasoningEngine(db)
@@ -547,6 +760,24 @@ def get_recommendation_run(
         RecommendationExplanation.recommendation_run_id == recommendation_run_id
     ).all()
     explanation_map = {e.test_id: e for e in explanations}
+
+    # Fetch RecommendedTest records to map execution status
+    from app.models.recommendation import RecommendedTest
+    recommended_tests = db.query(RecommendedTest).filter(
+        RecommendedTest.recommendation_run_id == recommendation_run_id
+    ).all()
+    rec_test_map = {rt.test_identifier: rt for rt in recommended_tests}
+
+    # Candidate statuses that mean a test has already been resolved by execution evidence.
+    # These must NOT appear under must_run / should_run in the UI.
+    _EXECUTION_RESOLVED_STATUSES = {
+        "ALREADY_PASSED_CURRENT_PR",
+        "FAILED_CURRENT_PR",
+        "SKIPPED_CURRENT_PR",
+        "STALE_RESULT_RERUN_REQUIRED",
+        "NEEDS_MAPPING_REVIEW",
+        "NOT_RELEVANT",
+    }
 
     # Build test list with priority tiers from priority_score
     tests = run.tests or []
@@ -642,11 +873,52 @@ def get_recommendation_run(
             score_breakdown_dict = {}
             explanation_reason = custom_reason
 
+        rt = rec_test_map.get(t.test_case_id)
+        candidate_status = rt.candidate_status if rt else None
+        active_action = rt.active_action if rt else "RUN_NOW"
+        included_val = rt.included if rt else True
+        mapping_uncertainty_val = rt.mapping_uncertainty if rt else None
+
+        # Execution-aware tier: override score-based tier when execution evidence is conclusive.
+        # ALREADY_PASSED_CURRENT_PR -> must NOT appear under must_run/should_run.
+        # FAILED_CURRENT_PR / SKIPPED_CURRENT_PR -> separate bucket, not must_run.
+        # STALE_RESULT_RERUN_REQUIRED -> flagged separately, treated as must_run for urgency.
+        if candidate_status == "ALREADY_PASSED_CURRENT_PR":
+            execution_aware_tier = "already_verified"
+        elif candidate_status == "FAILED_CURRENT_PR":
+            execution_aware_tier = "failed_current_pr"
+        elif candidate_status == "SKIPPED_CURRENT_PR":
+            execution_aware_tier = "skipped_current_pr"
+        elif candidate_status == "STALE_RESULT_RERUN_REQUIRED":
+            execution_aware_tier = "stale_rerun_required"
+        elif candidate_status == "NEEDS_MAPPING_REVIEW":
+            execution_aware_tier = "mapping_review_needed"
+        elif candidate_status in ("NOT_EXECUTED_FOR_CURRENT_PR", "MUST_RUN", "SHOULD_RUN", "OPTIONAL", None):
+            execution_aware_tier = tier
+        else:
+            execution_aware_tier = tier
+
+        # Use the evidence_path persisted on RecommendedTest when available;
+        # fall back to live computation for runs generated before persistence was added.
+        if rt and rt.evidence_path:
+            evidence_path_list = rt.evidence_path
+        else:
+            from app.services.traceability_graph_service import TraceabilityGraphService
+            evidence_path_list = TraceabilityGraphService.get_evidence_path_for_recommendation(
+                db=db,
+                repository_id=run.repository_id,
+                pull_request_id=run.pull_request_id,
+                test_id=t.test_case_id
+            )
+        
+        would_priority = "MUST_RUN" if (score >= 80 or score >= 0.8) else "SHOULD_RUN" if (score >= 50 or score >= 0.5) else "OPTIONAL"
+
         test_list.append({
             "stable_identity": t.test_case_id,
             "display_name": display_name,
             "suite_name": suite_name,
             "tier": tier,
+            "execution_aware_tier": execution_aware_tier,
             "priority_score": round(score, 3),
             "reason_type": t.reason_type,
             "reason": explanation_reason,
@@ -659,11 +931,28 @@ def get_recommendation_run(
             "testing_types": testing_types_list,
             "signals_trace": signals_trace_list,
             "score_breakdown": score_breakdown_dict,
+            "candidate_status": candidate_status,
+            "active_action": active_action,
+            "included": included_val,
+            "mapping_uncertainty": mapping_uncertainty_val,
+            "evidence_path": evidence_path_list,
+            "would_have_been_priority": would_priority
         })
 
     # Sort: must_run first, then should_run, then fallback; within tier by priority_score desc
     tier_order = {"must_run": 0, "should_run": 1, "fallback": 2}
     test_list.sort(key=lambda x: (tier_order[x["tier"]], -x["priority_score"]))
+
+    # Build execution-aware bucketed lists.
+    # These are the canonical source of truth for UI bucketing — never use raw tier for this.
+    already_verified_tests = [t for t in test_list if t["execution_aware_tier"] == "already_verified"]
+    must_run_tests = [t for t in test_list if t["execution_aware_tier"] == "must_run"]
+    should_run_tests = [t for t in test_list if t["execution_aware_tier"] == "should_run"]
+    failed_current_pr_tests = [t for t in test_list if t["execution_aware_tier"] == "failed_current_pr"]
+    skipped_current_pr_tests = [t for t in test_list if t["execution_aware_tier"] == "skipped_current_pr"]
+    stale_rerun_required_tests = [t for t in test_list if t["execution_aware_tier"] == "stale_rerun_required"]
+    mapping_review_needed_tests = [t for t in test_list if t["execution_aware_tier"] == "mapping_review_needed"]
+    not_executed_tests = [t for t in test_list if t["execution_aware_tier"] == "fallback" and t["candidate_status"] in ("NOT_EXECUTED_FOR_CURRENT_PR", None)]
 
     # Evidence signals
     original_mode = run.recommendation_mode or "NORMAL"
@@ -874,6 +1163,20 @@ def get_recommendation_run(
             "source_branch": pr.source_branch if pr else None,
             "target_branch": pr.target_branch if pr else None,
         } if pr else None,
+        # Part 6: PR Package and recommendation_audit at the root
+        "pr_package": {
+            "status": pr_package_readiness["status"],
+            "head_commit_sha": changed_files_evidence["head_commit_sha"],
+            "changed_files_count": changed_files_evidence["changed_files_count"],
+            "changed_file_paths_available": changed_files_evidence["changed_file_paths_available"],
+            "changed_files": changed_files_details,
+            "changed_files_source": changed_files_evidence["changed_files_source"],
+            "evidence_successful": changed_files_evidence["evidence_successful"],
+            "evidence_error": changed_files_evidence["evidence_error"],
+            "blockers": pr_package_readiness["blockers"],
+            "warnings": pr_package_readiness["warnings"]
+        } if pr else None,
+        "recommendation_audit": recommendation_audit_obj,
         # Generation-time readiness snapshot
         "readiness_snapshot": {
             "readiness_snapshot_available": run.readiness_snapshot_available,
@@ -905,9 +1208,13 @@ def get_recommendation_run(
             "recommendation_mode": mode,
             "evidence_quality": quality,
             "optimization_allowed": run.optimization_allowed,
-            "must_run_count": sum(1 for t in test_list if t["tier"] == "must_run"),
-            "should_run_count": sum(1 for t in test_list if t["tier"] == "should_run"),
-            "fallback_count": sum(1 for t in test_list if t["tier"] == "fallback"),
+            "must_run_count": len(must_run_tests),
+            "should_run_count": len(should_run_tests),
+            "fallback_count": sum(1 for t in test_list if t["execution_aware_tier"] == "fallback"),
+            "already_verified_count": len(already_verified_tests),
+            "failed_current_pr_count": len(failed_current_pr_tests),
+            "stale_rerun_required_count": len(stale_rerun_required_tests),
+            "mapping_review_needed_count": len(mapping_review_needed_tests),
             "estimated_runtime_seconds": run.estimated_runtime_seconds or 0.0,
             "full_suite_runtime_seconds": run.full_suite_runtime_seconds,
             "runtime_confidence": run.runtime_confidence,
@@ -916,8 +1223,18 @@ def get_recommendation_run(
             "types": strategy.get("types", []),
             "summary": strategy.get("summary", ""),
         },
-        # Section 3: Recommended Tests (tiered)
+        # Section 3: Recommended Tests (tiered, full list — use execution_aware_tier for bucketing)
         "recommended_tests": test_list,
+        # Section 3a: Execution-aware bucketed lists (canonical for UI classification)
+        # Already-verified tests must NOT appear under must_run / should_run.
+        "already_verified_tests": already_verified_tests,
+        "must_run_tests": must_run_tests,
+        "should_run_tests": should_run_tests,
+        "failed_current_pr_tests": failed_current_pr_tests,
+        "skipped_current_pr_tests": skipped_current_pr_tests,
+        "stale_rerun_required_tests": stale_rerun_required_tests,
+        "mapping_review_needed_tests": mapping_review_needed_tests,
+        "not_executed_tests": not_executed_tests,
         # Section 4: Why (risk reasoning bullets)
         "why": explanation["executive_summary"],
         # Section 5: Evidence
@@ -994,6 +1311,10 @@ def get_recommendation_run(
         "stale_reason": run.stale_reason,
         "stale_since": run.stale_since.isoformat() + "Z" if run.stale_since else None,
         "stale_input_types": run.stale_input_types,
+        # Generation gate fields
+        "is_draft": getattr(run, 'is_draft', False) or False,
+        "generation_mode": getattr(run, 'generation_mode', None) or "confident",
+        "generation_blocked_reason": getattr(run, 'generation_blocked_reason', None),
     }
 
 
@@ -2405,19 +2726,18 @@ def attach_test_run(
         )
 
 
-@router.get("/{recommendation_run_id}/readiness", response_model=RecommendationReadinessGateResponse)
+@router.get("/{recommendation_run_id}/readiness")
 def get_recommendation_readiness(
     recommendation_run_id: str,
     workspace: Workspace = Depends(get_current_workspace),
     db: Session = Depends(get_db)
 ):
     """
-    Assess readiness for an existing recommendation run.
+    Assess readiness for an existing recommendation run using strict 12-input readiness.
     """
     from app.models.recommendation import RecommendationRun
     from app.models.repository import Repository
-    from app.services.recommendation_readiness_gate import RecommendationReadinessGate
-    from app.schemas.readiness import RecommendationReadinessGateResponse
+    from app.services.input_readiness_v2_service import InputReadinessV2Service
 
     rec_run = db.query(RecommendationRun).filter(
         RecommendationRun.id == recommendation_run_id
@@ -2451,42 +2771,24 @@ def get_recommendation_readiness(
                 db.commit()
                 db.refresh(rec_run)
 
-    # Use generation-time snapshot if available for consistency
-    if rec_run.readiness_level_at_generation:
-        # Return snapshot data instead of live assessment
-        return RecommendationReadinessGateResponse(
-            can_generate=rec_run.can_generate_at_generation or False,
-            readiness_level=rec_run.readiness_level_at_generation,
-            expected_confidence=rec_run.expected_confidence_at_generation,
-            intelligence_completeness_score=rec_run.readiness_score_at_generation or 0,
-            release_confidence_ceiling=rec_run.confidence_ceiling_at_generation,
-            available_inputs=rec_run.available_inputs_at_generation or [],
-            missing_inputs=rec_run.missing_inputs_at_generation or [],
-            blocking_inputs=rec_run.blocking_inputs_at_generation or [],
-            confidence_limiters=rec_run.confidence_limiters_at_generation,
-            evidence_summary=rec_run.evidence_summary_at_generation,
-            confidence_reason=rec_run.confidence_reason_at_generation,
-            recommended_actions=[],
-            next_best_actions=[]
-        )
-
-    # Fallback to live assessment for legacy recommendations
-    gate = RecommendationReadinessGate()
-    result = gate.assess(db, str(rec_run.repository_id), str(rec_run.pull_request_id) if rec_run.pull_request_id else None, recommendation_run_id=str(rec_run.id))
-
-    return RecommendationReadinessGateResponse(
-        can_generate=result.can_generate,
-        readiness_level=result.readiness_level,
-        expected_confidence=result.expected_confidence,
-        intelligence_completeness_score=result.intelligence_completeness_score,
-        release_confidence_ceiling=result.release_confidence_ceiling,
-        available_inputs=result.available_inputs,
-        missing_inputs=result.missing_inputs,
-        next_best_actions=result.next_best_actions,
-        primary_message=result.user_message,
-        secondary_message=result.technical_reason,
-        created_at=result.created_at
+    # Use strict 12-input readiness service
+    v2_service = InputReadinessV2Service(db)
+    strict_readiness = v2_service.assess(
+        repository_id=str(rec_run.repository_id),
+        pull_request_id=str(rec_run.pull_request_id) if rec_run.pull_request_id else None
     )
+
+    # Convert to response format
+    strict_dict = strict_readiness.model_dump() if hasattr(strict_readiness, "model_dump") else (strict_readiness.dict() if hasattr(strict_readiness, "dict") else strict_readiness)
+
+    return {
+        "strict_12_input_readiness": strict_dict,
+        "legacy_repository_readiness": {
+            "readiness_state": "LEGACY",
+            "readiness_reasons": ["Using strict 12-input readiness"],
+            "next_action": "See strict_12_input_readiness for details"
+        }
+    }
 
 
 def _resolve_acceptance_criteria_text(run, pr, db) -> dict:
@@ -2575,6 +2877,121 @@ def _resolve_acceptance_criteria_text(run, pr, db) -> dict:
         "source_hash": "NONE",
         "diagnostics": diagnostics
     }
+
+def _map_classification_to_group(classification: str) -> str:
+    """Map evidence classification to scope group."""
+    mapping = {
+        "VERIFIED_BY_CURRENT_PR_EXECUTION": "EXCLUDED_ALREADY_VERIFIED",
+        "PARTIALLY_COVERED": "RECOMMENDED",
+        "MISSING_AUTOMATED_COVERAGE": "REQUIRED",
+        "FAILED_IN_CURRENT_PR_EXECUTION": "REQUIRED",
+        "SKIPPED_IN_CURRENT_PR_EXECUTION": "REQUIRED",
+        "EXISTING_TEST_NOT_RUN_IN_CURRENT_PR": "REQUIRED",
+        "NOT_MAPPED_TRACEABILITY_RISK": "REQUIRED",
+    }
+    return mapping.get(classification, "UNKNOWN")
+
+def _map_classification_to_execution_status(classification: str) -> str:
+    """Map evidence classification to execution status."""
+    mapping = {
+        "VERIFIED_BY_CURRENT_PR_EXECUTION": "PASSED",
+        "FAILED_IN_CURRENT_PR_EXECUTION": "FAILED",
+        "SKIPPED_IN_CURRENT_PR_EXECUTION": "SKIPPED",
+        "EXISTING_TEST_NOT_RUN_IN_CURRENT_PR": "NOT_RUN",
+        "PARTIALLY_COVERED": "NOT_RUN",
+        "MISSING_AUTOMATED_COVERAGE": "NOT_RUN",
+        "NOT_MAPPED_TRACEABILITY_RISK": "NOT_RUN",
+    }
+    return mapping.get(classification, "UNKNOWN")
+
+def _build_file_impact_map(db: Session, run, pr, parent_reqs):
+    """Build file impact map showing which ACs are affected by each changed file."""
+    from app.models.pull_request import PullRequestChangedFile
+    from app.models.coverage import FileTestLink
+    from app.models.manual_test_requirement_mapping import ManualTestRequirementMapping
+    from app.models.acceptance_criterion import AcceptanceCriterion
+    from app.models.test_result import TestCase
+    from collections import defaultdict
+    
+    # Get changed files for this PR
+    changed_files = db.query(PullRequestChangedFile).filter(
+        PullRequestChangedFile.pull_request_id == pr.id
+    ).all()
+    
+    if not changed_files:
+        return []
+    
+    # Build a map of test_case_id -> AC information
+    # First, get all manual test requirement mappings for this repository
+    manual_mappings = db.query(ManualTestRequirementMapping).filter(
+        ManualTestRequirementMapping.repository_id == run.repository_id,
+        ManualTestRequirementMapping.is_active == True
+    ).all()
+    
+    # Build test_case_id -> AC ID mapping
+    test_to_ac = {}
+    for mapping in manual_mappings:
+        test_to_ac[mapping.external_test_case_id] = mapping.acceptance_criterion_id
+    
+    # Get all ACs for this repository
+    ac_ids = list(set(test_to_ac.values()))
+    ac_by_id = {}
+    if ac_ids:
+        acs = db.query(AcceptanceCriterion).filter(AcceptanceCriterion.id.in_(ac_ids)).all()
+        ac_by_id = {ac.id: ac for ac in acs}
+    
+    # Build a map of requirement_id -> classification for parent_reqs
+    req_to_classification = {}
+    for req in parent_reqs:
+        req_to_classification[req.requirement_id] = req.classification.value if hasattr(req.classification, "value") else str(req.classification)
+    
+    # Build file impact map
+    file_impact_map = []
+    
+    for changed_file in changed_files:
+        # Find FileTestLink records for this file
+        file_links = db.query(FileTestLink).filter(
+            FileTestLink.file_path == changed_file.file_path
+        ).all()
+        
+        if not file_links:
+            continue
+        
+        # Collect affected ACs
+        affected_acs = []
+        seen_ac_ids = set()
+        
+        for link in file_links:
+            test_case_id = link.test_case_id
+            
+            # Check if this test is mapped to an AC
+            if test_case_id in test_to_ac:
+                ac_id = test_to_ac[test_case_id]
+                
+                if ac_id in seen_ac_ids:
+                    continue
+                seen_ac_ids.add(ac_id)
+                
+                ac = ac_by_id.get(ac_id)
+                if ac:
+                    # Get classification from parent_reqs
+                    classification = req_to_classification.get(str(ac_id), "UNKNOWN")
+                    
+                    affected_acs.append({
+                        "acId": f"AC-{ac.source_number}" if ac.source_number else ac.normalized_key,
+                        "title": ac.text,
+                        "group": _map_classification_to_group(classification),
+                        "executionStatus": _map_classification_to_execution_status(classification)
+                    })
+        
+        if affected_acs:
+            file_impact_map.append({
+                "filePath": changed_file.file_path,
+                "changeStatus": changed_file.status,
+                "affectedAcs": affected_acs
+            })
+    
+    return file_impact_map
 
 @router.get("/{recommendation_run_id}/regression-evidence", status_code=status.HTTP_200_OK)
 def get_regression_evidence_classification(
@@ -2792,6 +3209,13 @@ def get_regression_evidence_classification(
         mappings_by_ac_id[ac_id].append(mapping)
 
     def serialize_requirement(req, audit_enabled: bool):
+        # Resolve acceptance_criterion UUID and manual validation channel
+        req_uuid = None
+        try:
+            req_uuid = UUID(req.requirement_id) if isinstance(req.requirement_id, str) else req.requirement_id
+        except ValueError:
+            pass
+
         item = {
             "requirementId": req.requirement_id,
             "readableId": req.readable_id,
@@ -2942,13 +3366,6 @@ def get_regression_evidence_classification(
                 }
             }
 
-        # Resolve acceptance_criterion UUID and manual validation channel
-        req_uuid = None
-        try:
-            req_uuid = UUID(req.requirement_id) if isinstance(req.requirement_id, str) else req.requirement_id
-        except ValueError:
-            pass
-
         ac_mappings = mappings_by_ac_id.get(req_uuid, [])
         mapped_count = len(ac_mappings)
         
@@ -3060,6 +3477,8 @@ def get_regression_evidence_classification(
 
         return item
 
+
+
     buckets = {
         "coveredByPassedPrTests": [serialize_requirement(r, audit) for r in parent_reqs if r.classification == EvidenceClassification.VERIFIED_BY_CURRENT_PR_EXECUTION],
         "partiallySupported": [serialize_requirement(r, audit) for r in parent_reqs if r.classification == EvidenceClassification.PARTIALLY_COVERED],
@@ -3099,6 +3518,81 @@ def get_regression_evidence_classification(
         ]
     }
 
+    # Phase 5.8: Use V2 regression scope as source of truth for release decision
+    # Get V2 regression scope to determine release decision state
+    from app.services.regression_scope_v2_service import RegressionScopeV2Service
+    from app.schemas.regression_scope_v2 import ScopeMode
+    
+    try:
+        v2_scope = RegressionScopeV2Service.generate_scope_v2(
+            db=db,
+            run_id=str(run.id),
+            mode=ScopeMode.TARGETED,
+            include_safe_to_skip=False,
+            include_diagnostics=False,
+            audit=False
+        )
+        
+        # Convert to dictionary representation for easy querying
+        v2_scope_dict = v2_scope.model_dump() if hasattr(v2_scope, 'model_dump') else v2_scope.dict()
+        groups_dict = v2_scope_dict.get("groups", {})
+        
+        # Extract counts from V2 scope for release decision
+        required_count = len(groups_dict.get("REQUIRED", {}).get("items", []))
+        review_needed_count = len(groups_dict.get("REVIEW_NEEDED", {}).get("items", []))
+        already_verified_count = len(groups_dict.get("EXCLUDED_ALREADY_VERIFIED", {}).get("items", []))
+        
+        # Determine release decision state based on V2 scope
+        if required_count > 0:
+            release_decision_state = "BLOCKED"
+            release_decision_reason = f"{required_count} required items need action before release"
+        elif review_needed_count > 0:
+            release_decision_state = "NEEDS_REVIEW"
+            release_decision_reason = f"{review_needed_count} items need review"
+        else:
+            release_decision_state = "READY"
+            release_decision_reason = f"All {already_verified_count} items verified"
+        
+        # Update decision_summary to use V2 scope counts
+        decision_summary.update({
+            "totalItems": sum(len(group.get("items", [])) for group in groups_dict.values()),
+            "requiredCount": required_count,
+            "reviewNeededCount": review_needed_count,
+            "alreadyVerifiedCount": already_verified_count,
+            "recommendedCount": len(groups_dict.get("RECOMMENDED", {}).get("items", [])),
+            "optionalCount": len(groups_dict.get("OPTIONAL", {}).get("items", [])),
+            "safeToSkipCount": len(groups_dict.get("SAFE_TO_SKIP", {}).get("items", [])),
+            "state": release_decision_state,
+            "reason": release_decision_reason,
+            "source": "V2_REGRESSION_SCOPE"
+        })
+        
+        # Update scopeRecommendation to use V2 scope
+        scope_recommendation = {
+            "requiredItems": groups_dict.get("REQUIRED", {}).get("items", []),
+            "reviewItems": groups_dict.get("REVIEW_NEEDED", {}).get("items", []),
+            "recommendedItems": groups_dict.get("RECOMMENDED", {}).get("items", []),
+            "optionalItems": groups_dict.get("OPTIONAL", {}).get("items", []),
+            "excludedAlreadyVerifiedItems": groups_dict.get("EXCLUDED_ALREADY_VERIFIED", {}).get("items", []),
+            "safeToSkipItems": groups_dict.get("SAFE_TO_SKIP", {}).get("items", []),
+            "generationRulesApplied": [
+                "Phase 5: Change Impact Engine v1",
+                "Candidate selection based on impact type (DIRECT, INDIRECT, CROSS_LAYER, SECURITY_SENSITIVE)",
+                "Evidence overlay applied after candidate selection",
+                "Mode-specific selection strategies (targeted, risk_based, full_suite)"
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"[Phase5.8] Failed to get V2 scope for release decision: {e}")
+        # Fallback to legacy logic if V2 fails
+        decision_summary = {
+            "state": "UNKNOWN",
+            "reason": f"V2 scope generation failed: {str(e)}",
+            "source": "LEGACY_FALLBACK"
+        }
+        scope_recommendation = {}
+
     # Add release decision to response
     from app.models.release_decision import ReleaseDecision
     release_decision = db.query(ReleaseDecision).filter(
@@ -3117,11 +3611,16 @@ def get_regression_evidence_classification(
             "updatedAt": release_decision.updated_at.isoformat() + "Z" if release_decision.updated_at else None
         }
 
+    # Build file impact map
+    file_impact_map = _build_file_impact_map(db, run, pr, parent_reqs)
+
     return {
         "decisionSummary": decision_summary,
-        "buckets": buckets,
+        "buckets": buckets,  # Keep legacy buckets for backward compatibility
         "scopeRecommendation": scope_recommendation,
-        "releaseDecision": release_decision_data
+        "releaseDecision": release_decision_data,
+        "fileImpactMap": file_impact_map,
+        "v2ScopeSource": "Phase 5 Change Impact Engine v1"  # Indicate source
     }
 
 
@@ -3352,6 +3851,14 @@ def get_regression_scope_v2(
 
     run = validate_recommendation_run_access(db, recommendation_run_id, user)
 
+    logger.info(
+        "REGRESSION_SCOPE_MODE_RECEIVED",
+        extra={
+            "recommendation_run_id": str(recommendation_run_id),
+            "mode": mode,
+        },
+    )
+
     try:
         # Validate mode
         try:
@@ -3361,23 +3868,39 @@ def get_regression_scope_v2(
                 status="ERROR",
                 scope=None,
                 error_code="INVALID_MODE",
-                message=f"Invalid mode: {mode}. Must be one of: targeted, risk_based, full"
+                message=f"Invalid mode: {mode}. Must be one of: targeted, risk_based, full_suite"
             )
 
         # Generate scope
-        scope = RegressionScopeV2Service.generate_scope_v2(
-            db=db,
-            run_id=str(run.id),
-            mode=scope_mode,
-            include_safe_to_skip=include_safe_to_skip,
-            include_diagnostics=include_diagnostics,
-            audit=audit
-        )
-
-        return RegressionScopeV2Response(
-            status="SUCCESS",
-            scope=scope
-        )
+        try:
+            logger.info(f"[ScopeGen] Starting scope generation for run_id={run.id}, mode={scope_mode}")
+            scope = RegressionScopeV2Service.generate_scope_v2(
+                db=db,
+                run_id=str(run.id),
+                mode=scope_mode,
+                include_safe_to_skip=include_safe_to_skip,
+                include_diagnostics=include_diagnostics,
+                audit=audit
+            )
+            logger.info(f"[ScopeGen] Scope generation completed successfully for run_id={run.id}")
+            
+            response = RegressionScopeV2Response(
+                status="SUCCESS",
+                scope=scope,
+                mode=scope_mode
+            )
+            logger.info(f"[ScopeGen] Response object created with mode={scope_mode}, attempting to serialize")
+            return response
+        except AttributeError as e:
+            logger.error(
+                f"[ScopeGen] AttributeError during scope generation: {e}"
+            )
+            return RegressionScopeV2Response(
+                status="ERROR",
+                scope=None,
+                error_code="ATTRIBUTE_ERROR",
+                message=f"Scope generation failed: {str(e)}"
+            )
     except ValueError as e:
         return RegressionScopeV2Response(
             status="ERROR",
@@ -3386,6 +3909,8 @@ def get_regression_scope_v2(
             message=str(e)
         )
     except Exception as e:
+        import traceback
+        logger.error(f"[ScopeGen] Full traceback:\n{traceback.format_exc()}")
         return RegressionScopeV2Response(
             status="ERROR",
             scope=None,
@@ -5149,3 +5674,183 @@ def get_evidence_report(
         report=report if format == "json" else None,
         markdown_content=markdown_content if format == "markdown" else None
     )
+
+
+@router.post("/{run_id}/report-incident", status_code=status.HTTP_200_OK)
+def report_post_release_incident(
+    run_id: UUID,
+    incident_data: dict,
+    db: Session = Depends(get_db)
+):
+    """
+    Report a post-release incident (regression, rollback, hotfix).
+    Creates PatternMemoryV2 signals for affected areas.
+    """
+    from app.models.recommendation import RecommendationRun
+    from app.models.pattern_memory_v2 import PatternMemoryV2
+    from app.models.acceptance_criterion import AcceptanceCriterion
+    import uuid
+    from datetime import datetime
+    
+    # Load the recommendation run
+    run = db.query(RecommendationRun).filter(
+        RecommendationRun.id == run_id
+    ).first()
+    
+    if not run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Recommendation run not found"
+        )
+    
+    # Validate incident type
+    incident_type = incident_data.get("incident_type")
+    valid_types = ["REGRESSION", "ROLLBACK", "HOTFIX"]
+    if incident_type not in valid_types:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid incident_type. Must be one of: {valid_types}"
+        )
+    
+    description = incident_data.get("description", "")
+    affected_areas = incident_data.get("affected_areas", [])
+    severity = incident_data.get("severity", "MEDIUM")
+    
+    # Map severity to strength
+    severity_to_strength = {
+        "CRITICAL": 0.9,
+        "HIGH": 0.7,
+        "MEDIUM": 0.5,
+        "LOW": 0.3
+    }
+    strength = severity_to_strength.get(severity, 0.5)
+    
+    # Load regression scope if available
+    signals_created = []
+    
+    # Load ACs for the repository
+    acs = db.query(AcceptanceCriterion).filter(
+        AcceptanceCriterion.repository_id == run.repository_id
+    ).all()
+    
+    # For each affected area, find matching ACs and create signals
+    for area in affected_areas:
+        # Try to find AC by ID or fuzzy match on text
+        matched_ac = None
+        for ac in acs:
+            if str(ac.id) == area or area.lower() in ac.text.lower():
+                matched_ac = ac
+                break
+        
+        if matched_ac:
+            # Check if signal already exists
+            existing = db.query(PatternMemoryV2).filter(
+                PatternMemoryV2.pattern_key == matched_ac.normalized_key,
+                PatternMemoryV2.repository_id == run.repository_id
+            ).first()
+            
+            if existing:
+                existing.usage_count += 1
+                existing.strength = min(1.0, existing.strength + 0.1)
+                signals_created.append({
+                    "pattern_key": matched_ac.normalized_key,
+                    "action": "updated",
+                    "signal_type": incident_type
+                })
+            else:
+                signal = PatternMemoryV2(
+                    id=uuid.uuid4(),
+                    repository_id=run.repository_id,
+                    workspace_id=run.workspace_id,
+                    pattern_key=matched_ac.normalized_key,
+                    signal_type=incident_type,
+                    strength=strength,
+                    confidence=0.7,
+                    usage_count=1
+                )
+                db.add(signal)
+                signals_created.append({
+                    "pattern_key": matched_ac.normalized_key,
+                    "action": "created",
+                    "signal_type": incident_type
+                })
+    
+    # Update recommendation run outcome status
+    run.outcome_status = "REGRESSION_REPORTED"
+    db.commit()
+    
+    return {
+        "status": "SUCCESS",
+        "signals_created": signals_created,
+        "incident_type": incident_type,
+        "severity": severity,
+        "affected_areas_count": len(affected_areas)
+    }
+
+
+@router.get("/{run_id}/audit-report")
+def get_release_audit_report(
+    run_id: UUID,
+    db: Session = Depends(get_db)
+):
+    """
+    Get a complete audit record for a recommendation run and its release decision.
+    Returns JSON with all audit fields.
+    """
+    from app.services.release_audit_service import ReleaseAuditService
+    
+    try:
+        audit_record = ReleaseAuditService.generate_release_audit_record(
+            db,
+            str(run_id)
+        )
+        return audit_record
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate audit report: {str(e)}"
+        )
+
+
+@router.get("/{run_id}/audit-report/pdf")
+def get_release_audit_report_pdf(
+    run_id: UUID,
+    db: Session = Depends(get_db)
+):
+    """
+    Get a complete audit record for a recommendation run as PDF.
+    Returns PDF file or JSON with warning if PDF generation fails.
+    """
+    from app.services.release_audit_service import ReleaseAuditService
+    from fastapi.responses import JSONResponse
+    
+    try:
+        audit_record = ReleaseAuditService.generate_release_audit_record(
+            db,
+            str(run_id)
+        )
+        
+        # For now, return JSON with a warning header
+        # PDF generation would require additional libraries
+        return JSONResponse(
+            content={
+                "warning": "PDF generation not yet implemented",
+                "audit_record": audit_record
+            },
+            headers={"X-PDF-Generation-Status": "not-implemented"}
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate audit report: {str(e)}"
+        )

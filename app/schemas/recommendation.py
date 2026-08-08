@@ -21,15 +21,18 @@ class RecommendationRunCreate(BaseModel):
     readiness_snapshot: Optional[Dict[str, Any]] = None
     generated_from_repository_id: Optional[UUID] = None
     generated_from_pull_request_id: Optional[UUID] = None
+    generation_mode: Optional[str] = Field(default="confident", description="'draft' or 'confident'")
 
 # Request model for the generate endpoint
 class RecommendationGenerateRequest(BaseModel):
     repository_id: UUID
     pull_request_id: str = Field(..., min_length=1)
+    pr_id: str = Field(default="", description="Alias for pull_request_id for backward compatibility")
     triggered_by: str = Field(..., min_length=1)
     changed_files: List[str] = Field(default_factory=list)
     engine_version: Optional[str] = "v3.0.0"
     readiness_acknowledged: Optional[bool] = False
+    mode: Optional[str] = Field(default="confident", description="Generation mode: 'draft' or 'confident'")
 
     @model_validator(mode="before")
     @classmethod
@@ -41,9 +44,18 @@ class RecommendationGenerateRequest(BaseModel):
                 data["pr_id"] = pr_val
         return data
 
+    @model_validator(mode="after")
+    def sync_pr_id(self) -> "RecommendationGenerateRequest":
+        """Ensure pr_id is set from pull_request_id after validation."""
+        if not self.pr_id and self.pull_request_id:
+            # Use object.__setattr__ to avoid validation issues
+            object.__setattr__(self, "pr_id", self.pull_request_id)
+        return self
+
 # Optional body payload for pull-request recommendation generation
 class RecommendationGeneratePayload(BaseModel):
     readiness_acknowledged: Optional[bool] = False
+    mode: Optional[str] = Field(default=None, description="Generation mode: 'draft' or 'confident'. Defaults to 'confident'.")
 
 class RecommendationTestResponse(BaseModel):
     id: UUID
@@ -120,6 +132,11 @@ class RecommendationRunResponse(BaseModel):
     requirement_gaps: Optional[List[Dict[str, Any]]] = Field(None, description="Requirement gaps detected")
     completeness_assessment: Optional[Dict[str, Any]] = Field(None, description="Completeness score and dimension breakdown")
 
+    # Generation gate fields
+    is_draft: bool = False
+    generation_mode: Optional[str] = None
+    generation_blocked_reason: Optional[str] = None
+
     # Readiness and acknowledgement fields
     readiness_acknowledged: Optional[bool] = False
     readiness_acknowledged_at: Optional[datetime] = None
@@ -132,6 +149,21 @@ class RecommendationRunResponse(BaseModel):
     stale_since: Optional[datetime] = None
     stale_input_types: Optional[List[str]] = None
 
+    # Input 1 snapshot fields
+    head_commit_sha_at_generation: Optional[str] = None
+    base_commit_sha_at_generation: Optional[str] = None
+    merge_commit_sha_at_generation: Optional[str] = None
+    changed_files_snapshot_json: Optional[List[Dict[str, Any]]] = None
+    pr_package_ready_at_generation: Optional[bool] = None
+    pr_snapshot_id: Optional[UUID] = None
+
+    # Input 2 snapshot fields
+    requirement_package_id_at_generation: Optional[UUID] = None
+    requirement_package_snapshot_json: Optional[Dict[str, Any]] = None
+    requirement_groups_snapshot_json: Optional[List[Dict[str, Any]]] = None
+    acceptance_criteria_snapshot_json: Optional[List[Dict[str, Any]]] = None
+    stable_ac_keys_snapshot_json: Optional[List[str]] = None
+    requirement_package_ready_at_generation: Optional[bool] = None
 
     tests: List[RecommendationTestResponse] = []
     suggested_scenarios: List[SuggestedTestScenarioResponse] = []
@@ -224,6 +256,11 @@ class TestOutcomeUpdate(BaseModel):
     recommendation_action: Optional[str] = Field(None, description="RUN_EXISTING_TEST, SKIP, OPTIONAL_MONITOR")
     execution_status: Optional[str] = Field(None, description="NOT_RUN, PASSED, FAILED, SKIPPED, UNKNOWN")
     engineer_decision: Optional[str] = Field(None, description="KEPT, REMOVED, NOT_DECIDED")
+    actual_test_result_id: Optional[UUID] = None
+    actual_test_run_id: Optional[UUID] = None
+    duration_seconds: Optional[float] = None
+    failure_message: Optional[str] = None
+
 
 
 class LearnedPattern(BaseModel):
@@ -416,6 +453,11 @@ class DependencyExpansionBundle(BaseModel):
     limit_exceeded: bool
     dependency_state_hash: Optional[str] = None
     reasons: List[str]
+    original_changed_files: List[str] = []
+    expanded_dependent_files: List[str] = []
+    traversal_edges: List[List[str]] = []
+    depth_per_file: Dict[str, int] = {}
+    expansion_limited: bool = False
 
     class Config:
         from_attributes = True
@@ -560,9 +602,27 @@ class ChangedFileSnapshot(BaseModel):
 
 class TestInventorySnapshotItem(BaseModel):
     stable_identity: str
+    canonical_identity_hash: Optional[str] = None
+    dedupe_key: Optional[str] = None
     suite_name: str
     test_name: str
+    raw_test_name: Optional[str] = None
+    normalized_test_name: Optional[str] = None
     framework_name: Optional[str] = None
+    framework_version: Optional[str] = None
+    test_type: Optional[str] = None
+    automation_status: Optional[str] = None
+    source: Optional[str] = None
+    source_metadata_json: Optional[Dict[str, Any]] = None
+    file_path: Optional[str] = None
+    module_or_area: Optional[str] = None
+    owner: Optional[str] = None
+    tags: Optional[List[str]] = None
+    is_active: Optional[bool] = True
+    last_seen_at: Optional[str] = None
+    last_seen_commit_sha: Optional[str] = None
+    inventory_snapshot_sha: Optional[str] = None
+    confidence: Optional[float] = None
 
     class Config:
         from_attributes = True
@@ -652,7 +712,20 @@ class RecommendationInputSnapshotResponse(BaseModel):
     behavior_confidence_summary: Dict[str, int] = {}
     journey_summary: Dict[str, Any] = {}
     business_intent_override: Optional[Dict[str, Any]] = None
+    requirement_package: Optional[Dict[str, Any]] = None
+    requirement_groups: List[Dict[str, Any]] = []
     acceptance_criteria: List[Dict[str, Any]] = []
+    stable_ac_keys: List[str] = []
+    business_behavior_mappings: List[Dict[str, Any]] = []
+    behavior_scenario_coverages: List[Dict[str, Any]] = []
+    changed_file_behavior_mappings: List[Dict[str, Any]] = []
+    changed_file_paths_available: bool = False
+    changed_files_source: Optional[str] = None
+    behavior_map_source_commit_sha: Optional[str] = None
+    behavior_map_generated_at: Optional[str] = None
+    behavior_context_status: Optional[str] = None
+    unmapped_product_files: List[str] = []
+    unmapped_requirement_groups: List[str] = []
     generated_at: datetime
     input_snapshot_hash: str
 

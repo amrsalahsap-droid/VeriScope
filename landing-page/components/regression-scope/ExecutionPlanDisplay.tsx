@@ -5,23 +5,40 @@ import { RegressionScopeExecutionPlan } from "../../types/regression-scope-v2";
 export type ExecutionPlanDisplayProps = {
   executionPlan: RegressionScopeExecutionPlan;
   compact?: boolean;
+  verifiedCount?: number;
 };
 
 export const ExecutionPlanDisplay: React.FC<ExecutionPlanDisplayProps> = ({
   executionPlan,
   compact = false,
+  verifiedCount,
 }) => {
   const {
     required_count,
     recommended_count,
     optional_count,
     safe_to_skip_count,
+    review_needed_count,
+    deferred_coverage_debt_count,
     total_executable_count,
     estimated_execution_reduction,
     confidence_level,
     plan_summary,
     advisory_notice,
   } = executionPlan;
+
+  // Extract confidence label from plan_summary (format: "... - {label}")
+  const confidenceLabel = plan_summary.includes(" - ") 
+    ? plan_summary.split(" - ").pop() 
+    : null;
+
+  // Get confidence color based on score
+  const getConfidenceColor = (score: number) => {
+    if (score >= 90) return "text-emerald-400";
+    if (score >= 75) return "text-blue-400";
+    if (score >= 50) return "text-amber-400";
+    return "text-red-400";
+  };
 
   const MetricCard = ({
     label,
@@ -54,7 +71,10 @@ export const ExecutionPlanDisplay: React.FC<ExecutionPlanDisplayProps> = ({
           <div className="shrink-0 flex items-center gap-3">
             <div className="text-right">
               <span className="text-[10px] text-zinc-500 block uppercase tracking-wider">Confidence</span>
-              <span className="text-xs font-bold text-emerald-400">{(confidence_level ?? 0).toFixed(0)}%</span>
+              <span className={`text-xs font-bold ${getConfidenceColor(confidence_level ?? 0)}`}>{(confidence_level ?? 0).toFixed(0)}%</span>
+              {confidenceLabel && (
+                <span className="text-[9px] text-zinc-500 block leading-tight mt-0.5">{confidenceLabel}</span>
+              )}
             </div>
             <div className="text-right border-l border-zinc-800/60 pl-3">
               <span className="text-[10px] text-zinc-500 block uppercase tracking-wider">Time Saved</span>
@@ -73,6 +93,33 @@ export const ExecutionPlanDisplay: React.FC<ExecutionPlanDisplayProps> = ({
           bgClass="bg-rose-950/10"
           borderClass="border-rose-900/30"
         />
+        {verifiedCount !== undefined && verifiedCount > 0 && (
+          <MetricCard
+            label="Already Verified"
+            value={verifiedCount}
+            colorClass="text-emerald-400"
+            bgClass="bg-emerald-950/10"
+            borderClass="border-emerald-900/30"
+          />
+        )}
+        {review_needed_count !== undefined && review_needed_count > 0 && (
+          <MetricCard
+            label="Review Needed"
+            value={review_needed_count}
+            colorClass="text-purple-400"
+            bgClass="bg-purple-950/10"
+            borderClass="border-purple-900/30"
+          />
+        )}
+        {deferred_coverage_debt_count !== undefined && deferred_coverage_debt_count > 0 && (
+          <MetricCard
+            label="Deferred Debt"
+            value={deferred_coverage_debt_count}
+            colorClass="text-orange-400"
+            bgClass="bg-orange-950/10"
+            borderClass="border-orange-900/30"
+          />
+        )}
         <MetricCard
           label="Recommended"
           value={recommended_count}

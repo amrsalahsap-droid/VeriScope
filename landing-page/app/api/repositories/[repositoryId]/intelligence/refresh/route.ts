@@ -16,7 +16,7 @@ export async function POST(
 
   try {
     const body = await request.json().catch(() => ({}));
-    const { include_architecture = true, include_behaviors = true, include_journeys = true } = body;
+    const { include_architecture = true, include_behaviors = true, include_journeys = true, pull_request_id = null, head_commit_sha = null } = body;
 
     const res = await fetch(`${BACKEND}/intelligence/repositories/${repositoryId}/refresh`, {
       method: "POST",
@@ -28,6 +28,8 @@ export async function POST(
         include_architecture,
         include_behaviors,
         include_journeys,
+        pull_request_id,
+        head_commit_sha,
       }),
     });
 
@@ -47,10 +49,23 @@ export async function POST(
 
     return NextResponse.json({
       success: true,
+      status: responseBody?.status || "SUCCESS",
+      run_id: responseBody?.run_id || null,
+      score: responseBody?.score ?? null,
+      max_score: responseBody?.max_score ?? null,
       architecture_graph_status: responseBody?.architecture_graph_status || "PROCESSING",
       behaviors_discovered: responseBody?.behaviors_discovered || 0,
       journeys_discovered: responseBody?.journeys_discovered || 0,
+      specific_behaviors_created: responseBody?.specific_behaviors_created || 0,
+      business_behavior_mappings_created: responseBody?.business_behavior_mappings_created || 0,
+      completed_steps: responseBody?.completed_steps || [],
+      failed_steps: responseBody?.failed_steps || [],
+      partial_errors: responseBody?.partial_errors || [],
+      readiness_reasons: responseBody?.readiness_reasons || [],
       message: responseBody?.message || "Repository intelligence refresh initiated.",
+      total_duration_ms: responseBody?.total_duration_ms ?? null,
+      step_durations_ms: responseBody?.step_durations_ms ?? {},
+      slowest_step: responseBody?.slowest_step ?? null,
     });
   } catch (err: any) {
     return NextResponse.json(

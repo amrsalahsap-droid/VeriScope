@@ -60,6 +60,7 @@ from app.models.test_coverage_link import TestCoverageLink
 from app.models.domain_map import DomainMap
 from app.models.risk_assessment import RiskAssessment
 from app.models.pattern_memory import PatternMemory
+from app.models.pattern_memory_v2 import PatternMemoryV2
 from app.models.behavior import Behavior
 from app.models.behavior_evidence import BehaviorEvidence
 from app.models.behavior_scenario import BehaviorScenario
@@ -74,13 +75,18 @@ from app.models.journey_relationship import JourneyRelationship
 from app.models.behavior_impact import BehaviorImpactRun, BehaviorImpactItem
 from app.models.behavior_scenario_coverage import BehaviorScenarioCoverage
 from app.models.acceptance_criterion import AcceptanceCriterion
+from app.models.requirement_package import RequirementPackage
+from app.models.requirement_group import RequirementGroup
+from app.models.testable_scenario import TestableScenario
 from app.models.business_behavior_mapping import BusinessBehaviorMapping
+from app.models.business_intent import BusinessIntentOverride, AcceptanceCriteriaExtraction
 from app.models.expected_behavior_scenario import ExpectedBehaviorScenario
 from app.models.architecture_node import (
     ArchitectureNode,
     ArchitectureNodeType,
     ArchitectureLayer,
 )
+from app.models.source_segment import SourceSegment
 from app.models.architecture_edge import (
     ArchitectureEdge,
     ArchitectureEdgeType,
@@ -93,9 +99,11 @@ from app.models.release_decision import ReleaseDecision
 from app.models.release_decision_history import ReleaseDecisionHistory
 from app.models.manual_test_execution import ManualTestExecution
 from app.models.manual_test_requirement_mapping import ManualTestRequirementMapping
+from app.models.traceability_edge import TraceabilityEdge
 from app.models.pipeline_run import PipelineRun, PipelineRunStatus, QualityGateStatus, TriggerSource
 from app.models.pipeline_execution_job import PipelineExecutionJob, PipelineJobStatus
 from app.models.ci_token import RepositoryCIToken
+from app.models.readiness import RecommendationReadinessAssessment
 from app.models.ci_token_audit import CITokenAuditEvent, AuditEventType, ActorType
 from app.models.governance_role_assignment import GovernanceRoleAssignment, GovernanceRole, ScopeType
 from app.models.governance_notification import GovernanceNotification, NotificationType, NotificationSeverity, NotificationStatus
@@ -106,6 +114,13 @@ from app.models.ci_cd_policy_exception import CICDPolicyException
 from app.models.ci_cd_governance_review_snapshot import CICDGovernanceReviewSnapshot
 from app.models.governance_access_review import GovernanceAccessReview
 from app.models.governance_access_review_item import GovernanceAccessReviewItem
+from app.models.outcome_event import OutcomeEvent
+from app.models.outcome_label import OutcomeLabel
+from app.models.recommendation_outcome_summary import RecommendationOutcomeSummary
+from app.models.repository_intelligence_run import RepositoryIntelligenceRun
+from app.models.mapping_candidate import MappingCandidate
+from app.models.ac_mapping_decision import ACMappingDecision
+from app.models.test_import_report import TestImportQualityReport
 
 
 
@@ -182,6 +197,9 @@ __all__ = [
     "BehaviorImpactItem",
     "BehaviorScenarioCoverage",
     "AcceptanceCriterion",
+    "RequirementPackage",
+    "RequirementGroup",
+    "TestableScenario",
     "BusinessBehaviorMapping",
     "ExpectedBehaviorScenario",
     "ArchitectureNode",
@@ -227,4 +245,15 @@ __all__ = [
     "CICDGovernanceReviewSnapshot",
     "GovernanceAccessReview",
     "GovernanceAccessReviewItem",
+    "OutcomeEvent",
+    "OutcomeLabel",
+    "RecommendationOutcomeSummary",
+    "RepositoryIntelligenceRun",
+    "BusinessIntentOverride",
+    "AcceptanceCriteriaExtraction",
+    "RecommendationReadinessAssessment",
+    "SourceSegment",
+    "MappingCandidate",
+    "ACMappingDecision",
 ]
+

@@ -67,6 +67,8 @@ class ACTraceabilityRow:
     residual_risk_band: Optional[str] = None
     risk_adjustment_reason: Optional[str] = None
     risk_adjustment_delta: Optional[int] = None
+    # Phase 6: Database AC ID for evidence overlay cross-reference
+    database_ac_id: Optional[str] = None
 
 
 @dataclass
@@ -120,7 +122,8 @@ class RecommendationViewModelBuilder:
         recommendation_run_id: str = None,
         repository_id: str = None,
         db_session: Any = None,
-        manual_evidence_nodes: Optional[List[Dict[str, Any]]] = None
+        manual_evidence_nodes: Optional[List[Dict[str, Any]]] = None,
+        change_impact_model: Optional[Any] = None
     ) -> RecommendationEvidenceViewModel:
         """Build the final view model from classified evidence.
 
@@ -137,12 +140,15 @@ class RecommendationViewModelBuilder:
             repository_id: Optional repository ID
             db_session: Optional database session
             manual_evidence_nodes: Optional manual evidence nodes
+            change_impact_model: Optional ChangeImpactModel for unified classification
 
         Returns:
             RecommendationEvidenceViewModel
         """
         self.view_model = RecommendationEvidenceViewModel()
         self.view_model.manual_evidence_nodes = manual_evidence_nodes or []
+        self.db_session = db_session
+        self.repository_id = repository_id
 
         # Build counts
         self._build_counts(requirements, executions)
@@ -177,7 +183,7 @@ class RecommendationViewModelBuilder:
                     ac_counter += 1
 
         # Build AC traceability
-        self._build_ac_traceability(requirements, executions, tests, manual_evidence_nodes=manual_evidence_nodes)
+        self._build_ac_traceability(requirements, executions, tests, manual_evidence_nodes=manual_evidence_nodes, change_impact_model=change_impact_model)
 
         # Build graph quality metrics
         self._build_graph_quality(requirements, match_table, missing_tests, extraction_audit)
@@ -440,10 +446,31 @@ class RecommendationViewModelBuilder:
         requirements: List[RequirementNode],
         executions: List[ExecutionNode],
         tests: List[TestNode],
-        manual_evidence_nodes: Optional[List[Dict[str, Any]]] = None
+        manual_evidence_nodes: Optional[List[Dict[str, Any]]] = None,
+        change_impact_model: Optional[Any] = None
     ):
-        """Build AC traceability rows - only for parent requirements, not child rules."""
+        """Build AC traceability rows - only for parent requirements, not child rules.
+        
+        Args:
+            requirements: List of requirement nodes
+            executions: List of execution nodes
+            tests: List of test nodes
+            manual_evidence_nodes: Optional manual evidence nodes
+            change_impact_model: Optional ChangeImpactModel for unified classification
+        """
         test_map = {t.test_id: t for t in tests}
+        
+        # Build AC ID to impact matrix mapping if change impact model is provided
+        ac_impact_map = {}
+        if change_impact_model:
+            for ac_matrix in change_impact_model.ac_impact_matrix:
+                ac_impact_map[ac_matrix.ac_id] = ac_matrix
+            
+            # Build AC ID to release action scope mapping
+            ac_scope_map = {}
+            for scope_item in change_impact_model.release_action_scope:
+                if scope_item.source_ac_id:
+                    ac_scope_map[scope_item.source_ac_id] = scope_item
 
         for req in requirements:
             # Only include parent requirements in traceability, not child rules
@@ -454,8 +481,21 @@ class RecommendationViewModelBuilder:
             if req.classification == EvidenceClassification.EXCLUDED_FRAGMENT_OR_TEST_DATA:
                 continue
 
-            # Determine status
-            status = self._map_classification_to_status(req.classification)
+            # Determine status - use change impact model if available
+            req_id_str = str(req.requirement_id)
+            if change_impact_model and req_id_str in ac_scope_map:
+                # Use unified classification from change impact engine
+                scope_item = ac_scope_map[req_id_str]
+                status = self._map_final_bucket_to_status(scope_item.final_bucket)
+                priority = self._map_final_bucket_to_priority(scope_item.final_bucket)
+                impact_type = scope_item.impact_type.value if scope_item.impact_type else "UNKNOWN"
+                impact_reason = scope_item.impact_reason
+            else:
+                # Fallback to legacy classification
+                status = self._map_classification_to_status(req.classification)
+                priority = "Must" if (req.risk_level and req.risk_level.lower() == "high") else "Recommended"
+                impact_type = "UNKNOWN"
+                impact_reason = req.classification_reason or ""
 
             # Determine linked existing tests
             linked_existing_tests = []
@@ -472,9 +512,6 @@ class RecommendationViewModelBuilder:
                     if mt.requirement_id == req.requirement_id:
                         linked_missing_test = mt.suggested_test_objective
                         break
-
-            # Determine priority
-            priority = "Must" if (req.risk_level and req.risk_level.lower() == "high") else "Recommended"
 
             # Determine notes - include classification reason and any attached notes
             notes_parts = []
@@ -578,10 +615,57 @@ class RecommendationViewModelBuilder:
                 notes=notes,
                 manual_support_status=manual_support_status,
                 manual_validation=manual_validation,
-                source_ac_number=getattr(req, 'source_number', None)
+                source_ac_number=getattr(req, 'source_number', None),
+                # Phase 5: Add impact type and reason from change impact model
+                generated_risk_band=impact_type if change_impact_model and req_id_str in ac_scope_map else None,
+                risk_adjustment_reason=impact_reason if change_impact_model and req_id_str in ac_scope_map else None,
+                # Phase 6: Add database AC ID for evidence overlay cross-reference
+                database_ac_id=(
+                    getattr(req, 'database_ac_id', None) or 
+                    (self.db_session and self.repository_id and (
+                        lambda: (
+                            lambda resolved: resolved.database_ac_id if resolved and resolved.confidence >= 0.5 else None
+                        )(
+                            (lambda: __import__('app.services.ac_identity_resolver', fromlist=['resolve_ac_identity']).resolve_ac_identity(
+                                req, 
+                                self.db_session.query(__import__('app.models.acceptance_criterion', fromlist=['AcceptanceCriterion']).AcceptanceCriterion).filter(
+                                    __import__('app.models.acceptance_criterion', fromlist=['AcceptanceCriterion']).AcceptanceCriterion.repository_id == self.repository_id
+                                ).all()
+                            ))()
+                        )
+                    )())
+                )
             )
 
             self.view_model.ac_traceability.append(row)
+
+    def _map_final_bucket_to_status(self, final_bucket) -> str:
+        """Map FinalBucket to display status for traceability."""
+        from app.schemas.change_impact import FinalBucket
+        mapping = {
+            FinalBucket.REQUIRED: "Required",
+            FinalBucket.REVIEW_NEEDED: "Review Needed",
+            FinalBucket.ALREADY_VERIFIED: "Already Verified",
+            FinalBucket.RECOMMENDED: "Mapping Recommendation",
+            FinalBucket.OPTIONAL: "Optional",
+            FinalBucket.SAFE_TO_SKIP: "Safe to Skip",
+            FinalBucket.DEFERRED_COVERAGE_DEBT: "Deferred"
+        }
+        return mapping.get(final_bucket, "Unknown")
+
+    def _map_final_bucket_to_priority(self, final_bucket) -> str:
+        """Map FinalBucket to priority display."""
+        from app.schemas.change_impact import FinalBucket
+        mapping = {
+            FinalBucket.REQUIRED: "Must",
+            FinalBucket.REVIEW_NEEDED: "Must",
+            FinalBucket.ALREADY_VERIFIED: "Verified",
+            FinalBucket.RECOMMENDED: "Recommended",
+            FinalBucket.OPTIONAL: "Optional",
+            FinalBucket.SAFE_TO_SKIP: "Skip",
+            FinalBucket.DEFERRED_COVERAGE_DEBT: "Deferred"
+        }
+        return mapping.get(final_bucket, "Recommended")
 
     def _map_classification_to_status(self, classification: EvidenceClassification) -> str:
         """Map classification to display status."""
@@ -590,11 +674,11 @@ class RecommendationViewModelBuilder:
             EvidenceClassification.FAILED_IN_CURRENT_PR_EXECUTION: "Failed",
             EvidenceClassification.SKIPPED_IN_CURRENT_PR_EXECUTION: "Skipped",
             EvidenceClassification.EXISTING_TEST_NOT_RUN_IN_CURRENT_PR: "Not Run",
-            EvidenceClassification.MISSING_AUTOMATED_COVERAGE: "Missing",
-            EvidenceClassification.PARTIALLY_COVERED: "Partially covered",
+            EvidenceClassification.MISSING_AUTOMATED_COVERAGE: "Evidence Gap",
+            EvidenceClassification.PARTIALLY_COVERED: "Coverage Recommendation",
             EvidenceClassification.COVERAGE_GAP_ONLY: "Coverage Gap",
             EvidenceClassification.OPTIONAL_IMPROVEMENT: "Optional",
-            EvidenceClassification.NOT_MAPPED_TRACEABILITY_RISK: "Not mapped",
+            EvidenceClassification.NOT_MAPPED_TRACEABILITY_RISK: "Evidence Gap",
             EvidenceClassification.EXCLUDED_FRAGMENT_OR_TEST_DATA: "Excluded",
         }
         return mapping.get(classification, "Unknown")

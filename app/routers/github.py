@@ -806,6 +806,7 @@ async def upload_test_history(
     branch: Optional[str] = Form(None),
     run_name: Optional[str] = Form(None),
     source: str = Form("MANUAL_UPLOAD"),
+    import_mode: Optional[str] = Form("BOTH"),
     pull_request_id: Optional[UUID] = Form(None),
     head_sha: Optional[str] = Form(None),
     source_context: Optional[str] = Form(None),
@@ -867,7 +868,9 @@ async def upload_test_history(
             ingestion_reason="MANUAL_UPLOAD",
             request_origin=source,
             branch=branch,
-            source_context=source_context
+            run_name=run_name,
+            source_context=source_context,
+            import_mode=import_mode or "BOTH"
         )
     except OversizedXMLException as e:
         raise HTTPException(
@@ -880,6 +883,7 @@ async def upload_test_history(
             detail=f"Invalid JUnit XML: {str(e)}"
         )
     except Exception as e:
+        logger.exception(f"JUnit ingestion failed for repository {repository_id}: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Ingestion failed: {str(e)}"
@@ -889,36 +893,51 @@ async def upload_test_history(
     readiness_service = RepositoryReadinessService(db)
     readiness = readiness_service.calculate_readiness(repository_id, workspace.id)
     
-    from app.services.recommendation_readiness_service import RecommendationReadinessService
-    rec_readiness_svc = RecommendationReadinessService(db)
-    latest_assessment = rec_readiness_svc.assess_readiness(
-        repository_id=repository_id,
-        pull_request_id=pull_request_id
+    from app.services.input_readiness_v2_service import InputReadinessV2Service
+    v2_service = InputReadinessV2Service(db)
+    strict_12_readiness = v2_service.assess(
+        repository_id=str(repository_id),
+        pull_request_id=str(pull_request_id) if pull_request_id else None
     )
-    readiness_summary = {
-        "repository_id": str(latest_assessment.repository_id),
-        "pull_request_id": str(latest_assessment.pull_request_id) if latest_assessment.pull_request_id else None,
-        "readiness_level": latest_assessment.readiness_level,
-        "expected_confidence": latest_assessment.expected_confidence,
-        "readiness_score": latest_assessment.readiness_score,
-        "can_generate": latest_assessment.can_generate,
-        "can_generate_reason": latest_assessment.can_generate_reason,
-        "signal_count": len(latest_assessment.available_signals),
-        "total_signals": 15,
-        "intelligence_completeness_score": latest_assessment.intelligence_completeness_score,
-        "release_confidence_ceiling": latest_assessment.release_confidence_ceiling,
-        "available_inputs": latest_assessment.available_inputs,
-        "missing_inputs": latest_assessment.missing_inputs,
-        "recommended_inputs": latest_assessment.recommended_inputs,
-        "blocking_inputs": latest_assessment.blocking_inputs,
-        "next_best_actions": latest_assessment.next_best_actions,
-        "primary_message": latest_assessment.primary_message,
-        "secondary_message": latest_assessment.secondary_message,
-        "confidence_reason": latest_assessment.confidence_reason,
-        "confidence_ceiling": latest_assessment.confidence_ceiling,
-        "confidence_blockers": latest_assessment.confidence_blockers,
-        "confidence_limiters": latest_assessment.confidence_limiters
+    strict_12_dict = strict_12_readiness.model_dump() if hasattr(strict_12_readiness, "model_dump") else (strict_12_readiness.dict() if hasattr(strict_12_readiness, "dict") else strict_12_readiness)
+    
+    legacy_repo_readiness = {
+        "readiness_state": readiness.readiness_state,
+        "readiness_reasons": readiness.readiness_reasons,
+        "next_action": readiness.next_action
     }
+    
+    readiness_summary = {
+        "repository_id": str(repository_id),
+        "pull_request_id": str(pull_request_id) if pull_request_id else None,
+        "generation_status": strict_12_dict.get("generation_status"),
+        "can_generate_draft": strict_12_dict.get("can_generate_draft"),
+        "can_generate_confident": strict_12_dict.get("can_generate_confident"),
+        "confidence_score": strict_12_dict.get("confidence_score"),
+        "confidence_level": strict_12_dict.get("confidence_level"),
+        "confidence_ceiling": strict_12_dict.get("confidence_ceiling"),
+        "primary_message": strict_12_dict.get("primary_message"),
+        "primary_reason": strict_12_dict.get("primary_reason"),
+        "blocking_inputs": strict_12_dict.get("blocking_inputs"),
+        "partial_inputs": strict_12_dict.get("partial_inputs"),
+        "review_needed_inputs": strict_12_dict.get("review_needed_inputs"),
+        "missing_confidence_boosters": strict_12_dict.get("missing_confidence_boosters"),
+        "next_best_actions": strict_12_dict.get("next_best_actions"),
+        "warnings": strict_12_dict.get("warnings"),
+        "blockers": strict_12_dict.get("blockers")
+    }
+
+    if import_mode == "INVENTORY_ONLY" or test_run is None:
+        return {
+            "import_mode": "INVENTORY_ONLY",
+            "test_run_id": None,
+            "status": "INVENTORY_UPDATED",
+            "message": "Test case inventory updated successfully",
+            "duplicate_coalesced": duplicate_coalesced,
+            "legacy_repository_readiness": legacy_repo_readiness,
+            "strict_12_input_readiness": strict_12_dict,
+            "readiness_summary": readiness_summary
+        }
 
     return {
         "test_run_id": str(test_run.id),
@@ -931,10 +950,12 @@ async def upload_test_history(
         "normalization_schema_version": test_run.normalization_schema_version,
         "evidence_health_status": test_run.evidence_health_status,
         "duplicate_coalesced": duplicate_coalesced,
+        "legacy_repository_readiness": legacy_repo_readiness,
+        "strict_12_input_readiness": strict_12_dict,
         "repository_readiness": {
-            "readiness_state": readiness.readiness_state,
-            "readiness_reasons": readiness.readiness_reasons,
-            "next_action": readiness.next_action
+            "readiness_state": strict_12_dict.get("generation_status"),
+            "readiness_reasons": [b.get("message") for b in strict_12_dict.get("blockers", [])] + [w.get("message") for w in strict_12_dict.get("warnings", [])],
+            "next_action": strict_12_dict.get("next_best_actions")[0].get("label") if strict_12_dict.get("next_best_actions") else "None"
         },
         "readiness_summary": readiness_summary
     }
@@ -1239,6 +1260,7 @@ async def upload_test_history(
     branch: Optional[str] = Form(None),
     run_name: Optional[str] = Form(None),
     source: str = Form("MANUAL_UPLOAD"),
+    import_mode: Optional[str] = Form("BOTH"),
     pull_request_id: Optional[UUID] = Form(None),
     head_sha: Optional[str] = Form(None),
     source_context: Optional[str] = Form(None),
@@ -1306,7 +1328,8 @@ async def upload_test_history(
             ingestion_reason="ORIGINAL_UPLOAD",
             request_origin=source,
             branch=branch,
-            source_context=source_context
+            source_context=source_context,
+            import_mode=import_mode or "BOTH"
         )
     except OversizedXMLException as e:
         raise HTTPException(
@@ -1319,6 +1342,7 @@ async def upload_test_history(
             detail=str(e)
         )
     except Exception as e:
+        logger.exception(f"JUnit ingestion failed for repository {repository_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Ingestion pipeline failure: {str(e)}"
@@ -1359,6 +1383,17 @@ async def upload_test_history(
         "confidence_limiters": latest_assessment.confidence_limiters
     }
     
+    # For INVENTORY_ONLY mode, test_run is None; return inventory update status
+    if import_mode == "INVENTORY_ONLY" or test_run is None:
+        return {
+            "import_mode": "INVENTORY_ONLY",
+            "test_run_id": None,
+            "status": "INVENTORY_UPDATED",
+            "message": "Test case inventory updated successfully",
+            "duplicate_coalesced": duplicate_coalesced,
+            "readiness_summary": readiness_summary
+        }
+
     return {
         "test_run_id": str(test_run.id),
         "tests_total": test_run.total_tests,
@@ -1454,7 +1489,7 @@ def get_pull_requests(
         # Check if there's a recommendation run for this PR
         recommendation_run = (
             db.query(RecommendationRun)
-            .filter(RecommendationRun.pull_request_id == str(pr.id))
+            .filter(RecommendationRun.pull_request_id == pr.id)
             .order_by(RecommendationRun.created_at.desc())
             .first()
         )
@@ -1467,6 +1502,9 @@ def get_pull_requests(
             "source_branch": pr.source_branch,
             "target_branch": pr.target_branch,
             "state": pr.state,
+            "head_commit_sha": pr.head_commit_sha,
+            "base_commit_sha": getattr(pr, "base_commit_sha", None),
+            "merge_commit_sha": getattr(pr, "merge_commit_sha", None),
             "changed_files_count": pr.changed_files_count,
             "last_synced_at": _utc_iso(pr.last_sync_completed_at),
             "sync_status": pr.sync_integrity_status,
@@ -2597,6 +2635,106 @@ async def webhook_handler(
                 author = pr_payload.get("user", {}).get("login", "unknown")
                 source_branch = pr_payload.get("head", {}).get("ref")
                 target_branch = pr_payload.get("base", {}).get("ref")
+                
+                # Check for rollback/hotfix PR
+                title_lower = title.lower()
+                body_lower = pr_payload.get("body", "").lower()
+                rollback_keywords = ["revert", "rollback", "hotfix", "fix:"]
+                is_rollback = any(kw in title_lower or kw in body_lower for kw in rollback_keywords)
+                
+                if is_rollback:
+                    logger.info(f"Potential rollback PR detected: {title}")
+                    # Get changed files in this PR
+                    changed_files = []
+                    for file in pr_payload.get("changed_files", []):
+                        changed_files.append(file.get("filename"))
+                    
+                    # Find recent merged recommendation runs (last 7 days)
+                    from datetime import timedelta
+                    from app.models.recommendation import RecommendationRun
+                    from app.models.pattern_memory_v2 import PatternMemoryV2
+                    from app.models.pull_request import PullRequest
+                    from app.models.pull_request import PullRequestChangedFile
+                    import uuid
+                    
+                    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+                    recent_runs = db.query(RecommendationRun).filter(
+                        RecommendationRun.repository_id == db_repo.id,
+                        RecommendationRun.created_at >= seven_days_ago
+                    ).all()
+                    
+                    rollback_detected = False
+                    for run in recent_runs:
+                        # Get changed files from the original PR
+                        pr = db.query(PullRequest).filter(
+                            PullRequest.id == run.pr_id
+                        ).first()
+                        if pr:
+                            original_changed_files = db.query(PullRequestChangedFile).filter(
+                                PullRequestChangedFile.pull_request_id == pr.id
+                            ).all()
+                            original_file_paths = [f.file_path for f in original_changed_files]
+                            
+                            # Check for file overlap
+                            file_overlap = set(changed_files) & set(original_file_paths)
+                            if file_overlap:
+                                rollback_detected = True
+                                logger.info(f"Rollback detected for run {run.id} - overlapping files: {file_overlap}")
+                                
+                                # Create PatternMemoryV2 signals for affected ACs
+                                # Load ACs for the repository
+                                from app.models.acceptance_criterion import AcceptanceCriterion
+                                acs = db.query(AcceptanceCriterion).filter(
+                                    AcceptanceCriterion.repository_id == db_repo.id
+                                ).all()
+                                
+                                # For each overlapping file, find linked ACs and create signals
+                                for file_path in file_overlap:
+                                    # Find ACs that reference this file (simplified - would need proper traceability)
+                                    for ac in acs:
+                                        # Create signal for the AC
+                                        existing = db.query(PatternMemoryV2).filter(
+                                            PatternMemoryV2.pattern_key == ac.normalized_key,
+                                            PatternMemoryV2.repository_id == db_repo.id
+                                        ).first()
+                                        
+                                        if existing:
+                                            existing.usage_count += 1
+                                            existing.strength = min(1.0, existing.strength + 0.15)
+                                        else:
+                                            signal = PatternMemoryV2(
+                                                id=uuid.uuid4(),
+                                                repository_id=db_repo.id,
+                                                workspace_id=db_repo.workspace_id,
+                                                pattern_key=ac.normalized_key,
+                                                signal_type="ROLLBACK",
+                                                strength=0.8,
+                                                confidence=0.8,
+                                                usage_count=1
+                                            )
+                                            db.add(signal)
+                                
+                                db.commit()
+                                
+                                # Add comment to original PR
+                                try:
+                                    from app.services.github_service import GitHubService
+                                    github_service = GitHubService(db)
+                                    github_service.add_pr_comment(
+                                        db_repo.github_repo_id,
+                                        pr.github_pr_number,
+                                        "⚠️ **VeriScope: Potential Rollback Detected**\n\n"
+                                        f"A potential rollback was detected for this release. "
+                                        f"Outcome learning signals have been updated for the affected areas.\n\n"
+                                        f"Overlapping files: {', '.join(file_overlap)}"
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"Failed to add rollback comment: {e}")
+                                
+                                break  # Only process the first matching run
+                    
+                    if rollback_detected:
+                        logger.info("Rollback detection completed and signals recorded")
                 additions = pr_payload.get("additions", 0)
                 deletions = pr_payload.get("deletions", 0)
                 changed_files_count = pr_payload.get("changed_files", 0)
@@ -2674,6 +2812,90 @@ async def webhook_handler(
                     "pull_request_id": github_pr_id,
                     "sync_job_id": str(sync_job_id)
                 }
+            elif action == "closed":
+                # Get Repository
+                gh_repo_id = payload.get("repository", {}).get("id")
+                if not gh_repo_id:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing repository.id in payload")
+                
+                db_repo = db.query(Repository).filter(Repository.github_repo_id == gh_repo_id).first()
+                if not db_repo:
+                    logger.warning(f"Repository with GitHub ID {gh_repo_id} not found in database. Skipping PR webhook.")
+                    webhook_event.processing_status = "COMPLETED"
+                    webhook_event.processed_at = datetime.utcnow()
+                    db.commit()
+                    return {"status": "ignored", "detail": f"Repository with github_repo_id {gh_repo_id} not found."}
+                
+                # Update webhook timestamp for this repository
+                _update_repository_webhook_timestamp(db, gh_repo_id)
+                
+                # Rule 3: Ignore unsupported (inactive) repositories
+                if not db_repo.is_active:
+                    logger.info(f"Ignoring PR event for deactivated repository {db_repo.full_name}")
+                    webhook_event.processing_status = "COMPLETED"
+                    webhook_event.processed_at = datetime.utcnow()
+                    db.commit()
+                    return {"status": "ignored", "detail": f"Repository {db_repo.full_name} is inactive."}
+                
+                # Fetch PR fields from payload
+                pr_payload = payload.get("pull_request", {})
+                is_merged = pr_payload.get("merged") is True
+                event_type = "PR_MERGED" if is_merged else "PR_CLOSED_UNMERGED"
+                
+                github_pr_id = pr_payload.get("id")
+                db_pr = db.query(PullRequest).filter(
+                    PullRequest.github_pr_id == github_pr_id,
+                    PullRequest.repository_id == db_repo.id
+                ).first()
+                
+                # Update pull request state in database
+                gh_updated_at_str = pr_payload.get("updated_at")
+                gh_updated_at = datetime.fromisoformat(gh_updated_at_str.replace("Z", "+00:00")).replace(tzinfo=None) if gh_updated_at_str else datetime.utcnow()
+                
+                if db_pr:
+                    db_pr.state = "closed"
+                    db_pr.github_updated_at = gh_updated_at
+                    db_pr.last_github_updated_at = gh_updated_at
+                    db_pr.last_processed_delivery_id = x_github_delivery
+                    db.commit()
+                
+                # Parse occurred_at (merged_at or closed_at)
+                occurred_at_str = pr_payload.get("merged_at") if is_merged else pr_payload.get("closed_at")
+                occurred_at = None
+                if occurred_at_str:
+                    try:
+                        occurred_at = datetime.fromisoformat(occurred_at_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                    except Exception:
+                        pass
+                
+                # Prepare OutcomeEventCreate
+                from app.services.outcome_learning_service import OutcomeLearningService
+                from app.schemas.outcome_learning import OutcomeEventCreate
+                
+                event_in = OutcomeEventCreate(
+                    event_type=event_type,
+                    event_source="github",
+                    event_status="completed",
+                    occurred_at=occurred_at,
+                    external_event_id=x_github_delivery,
+                    metadata_json=payload,
+                    pull_request_id=db_pr.id if db_pr else None,
+                    github_pr_number=pr_payload.get("number"),
+                    commit_sha=pr_payload.get("head", {}).get("sha")
+                )
+                
+                # Ingest event
+                OutcomeLearningService.ingest_event(
+                    db=db,
+                    workspace_id=db_repo.workspace_id,
+                    repository_id=db_repo.id,
+                    event_in=event_in
+                )
+                
+                webhook_event.processing_status = "COMPLETED"
+                webhook_event.processed_at = datetime.utcnow()
+                db.commit()
+                return {"status": "processed", "action": action, "event_type": event_type}
 
         elif x_github_event == "check_suite":
             if action == "completed":
@@ -2703,6 +2925,86 @@ async def webhook_handler(
 
                 check_suite_payload = payload.get("check_suite", {})
                 head_sha = check_suite_payload.get("head_sha")
+                
+                # --- OUTCOME LEARNING INGESTION START ---
+                conclusion = check_suite_payload.get("conclusion")
+                ci_event_type = None
+                if conclusion == "success":
+                    ci_event_type = "CI_PASSED_AFTER_RECOMMENDATION"
+                elif conclusion in ("failure", "timed_out"):
+                    ci_event_type = "CI_FAILED_AFTER_RECOMMENDATION"
+
+                if ci_event_type:
+                    occurred_at_str = check_suite_payload.get("updated_at")
+                    occurred_at = None
+                    if occurred_at_str:
+                        try:
+                            occurred_at = datetime.fromisoformat(occurred_at_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                        except Exception:
+                            pass
+                    
+                    from app.services.outcome_learning_service import OutcomeLearningService
+                    from app.schemas.outcome_learning import OutcomeEventCreate
+                    
+                    # Look up PRs in payload or database to link
+                    pr_payloads = check_suite_payload.get("pull_requests", [])
+                    pr_numbers = [p.get("number") for p in pr_payloads if p.get("number")]
+                    
+                    # Fallback to DB PRs matching head_sha
+                    if not pr_numbers:
+                        db_prs = db.query(PullRequest).filter(
+                            PullRequest.repository_id == db_repo.id,
+                            PullRequest.head_commit_sha == head_sha
+                        ).all()
+                        pr_numbers = [db_pr.number for db_pr in db_prs]
+
+                    if pr_numbers:
+                        for pr_num in pr_numbers:
+                            db_pr = db.query(PullRequest).filter(
+                                PullRequest.repository_id == db_repo.id,
+                                PullRequest.number == pr_num
+                            ).first()
+                            
+                            event_in = OutcomeEventCreate(
+                                event_type=ci_event_type,
+                                event_source="github",
+                                event_status="completed",
+                                occurred_at=occurred_at,
+                                external_event_id=f"{x_github_delivery}_{pr_num}",
+                                metadata_json=payload,
+                                pull_request_id=db_pr.id if db_pr else None,
+                                github_pr_number=pr_num,
+                                commit_sha=head_sha
+                            )
+                            try:
+                                OutcomeLearningService.ingest_event(
+                                    db=db,
+                                    workspace_id=db_repo.workspace_id,
+                                    repository_id=db_repo.id,
+                                    event_in=event_in
+                                )
+                            except Exception as ol_err:
+                                logger.error(f"Failed to ingest outcome event for check_suite, PR {pr_num}: {ol_err}")
+                    else:
+                        event_in = OutcomeEventCreate(
+                            event_type=ci_event_type,
+                            event_source="github",
+                            event_status="completed",
+                            occurred_at=occurred_at,
+                            external_event_id=x_github_delivery,
+                            metadata_json=payload,
+                            commit_sha=head_sha
+                        )
+                        try:
+                            OutcomeLearningService.ingest_event(
+                                db=db,
+                                workspace_id=db_repo.workspace_id,
+                                repository_id=db_repo.id,
+                                event_in=event_in
+                            )
+                        except Exception as ol_err:
+                            logger.error(f"Failed to ingest outcome event for check_suite, commit {head_sha}: {ol_err}")
+                # --- OUTCOME LEARNING INGESTION END ---
                 
                 # Fetch PRs from payload and from DB matching head_sha
                 prs_to_process = []

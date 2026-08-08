@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
-import { Brain, Target, Globe, Layers, FileCode, GitBranch, ChevronDown, ChevronUp, AlertTriangle } from "lucide-react";
+import { Brain, Target, Globe, Layers, FileCode, GitBranch, ChevronDown, ChevronUp, AlertTriangle, ChevronRight } from "lucide-react";
 import { mapRawLabel, generateBusinessImpact, generateImpactedFlows, generateTechnicalAreas, generateWhyItMatters } from "@/lib/label-mapper";
 
 interface WhatVeriscopeUnderstoodProps {
@@ -11,6 +11,16 @@ interface WhatVeriscopeUnderstoodProps {
   changedComponents: string[];
   changedFiles: string[];
   summary: string;
+  fileImpactMap?: Array<{
+    filePath: string;
+    changeStatus: string;
+    affectedAcs: Array<{
+      acId: string;
+      title: string;
+      group: string;
+      executionStatus: string;
+    }>;
+  }>;
   className?: string;
 }
 
@@ -21,9 +31,11 @@ export default function WhatVeriscopeUnderstood({
   changedComponents,
   changedFiles,
   summary,
+  fileImpactMap,
   className = ""
 }: WhatVeriscopeUnderstoodProps) {
   const [showTechnicalDetails, setShowTechnicalDetails] = useState(false);
+  const [expandedFiles, setExpandedFiles] = useState<Set<string>>(new Set());
 
   const businessImpact = generateBusinessImpact(changedFiles);
   const impactedFlows = generateImpactedFlows(changedFiles);
@@ -107,6 +119,119 @@ export default function WhatVeriscopeUnderstood({
           ))}
         </div>
       </div>
+
+      {/* File Impact Map */}
+      {fileImpactMap && fileImpactMap.length > 0 && (
+        <div className="mb-4">
+          <div className="flex items-center gap-2 mb-2">
+            <FileCode className="w-4 h-4 text-blue-400" />
+            <h3 className="text-sm font-semibold text-zinc-300">File Impact Map</h3>
+          </div>
+          <div className="space-y-2">
+            {fileImpactMap.map((fileImpact, index) => {
+              const isExpanded = expandedFiles.has(fileImpact.filePath);
+              const displayAcs = isExpanded ? fileImpact.affectedAcs : fileImpact.affectedAcs.slice(0, 5);
+              const hasMore = fileImpact.affectedAcs.length > 5;
+              
+              const getGroupBadgeColor = (group: string) => {
+                switch (group) {
+                  case "REQUIRED":
+                    return "bg-red-950/30 text-red-400 border-red-800/40";
+                  case "EXCLUDED_ALREADY_VERIFIED":
+                    return "bg-green-950/30 text-green-400 border-green-800/40";
+                  case "RECOMMENDED":
+                    return "bg-amber-950/30 text-amber-400 border-amber-800/40";
+                  case "OPTIONAL":
+                    return "bg-zinc-950/30 text-zinc-400 border-zinc-800/40";
+                  case "SAFE_TO_SKIP":
+                    return "bg-blue-950/30 text-blue-400 border-blue-800/40";
+                  default:
+                    return "bg-zinc-950/30 text-zinc-400 border-zinc-800/40";
+                }
+              };
+
+              const getExecutionStatusColor = (status: string) => {
+                switch (status) {
+                  case "PASSED":
+                    return "text-green-400";
+                  case "FAILED":
+                    return "text-red-400";
+                  case "SKIPPED":
+                    return "text-amber-400";
+                  case "NOT_RUN":
+                    return "text-zinc-400";
+                  default:
+                    return "text-zinc-400";
+                }
+              };
+
+              return (
+                <div key={index} className="bg-zinc-800/40 rounded-lg border border-zinc-700/50 overflow-hidden">
+                  <button
+                    onClick={() => {
+                      const newExpanded = new Set(expandedFiles);
+                      if (newExpanded.has(fileImpact.filePath)) {
+                        newExpanded.delete(fileImpact.filePath);
+                      } else {
+                        newExpanded.add(fileImpact.filePath);
+                      }
+                      setExpandedFiles(newExpanded);
+                    }}
+                    className="w-full px-3 py-2 flex items-center justify-between hover:bg-zinc-700/30 transition-colors"
+                  >
+                    <div className="flex items-center gap-2 flex-1 min-w-0">
+                      <ChevronRight 
+                        className={`w-4 h-4 text-zinc-400 transition-transform ${
+                          isExpanded ? 'rotate-90' : ''
+                        }`} 
+                      />
+                      <span className="text-xs font-mono text-zinc-300 truncate">
+                        {fileImpact.filePath}
+                      </span>
+                      <span className={`text-xs px-2 py-0.5 rounded border ${
+                        fileImpact.changeStatus === 'modified' 
+                          ? 'bg-amber-950/30 text-amber-400 border-amber-800/40'
+                          : fileImpact.changeStatus === 'added'
+                          ? 'bg-green-950/30 text-green-400 border-green-800/40'
+                          : fileImpact.changeStatus === 'deleted'
+                          ? 'bg-red-950/30 text-red-400 border-red-800/40'
+                          : 'bg-zinc-950/30 text-zinc-400 border-zinc-800/40'
+                      }`}>
+                        {fileImpact.changeStatus.toUpperCase()}
+                      </span>
+                    </div>
+                    <span className="text-xs text-zinc-500">
+                      {fileImpact.affectedAcs.length} AC{fileImpact.affectedAcs.length !== 1 ? 's' : ''}
+                    </span>
+                  </button>
+                  
+                  {isExpanded && (
+                    <div className="px-3 pb-2 space-y-1">
+                      {displayAcs.map((ac, acIndex) => (
+                        <div key={acIndex} className="flex items-center gap-2 text-xs">
+                          <span className="font-mono text-zinc-400">{ac.acId}:</span>
+                          <span className="text-zinc-300 truncate flex-1">{ac.title}</span>
+                          <span className={`px-2 py-0.5 rounded border text-xs ${getGroupBadgeColor(ac.group)}`}>
+                            {ac.group.replace('_', ' ')}
+                          </span>
+                          <span className={`text-xs ${getExecutionStatusColor(ac.executionStatus)}`}>
+                            {ac.executionStatus}
+                          </span>
+                        </div>
+                      ))}
+                      {hasMore && !isExpanded && (
+                        <div className="text-xs text-zinc-500">
+                          and {fileImpact.affectedAcs.length - 5} more
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Technical Details (Collapsible) */}
       <div className="border-t border-zinc-800/50 pt-4">

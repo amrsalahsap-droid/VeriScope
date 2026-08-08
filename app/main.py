@@ -32,12 +32,15 @@ from app.routers.organization_ci_cd_policy import router as organization_ci_cd_p
 from app.routers.organization_governance import router as organization_governance_router
 from app.routers.governance_notifications import router as governance_notifications_router
 from app.routers.governance_security_api import router as governance_security_router
+from app.routers.outcome_learning import router as outcome_learning_router
+from app.routers.ac_test_mappings import router as ac_test_mappings_router
 
 app = FastAPI(
     title="Veriscope AI Regression Scope Intelligence Platform",
     description="Multi-tenant Organization & Phase 2 Trust Calibration Foundations API.",
     version="1.0.0"
 )
+
 
 # CORS configuration
 app.add_middleware(
@@ -90,6 +93,8 @@ app.include_router(governance_notifications_router, prefix="/organizations/{work
 app.include_router(governance_security_router, prefix="/organizations/{workspace_id}/cicd/governance")
 
 app.include_router(migration_router)
+app.include_router(outcome_learning_router)
+app.include_router(ac_test_mappings_router)
 
 
 @app.get("/", tags=["Health"])
@@ -139,3 +144,5 @@ def generic_exception_handler(request: Request, exc: Exception):
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": f"Internal Server Error: {str(exc)}"}
     )
+
+# Harmless comment to trigger uvicorn reload on file change

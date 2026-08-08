@@ -31,12 +31,20 @@ class SourceNormalizationService:
         ],
     }
     
-    # List item patterns
+    # List item patterns — each tuple is (regex, has_source_number_group)
+    # Patterns with has_source_number_group=True must have group(1)=number, group(2)=text.
+    # Patterns with has_source_number_group=False must have group(1)=text.
     LIST_ITEM_PATTERNS = [
-        r"^\s*(\d+)\.\s+(.+)",  # Numbered list: 1. item
-        r"^\s*[-*]\s+(.+)",  # Bullet list: - item or * item
+        r"^\s*(\d+)\.\s+(.+)",  # Numbered list: 1. item  → extracts source_number
+        r"^\s*[-*]\s+[Aa][Cc][-\s]?0*(\d+)[:\s]\s*(.+)",  # Bullet with AC ref: - AC-01: text → extracts source_number
+        r"^\s*[-*]\s+(.+)",  # Plain bullet list: - item or * item
         r"^\s*o\s+(.+)",  # Circle list: o item
     ]
+    # Patterns that have (number, text) capture groups rather than just (text)
+    _NUMBERED_PATTERNS = {
+        r"^\s*(\d+)\.\s+(.+)",
+        r"^\s*[-*]\s+[Aa][Cc][-\s]?0*(\d+)[:\s]\s*(.+)",
+    }
     
     def __init__(self, db: Optional[Session] = None):
         """Initialize the service with optional database session."""
@@ -97,8 +105,8 @@ class SourceNormalizationService:
             for pattern in self.LIST_ITEM_PATTERNS:
                 match = re.match(pattern, stripped, re.IGNORECASE)
                 if match:
-                    # Extract source number if present
-                    if pattern.startswith(r"^\s*(\d+)"):
+                    # Extract source number if this pattern has (number, text) groups
+                    if pattern in self._NUMBERED_PATTERNS:
                         source_number = int(match.group(1))
                         text_content = match.group(2)
                     else:

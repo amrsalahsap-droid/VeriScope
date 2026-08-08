@@ -48,12 +48,12 @@ class QualityGateService:
             if decision_status in ["APPROVED", "VERIFIED"]:
                 return QualityGateStatus.PASSED
             
-            # Partially verified with required items → PARTIAL
-            if decision_status == "PARTIALLY_VERIFIED":
+            # Conditionally approved with required items → PARTIAL
+            if decision_status in ["PARTIALLY_VERIFIED", "CONDITIONALLY_APPROVED"]:
                 # If required items remain, it's PARTIAL
                 if required_before_release_count > 0:
                     return QualityGateStatus.PARTIAL
-                # If no required items but still partially verified, treat as PASSED
+                # If no required items but still conditionally approved, treat as PASSED
                 return QualityGateStatus.PASSED
             
             # Rejected → FAILED

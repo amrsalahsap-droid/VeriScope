@@ -52,7 +52,8 @@ class RequirementEvidenceGraphService:
         changed_files: List[str],
         pr_description: Optional[str] = None,
         recommendation_run_id: str = None,
-        canonical_ac_rows: Optional[List] = None
+        canonical_ac_rows: Optional[List] = None,
+        change_impact_model: Optional[Any] = None
     ) -> RecommendationEvidenceViewModel:
         """Build the complete evidence graph and view model.
 
@@ -64,6 +65,7 @@ class RequirementEvidenceGraphService:
             pr_description: Optional PR description for AC extraction
             recommendation_run_id: Optional recommendation run ID
             canonical_ac_rows: Optional list of AcceptanceCriterion DB rows to use directly
+            change_impact_model: Optional ChangeImpactModel for unified classification
 
         Returns:
             RecommendationEvidenceViewModel as single source of truth
@@ -100,7 +102,10 @@ class RequirementEvidenceGraphService:
             extraction_result.requirement_nodes,
             test_nodes,
             execution_nodes,
-            coverage_nodes
+            coverage_nodes,
+            repository_id=repository_id,
+            pull_request_id=pull_request_id,
+            head_sha=head_sha
         )
 
         # Step 8: Generate missing tests only from uncovered requirements
@@ -129,7 +134,8 @@ class RequirementEvidenceGraphService:
             recommendation_run_id=recommendation_run_id,
             repository_id=repository_id,
             db_session=self.db,
-            manual_evidence_nodes=manual_evidence_nodes
+            manual_evidence_nodes=manual_evidence_nodes,
+            change_impact_model=change_impact_model
         )
 
         return view_model
@@ -372,10 +378,16 @@ class RequirementEvidenceGraphService:
         tests: List[TestNode],
         executions: List[ExecutionNode],
         coverage_nodes: List[CoverageNode],
-        policy: 'EvidenceQualityPolicy' = None
+        policy: 'EvidenceQualityPolicy' = None,
+        repository_id: Optional[str] = None,
+        pull_request_id: Optional[str] = None,
+        head_sha: Optional[str] = None
     ):
         """Classify each requirement based on evidence."""
         from app.services.evidence_graph.evidence_quality_policy import EvidenceQualityPolicy
+        from app.models.coverage import FileTestLink, CoverageReport
+        from app.models.test_result import TestCase, TestResult, TestRun
+        from app.models.acceptance_criterion import AcceptanceCriterion
         
         if policy is None:
             policy, _ = EvidenceQualityPolicy.load_policy(
@@ -385,12 +397,117 @@ class RequirementEvidenceGraphService:
         test_map = {t.test_id: t for t in tests}
         execution_map = {e.test_id: e for e in executions}
 
+        # Resolve current coverage report to filter FileTestLink queries
+        current_report = None
+        if repository_id:
+            current_report = self._load_current_coverage_reports(
+                repository_id=repository_id,
+                pull_request_id=pull_request_id,
+                head_sha=head_sha
+            )
+
+        # Pre-load DIRECT_AC_ID links for all requirements to avoid N+1 queries
+        # Build a map of AC identifiers to their linked test cases
+        ac_identifier_to_test_cases = {}
+        ac_identifier_to_passing_test_cases = {}
+        
+        # Get all AC identifiers from requirements
+        ac_identifiers = set()
+        for req in requirements:
+            # Try to get AC identifier from readable_id (e.g., "AC-01")
+            if req.readable_id and req.readable_id.startswith("AC-"):
+                ac_identifiers.add(req.readable_id)
+            # Also try source_number if available
+            if hasattr(req, 'source_number') and req.source_number is not None:
+                ac_identifiers.add(f"AC-{req.source_number:02d}")
+        
+        # Query FileTestLink for DIRECT_AC_ID mappings
+        if ac_identifiers:
+            query = self.db.query(FileTestLink).filter(
+                FileTestLink.mapping_type == "DIRECT_AC_ID",
+                FileTestLink.file_path.in_(ac_identifiers)
+            )
+            if current_report:
+                query = query.filter(FileTestLink.coverage_report_id == current_report.id)
+            elif repository_id:
+                query = query.join(CoverageReport).filter(CoverageReport.repository_id == repository_id)
+                
+            direct_links = query.all()
+            
+            # Group by AC identifier
+            for link in direct_links:
+                ac_id = link.file_path
+                if ac_id not in ac_identifier_to_test_cases:
+                    ac_identifier_to_test_cases[ac_id] = []
+                ac_identifier_to_test_cases[ac_id].append(link.test_case_id)
+        
+        # For each AC identifier, check if linked test cases have passing results
+        for ac_id, test_case_ids in ac_identifier_to_test_cases.items():
+            if not test_case_ids:
+                continue
+            
+            # Get the most recent TestRun for the repository
+            # We need to determine repository_id from context - for now, use the first test case
+            if test_case_ids:
+                first_tc = self.db.query(TestCase).filter(TestCase.id == test_case_ids[0]).first()
+                if first_tc:
+                    repository_id = first_tc.repository_id
+                    
+                    # Get the most recent TestRun for this repository
+                    latest_run = self.db.query(TestRun).filter(
+                        TestRun.repository_id == repository_id
+                    ).order_by(TestRun.created_at.desc()).first()
+                    
+                    if latest_run:
+                        # Check for passing TestResults in this run
+                        passing_test_cases = self.db.query(TestResult).filter(
+                            TestResult.test_run_id == latest_run.id,
+                            TestResult.test_case_id.in_(test_case_ids),
+                            TestResult.status == "passed"
+                        ).all()
+                        
+                        if passing_test_cases:
+                            ac_identifier_to_passing_test_cases[ac_id] = [tr.test_case_id for tr in passing_test_cases]
+
         for req in requirements:
             # Rule: Exclude fragments
             if not req.is_real_testable_requirement:
                 req.classification = EvidenceClassification.EXCLUDED_FRAGMENT_OR_TEST_DATA
                 req.classification_reason = "Not a real testable requirement (fragment or test data)"
                 continue
+
+            # NEW: Check DIRECT_AC_ID link FIRST before any other logic
+            ac_identifier = None
+            if req.readable_id and req.readable_id.startswith("AC-"):
+                ac_identifier = req.readable_id
+            elif hasattr(req, 'source_number') and req.source_number is not None:
+                ac_identifier = f"AC-{req.source_number:02d}"
+            elif req.title:
+                # Parse AC ID from title/label (format: "AC-XX <description>")
+                import re
+                match = re.match(r'^(AC-\d+)', req.title)
+                if match:
+                    ac_identifier = match.group(1)
+            
+            if ac_identifier and ac_identifier in ac_identifier_to_test_cases:
+                # There is a DIRECT_AC_ID link
+                linked_test_case_ids = ac_identifier_to_test_cases[ac_identifier]
+                passing_test_case_ids = ac_identifier_to_passing_test_cases.get(ac_identifier, [])
+                
+                if passing_test_case_ids:
+                    # Has passing test result → COVERED
+                    req.classification = EvidenceClassification.VERIFIED_BY_CURRENT_PR_EXECUTION
+                    req.classification_reason = f"Directly linked test passed via DIRECT_AC_ID mapping (AC: {ac_identifier})"
+                    # Set matched_test_ids to the passing test cases
+                    req.matched_test_ids = [str(tc_id) for tc_id in passing_test_case_ids]
+                    continue
+                else:
+                    # Has link but no passing result → PARTIALLY_COVERED
+                    req.classification = EvidenceClassification.PARTIALLY_COVERED
+                    req.classification_reason = f"Directly linked test exists but has no passing result via DIRECT_AC_ID mapping (AC: {ac_identifier})"
+                    # Set matched_test_ids to the linked test cases
+                    req.matched_test_ids = [str(tc_id) for tc_id in linked_test_case_ids]
+                    continue
 
             # Find matched execution
             matched_execution = None
@@ -524,6 +641,7 @@ class RequirementEvidenceGraphService:
         ).first()
 
         if run:
+            repository_id = str(run.repository_id)
             # Serialize view model to JSON
             snapshot = {
                 "health": view_model.health,
@@ -547,6 +665,7 @@ class RequirementEvidenceGraphService:
                         "manualSupportStatus": getattr(row, "manual_support_status", "MANUAL_NOT_MAPPED"),
                         "manualValidation": getattr(row, "manual_validation", {}),
                         "sourceAcNumber": getattr(row, "source_ac_number", None),
+                        "databaseAcId": self._get_resolved_database_ac_id(row, repository_id),  # Phase 6: Add database AC ID for evidence overlay
                     }
                     for row in view_model.ac_traceability
                 ],
@@ -571,6 +690,7 @@ class RequirementEvidenceGraphService:
                         "contradictionRuleTriggered": entry.contradiction_rule_triggered,
                         "matchingDimensions": entry.matching_dimensions,
                         "currentPrExecutionId": entry.current_pr_execution_id,
+                        "mapping_type": getattr(entry, "mapping_type", "FUZZY"),
                     }
                     for entry in self.matching_service.match_table
                 ],
@@ -580,6 +700,158 @@ class RequirementEvidenceGraphService:
             # Store in model (assuming JSON columns exist)
             run.requirement_evidence_snapshot_json = json.dumps(snapshot)
             self.db.commit()
+
+    def recompute_snapshot_for_pr(
+        self,
+        repository_id: str,
+        pull_request_id: str
+    ) -> int:
+        """Recompute acTraceability snapshot for open recommendation runs on a PR.
+        
+        This function is called after new evidence (JUnit/Cobertura) is uploaded
+        to update the coverageStatus in existing recommendation run snapshots.
+        
+        Args:
+            repository_id: Repository ID
+            pull_request_id: Pull request ID
+            
+        Returns:
+            Number of recommendation runs updated
+        """
+        from app.models.recommendation import RecommendationRun
+        from app.models.pull_request import PullRequest
+        from app.models.acceptance_criterion import AcceptanceCriterion
+        from uuid import UUID
+        import json
+        
+        # Resolve UUIDs safely
+        pr_uuid = None
+        if pull_request_id:
+            try:
+                pr_uuid = UUID(pull_request_id) if isinstance(pull_request_id, str) else pull_request_id
+            except ValueError:
+                pass
+        
+        repo_uuid = None
+        if repository_id:
+            try:
+                repo_uuid = UUID(repository_id) if isinstance(repository_id, str) else repository_id
+            except ValueError:
+                pass
+        
+        if not pr_uuid or not repo_uuid:
+            logger.warning(f"Invalid repository_id or pull_request_id for snapshot recompute")
+            return 0
+        
+        # Find open recommendation runs for this PR
+        # "Open" means not closed/merged - we'll use a simple check: runs created in the last 7 days
+        from datetime import datetime, timedelta
+        recent_cutoff = datetime.utcnow() - timedelta(days=7)
+        
+        open_runs = self.db.query(RecommendationRun).filter(
+            RecommendationRun.repository_id == repo_uuid,
+            RecommendationRun.pr_id == str(pr_uuid),
+            RecommendationRun.created_at >= recent_cutoff
+        ).all()
+        
+        if not open_runs:
+            logger.info(f"No open recommendation runs found for PR {pull_request_id}")
+            return 0
+        
+        updated_count = 0
+        
+        for run in open_runs:
+            try:
+                # Load the existing snapshot
+                raw_snapshot = run.requirement_evidence_snapshot_json
+                if isinstance(raw_snapshot, str):
+                    snapshot_data = json.loads(raw_snapshot)
+                else:
+                    snapshot_data = raw_snapshot
+                
+                if not snapshot_data or "acTraceability" not in snapshot_data:
+                    logger.warning(f"Run {run.id} has no acTraceability snapshot")
+                    continue
+                
+                # Get AC rows for this PR
+                ac_rows = self.db.query(AcceptanceCriterion).filter(
+                    AcceptanceCriterion.pull_request_id == pr_uuid
+                ).all()
+                
+                if not ac_rows:
+                    logger.warning(f"No AC rows found for PR {pull_request_id}")
+                    continue
+                
+                # Build requirement nodes from canonical AC rows
+                extraction_result = self._build_requirement_nodes_from_canonical_rows(ac_rows)
+                requirement_nodes = extraction_result.requirement_nodes
+                
+                # Build test nodes
+                test_nodes = self._build_test_nodes(str(repo_uuid))
+                
+                # Build execution nodes (empty since we're not re-running tests)
+                execution_nodes = []
+                
+                # Build coverage nodes (empty since we're not re-running coverage)
+                coverage_nodes = []
+                
+                # Re-classify requirements with the updated DIRECT_AC_ID logic
+                self._classify_requirements(
+                    requirement_nodes,
+                    test_nodes,
+                    execution_nodes,
+                    coverage_nodes
+                )
+                
+                # Rebuild the view model to get updated ac_traceability
+                view_model = self.view_model_builder.build_view_model(
+                    requirements=requirement_nodes,
+                    tests=test_nodes,
+                    executions=execution_nodes,
+                    coverage_nodes=coverage_nodes,
+                    missing_tests=[],
+                    match_table=self.matching_service.match_table,
+                    excluded_fragments=[],
+                    extraction_audit=extraction_result.audit.__dict__ if extraction_result.audit else None,
+                    recommendation_run_id=str(run.id),
+                    repository_id=str(repo_uuid),
+                    db_session=self.db,
+                    manual_evidence_nodes=snapshot_data.get("manualEvidenceNodes", [])
+                )
+                
+                # Update the snapshot with new acTraceability
+                snapshot_data["acTraceability"] = [
+                    {
+                        "requirementId": row.requirement_id,
+                        "readableId": row.readable_id,
+                        "title": row.title,
+                        "fullText": row.full_text,
+                        "coverageStatus": row.coverage_status,
+                        "linkedExistingTests": row.linked_existing_tests,
+                        "linkedMissingTest": row.linked_missing_test,
+                        "priority": row.priority,
+                        "notes": row.notes,
+                        "manualSupportStatus": getattr(row, "manual_support_status", "MANUAL_NOT_MAPPED"),
+                        "manualValidation": getattr(row, "manual_validation", {}),
+                        "sourceAcNumber": getattr(row, "source_ac_number", None),
+                        "databaseAcId": self._get_resolved_database_ac_id(row, str(repo_uuid)),  # Phase 6: Add database AC ID for evidence overlay
+                    }
+                    for row in view_model.ac_traceability
+                ]
+                
+                # Write updated snapshot back
+                run.requirement_evidence_snapshot_json = json.dumps(snapshot_data)
+                self.db.commit()
+                
+                updated_count += 1
+                logger.info(f"Updated snapshot for recommendation run {run.id}")
+                
+            except Exception as e:
+                logger.exception(f"Failed to recompute snapshot for run {run.id}: {e}")
+                self.db.rollback()
+        
+        logger.info(f"Recomputed snapshots for {updated_count} recommendation runs")
+        return updated_count
 
     def _load_manual_evidence(
         self,
@@ -730,3 +1002,28 @@ class RequirementEvidenceGraphService:
             manual_evidence_nodes.append(node)
 
         return manual_evidence_nodes
+
+    def _get_resolved_database_ac_id(self, row, repository_id: str) -> Optional[str]:
+        db_ac_id = getattr(row, "database_ac_id", None) or getattr(row, "requirement_id", None) or getattr(row, "id", None)
+        if db_ac_id and self.db:
+            from app.models.acceptance_criterion import AcceptanceCriterion
+            from uuid import UUID
+            try:
+                # Validate if it is a valid UUID
+                if isinstance(db_ac_id, str):
+                    UUID(db_ac_id)
+                ac_exists = self.db.query(AcceptanceCriterion).filter(AcceptanceCriterion.id == db_ac_id).first() is not None
+                if ac_exists:
+                    return str(db_ac_id)
+            except ValueError:
+                pass
+            
+            # If not a valid UUID or does not exist, resolve via resolver
+            from app.services.ac_identity_resolver import resolve_ac_identity
+            ac_rows = self.db.query(AcceptanceCriterion).filter(
+                AcceptanceCriterion.repository_id == repository_id
+            ).all()
+            resolved = resolve_ac_identity(row, ac_rows)
+            if resolved and resolved.confidence >= 0.5:
+                return resolved.database_ac_id
+        return None

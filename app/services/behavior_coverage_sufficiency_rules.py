@@ -51,7 +51,7 @@ class BehaviorCoverageSufficiencyRules:
         # Apply evaluation cascading rules:
 
         # 1. UNKNOWN Rule
-        if not scenarios or conf == "LOW" and not covered_blocker_scenarios:
+        if not scenarios or (conf == "LOW" and not covered_blocker_scenarios and not missing_blocker_scenarios):
             sufficiency = "UNKNOWN"
             reasons.append("Behavior coverage signals are weakly inferred or insufficient scenarios are registered")
 

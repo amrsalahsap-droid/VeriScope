@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, ForeignKey, Integer, Float, Boolean, Index, UniqueConstraint
+from sqlalchemy import Column, String, DateTime, ForeignKey, Integer, Float, Boolean, Index, UniqueConstraint, JSON
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
 from app.db.base import Base
@@ -32,7 +32,54 @@ class TestCase(Base):
     identity_version = Column(Integer, nullable=False, default=1)
     identity_resolution_strategy = Column(String, nullable=False, default="EXACT") # EXACT, RENAMED, HEURISTIC, MANUAL_OVERRIDE
     
+    # Input 4 — Test inventory metadata
+    test_type = Column(String, nullable=True) # unit / integration / e2e / api / manual / smoke / regression / unknown
+    automation_status = Column(String, nullable=False, default="UNKNOWN") # automated / manual / unknown
+    source = Column(String, nullable=False, default="unknown") # repo_scan / junit_import / test_management_import / manual_import / postman_collection / playwright / jest / pytest / unknown
+    source_metadata_json = Column(JSONB, nullable=True)
+    file_path = Column(String, nullable=True) # test file path or external source path
+    dedupe_key = Column(String, nullable=True, index=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    last_seen_at = Column(DateTime, nullable=True)
+    last_seen_commit_sha = Column(String, nullable=True, index=True)
+    inventory_snapshot_sha = Column(String, nullable=True, index=True)
+    module_or_area = Column(String, nullable=True)
+    owner = Column(String, nullable=True)
+    tags = Column(JSONB, nullable=True)
+    confidence = Column(Float, nullable=True)
+    
+    # Separate Taxonomy Columns
+    test_nature = Column(String, nullable=True)
+    primary_test_category = Column(String, nullable=True)
+    suite_purpose = Column(String, nullable=True)
+    risk_tags = Column(JSONB, nullable=True)
+    execution_layer = Column(String, nullable=True)
+    import_source = Column(String, nullable=True)
+    execution_method = Column(String, nullable=True)
+    framework = Column(String, nullable=True)
+    external_ac_ref = Column(String, nullable=True)
+    
+    # Semantic Classification Columns
+    product_area = Column(String, nullable=True)
+    business_flow = Column(String, nullable=True)
+    behavior_key = Column(String, nullable=True)
+    scenario_intent = Column(String, nullable=True)
+    scenario_type = Column(String, nullable=True)
+    validation_target = Column(String, nullable=True)
+    risk_dimensions = Column(JSON, nullable=True)
+    regression_role = Column(String, nullable=True)
+    must_run_condition = Column(String, nullable=True)
+    semantic_classification_json = Column(JSON, nullable=True)
+    classification_source = Column(String, nullable=True)
+    classification_confidence = Column(Float, nullable=True)
+    classification_review_status = Column(String, nullable=True)
+    classified_at = Column(DateTime, nullable=True)
+    classified_by = Column(String, nullable=True)
+    semantic_classifier_version = Column(String, nullable=True)
+    behavior_mapping_status = Column(String, nullable=True)
+    
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Relationships
     results = relationship("TestResult", back_populates="test_case")
@@ -41,6 +88,9 @@ class TestCase(Base):
     __table_args__ = (
         UniqueConstraint("repository_id", "canonical_identity_hash", name="uq_test_cases_repo_canonical_hash"),
         Index("ix_test_cases_repo_stable_identity", "repository_id", "stable_identity"),
+        Index("ix_test_cases_repo_active", "repository_id", "is_active"),
+        Index("ix_test_cases_repo_source", "repository_id", "source"),
+        Index("ix_test_cases_repo_type", "repository_id", "test_type"),
     )
 
 class TestRun(Base):

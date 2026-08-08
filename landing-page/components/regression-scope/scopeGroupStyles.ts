@@ -16,6 +16,13 @@ export const SCOPE_GROUP_STYLES: Record<ScopeGroup, GroupStyleConfig> = {
     borderClass: "border-rose-800/40",
     badgeClass: "text-rose-400 bg-rose-950/20 border-rose-800/40 border",
   },
+  [ScopeGroup.REVIEW_NEEDED]: {
+    label: "Review Needed",
+    textClass: "text-purple-400",
+    bgClass: "bg-purple-950/20",
+    borderClass: "border-purple-800/40",
+    badgeClass: "text-purple-400 bg-purple-950/20 border-purple-800/40 border",
+  },
   [ScopeGroup.RECOMMENDED]: {
     label: "Recommended Regression",
     textClass: "text-amber-400",
@@ -50,5 +57,12 @@ export const SCOPE_GROUP_STYLES: Record<ScopeGroup, GroupStyleConfig> = {
     bgClass: "bg-emerald-950/20",
     borderClass: "border-emerald-800/40",
     badgeClass: "text-emerald-400 bg-emerald-950/20 border-emerald-800/40 border",
+  },
+  [ScopeGroup.DEFERRED_COVERAGE_DEBT]: {
+    label: "Deferred Coverage Debt",
+    textClass: "text-orange-400",
+    bgClass: "bg-orange-950/20",
+    borderClass: "border-orange-800/40",
+    badgeClass: "text-orange-400 bg-orange-950/20 border-orange-800/40 border",
   },
 };

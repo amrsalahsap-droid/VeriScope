@@ -42,10 +42,10 @@ export function DevConsistencyCheck({ regressionEvidence, run, result }: DevCons
     const executiveGaps = counts.coverageGaps || 0;
 
     if (executiveVerified !== verifiedByCurrentPr.length) {
-      errors.push(`Executive verified count (${executiveVerified}) != rendered section (${verifiedByCurrentPr.length})`);
+      errors.push(`[ASSERTION_1] Executive verified count (${executiveVerified}) != rendered section (${verifiedByCurrentPr.length}) | expected: ${executiveVerified} == ${verifiedByCurrentPr.length} | affected_section: verifiedByCurrentPr`);
     }
     if (executiveMissing !== missingTests.length) {
-      errors.push(`Executive missing count (${executiveMissing}) != rendered section (${missingTests.length})`);
+      errors.push(`[ASSERTION_1] Executive missing count (${executiveMissing}) != rendered section (${missingTests.length}) | expected: ${executiveMissing} == ${missingTests.length} | affected_section: missingTests`);
     }
 
     // Assertion 2: No internal AC IDs visible in normal UI
@@ -54,7 +54,7 @@ export function DevConsistencyCheck({ regressionEvidence, run, result }: DevCons
       return id && !id.startsWith('AC-') && id.length > 10;
     });
     if (hasInternalIds) {
-      warnings.push("Internal AC IDs may be visible in normal UI");
+      warnings.push(`[ASSERTION_2] Internal AC IDs may be visible in normal UI | expected: no internal IDs | affected_section: acTraceability`);
     }
 
     // Assertion 3: No missing test has currentPrResult = Passed
@@ -62,7 +62,7 @@ export function DevConsistencyCheck({ regressionEvidence, run, result }: DevCons
       mt.currentPrResult === 'Passed' || mt.status === 'Passed'
     );
     if (missingWithPassed.length > 0) {
-      errors.push(`${missingWithPassed.length} missing tests have currentPrResult = Passed`);
+      errors.push(`[ASSERTION_3] ${missingWithPassed.length} missing tests have currentPrResult = Passed | expected: 0 | actual: ${missingWithPassed.length} | affected_section: missingTests`);
     }
 
     // Assertion 4: No missing test is also in verifiedByCurrentPr
@@ -71,7 +71,7 @@ export function DevConsistencyCheck({ regressionEvidence, run, result }: DevCons
       verifiedIds.has(mt.requirementId)
     );
     if (missingInVerified.length > 0) {
-      errors.push(`${missingInVerified.length} missing tests are also in verifiedByCurrentPr`);
+      errors.push(`[ASSERTION_4] ${missingInVerified.length} missing tests are also in verifiedByCurrentPr | expected: 0 | actual: ${missingInVerified.length} | affected_section: missingTests, verifiedByCurrentPr`);
     }
 
     // Assertion 5: Not mapped rows must not be fragments/test data
@@ -82,18 +82,18 @@ export function DevConsistencyCheck({ regressionEvidence, run, result }: DevCons
       ac.notes?.toLowerCase().includes('fragment')
     );
     if (fragmentsInNotMapped.length > 0) {
-      warnings.push(`${fragmentsInNotMapped.length} Not mapped rows may be fragments/test data`);
+      warnings.push(`[ASSERTION_5] ${fragmentsInNotMapped.length} Not mapped rows may be fragments/test data | expected: 0 | actual: ${fragmentsInNotMapped.length} | affected_section: acTraceability`);
     }
 
     // Assertion 6: "18 of 37" must not appear
     const decisionCopy = regressionEvidence.decisionCopy?.explanation || "";
     if (decisionCopy.includes("of") && /\d+\s+of\s+\d+/.test(decisionCopy)) {
-      warnings.push(`Decision copy contains "X of Y" pattern: ${decisionCopy}`);
+      warnings.push(`[ASSERTION_6] Decision copy contains "X of Y" pattern: ${decisionCopy} | expected: no "X of Y" pattern | affected_section: decisionCopy`);
     }
 
     // Assertion 7: "No remaining tests" must not appear while missing tests > 0
     if (missingTests.length > 0 && decisionCopy.toLowerCase().includes("no remaining")) {
-      errors.push(`"No remaining tests" appears while ${missingTests.length} missing tests exist`);
+      errors.push(`[ASSERTION_7] "No remaining tests" appears while ${missingTests.length} missing tests exist | expected: no "no remaining" when missing tests > 0 | actual: missing tests = ${missingTests.length} | affected_section: decisionCopy, missingTests`);
     }
 
     // Assertion 8: Coverage gap linked test must share flow or explanation
@@ -103,7 +103,7 @@ export function DevConsistencyCheck({ regressionEvidence, run, result }: DevCons
       return gap.reason && !gap.reason.toLowerCase().includes("shared policy");
     });
     if (gapsWithWrongFlow.length > 0) {
-      warnings.push(`${gapsWithWrongFlow.length} coverage gaps may have incorrectly linked tests`);
+      warnings.push(`[ASSERTION_8] ${gapsWithWrongFlow.length} coverage gaps may have incorrectly linked tests | expected: 0 | actual: ${gapsWithWrongFlow.length} | affected_section: coverageGaps`);
     }
   }
 

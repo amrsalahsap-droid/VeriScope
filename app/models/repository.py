@@ -96,6 +96,7 @@ class Repository(Base):
     releases = relationship("Release", back_populates="repository", cascade="all, delete-orphan")
     regression_suites = relationship("RegressionSuite", back_populates="repository", cascade="all, delete-orphan")
     pipeline_runs = relationship("PipelineRun", back_populates="repository", cascade="all, delete-orphan")
+    intelligence_runs = relationship("RepositoryIntelligenceRun", back_populates="repository", cascade="all, delete-orphan")
     # test_assets = relationship("TestAsset", back_populates="repository", cascade="all, delete-orphan")  # Table not yet migrated
 
 
