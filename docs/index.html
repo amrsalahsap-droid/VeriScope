@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VeriScope — Regression Intelligence for Engineering Teams</title>
+    <meta
+      name="description"
+      content="Stop running your entire regression suite blindly. VeriScope analyzes pull requests, historical failures, and fragility patterns to recommend exactly what should be tested."
+    />
+    <meta property="og:title" content="VeriScope" />
+    <meta
+      property="og:description"
+      content="Regression intelligence for engineering teams. Recommend exactly what should be tested — and explain why."
+    />
+    <link rel="canonical" href="https://amrsalahsap-droid.github.io/VeriScope/" />
+    <style>
+      :root {
+        --bg: #0b0d10;
+        --panel: #14181e;
+        --line: rgba(255, 255, 255, 0.08);
+        --text: #f4f4f5;
+        --muted: #a1a1aa;
+        --accent: #c4f542;
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; padding: 0; }
+      body {
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+        background: radial-gradient(1200px 600px at 10% -10%, #1b2430 0%, var(--bg) 55%);
+        color: var(--text);
+        line-height: 1.55;
+      }
+      a { color: inherit; }
+      .wrap { width: min(1080px, calc(100% - 40px)); margin: 0 auto; }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 22px 0;
+      }
+      .brand { font-weight: 700; letter-spacing: -0.03em; font-size: 1.15rem; }
+      .nav { display: flex; gap: 18px; align-items: center; color: var(--muted); font-size: 0.95rem; }
+      .nav a { text-decoration: none; }
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        text-decoration: none;
+        border-radius: 999px;
+        padding: 10px 16px;
+        font-weight: 600;
+        font-size: 0.95rem;
+      }
+      .btn-primary { background: var(--accent); color: #111; }
+      .btn-ghost { border: 1px solid var(--line); color: var(--text); }
+      .hero { padding: 72px 0 40px; }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        border: 1px solid var(--line);
+        background: rgba(255,255,255,0.03);
+        color: var(--muted);
+        border-radius: 999px;
+        padding: 6px 12px;
+        font-size: 0.82rem;
+        margin-bottom: 18px;
+      }
+      h1 {
+        font-size: clamp(2.2rem, 6vw, 4.4rem);
+        line-height: 1.05;
+        letter-spacing: -0.045em;
+        margin: 0 0 18px;
+        max-width: 14ch;
+      }
+      .lead { max-width: 62ch; color: var(--muted); font-size: 1.1rem; margin-bottom: 28px; }
+      .actions { display: flex; flex-wrap: wrap; gap: 12px; }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 16px;
+        padding: 20px 0 80px;
+      }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        padding: 22px;
+      }
+      .card h2 { margin: 0 0 8px; font-size: 1.05rem; }
+      .card p { margin: 0; color: var(--muted); }
+      footer {
+        border-top: 1px solid var(--line);
+        color: var(--muted);
+        padding: 24px 0 40px;
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      @media (max-width: 800px) {
+        .grid { grid-template-columns: 1fr; }
+        .nav span { display: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <div class="brand">VeriScope</div>
+        <nav class="nav">
+          <a href="https://github.com/amrsalahsap-droid/VeriScope">GitHub</a>
+          <a class="btn btn-ghost" href="https://github.com/amrsalahsap-droid/VeriScope">Open repository</a>
+        </nav>
+      </header>
+
+      <section class="hero">
+        <div class="badge">Now in pilot program</div>
+        <h1>Stop running your entire regression suite blindly.</h1>
+        <p class="lead">
+          VeriScope analyzes pull requests, historical failures, coverage signals,
+          and organizational fragility patterns to recommend exactly what should
+          be tested — and explain why.
+        </p>
+        <div class="actions">
+          <a class="btn btn-primary" href="https://github.com/amrsalahsap-droid/VeriScope">View the project</a>
+          <a class="btn btn-ghost" href="https://github.com/amrsalahsap-droid/VeriScope#readme">Read the README</a>
+        </div>
+      </section>
+
+      <section class="grid">
+        <article class="card">
+          <h2>Explainable recommendations</h2>
+          <p>Every recommended test includes evidence-backed reasoning, not a black box score.</p>
+        </article>
+        <article class="card">
+          <h2>Fragility memory</h2>
+          <p>Remembers recurring failure patterns across repositories so the next change is safer.</p>
+        </article>
+        <article class="card">
+          <h2>Operational trust</h2>
+          <p>Built for calm, deterministic release decisions — not AI guesswork.</p>
+        </article>
+      </section>
+
+      <footer>
+        <span>VeriScope · Regression intelligence for engineering teams</span>
+        <a href="https://github.com/amrsalahsap-droid/VeriScope">github.com/amrsalahsap-droid/VeriScope</a>
+      </footer>
+    </div>
+  </body>
+</html>
