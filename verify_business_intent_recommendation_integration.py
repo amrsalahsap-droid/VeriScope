@@ -35,15 +35,19 @@ PR_EMPTY_DESCRIPTION = ""
 
 def setup_test_data(db_session: Session):
     """Setup test workspace, repository, and behaviors."""
+    import random
+    suffix = random.randint(10000, 99999)
     
     print("Setting up test workspace and repository...")
-    workspace = Workspace(id=uuid4(), name="test", slug="test")
+    workspace = Workspace(id=uuid4(), name=f"test-{suffix}", slug=f"test-{suffix}")
     db_session.add(workspace)
     db_session.commit()
     
-    user = User(id=uuid4(), email="test@example.com", name="Test User")
-    db_session.add(user)
-    db_session.commit()
+    user = db_session.query(User).filter(User.email == "test@example.com").first()
+    if not user:
+        user = User(id=uuid4(), email="test@example.com", name="Test User")
+        db_session.add(user)
+        db_session.commit()
     
     member = WorkspaceMember(id=uuid4(), workspace_id=workspace.id, user_id=user.id, role="OWNER")
     db_session.add(member)
@@ -51,19 +55,33 @@ def setup_test_data(db_session: Session):
     
     repo = Repository(
         id=uuid4(),
-        name="test-repo",
-        url="https://github.com/test/repo",
+        name=f"test-repo-{suffix}",
+        owner="test-owner",
+        full_name=f"test-owner/test-repo-{suffix}",
         workspace_id=workspace.id,
-        github_repo_id=12345,
+        github_repo_id=suffix,
     )
     db_session.add(repo)
+    db_session.commit()
+    
+    # Create canonical journey first to satisfy Postgres foreign key constraint
+    from app.models.journey import Journey
+    journey_auth = Journey(
+        id=uuid4(),
+        repository_id=repo.id,
+        name="Authentication",
+        slug="authentication",
+        description="User authentication and password management",
+        is_deleted=False,
+    )
+    db_session.add(journey_auth)
     db_session.commit()
     
     # Create behaviors
     print("Setting up behaviors...")
     password_validation = Behavior(
         id=uuid4(),
-        journey_id=uuid4(),
+        journey_id=journey_auth.id,
         repository_id=repo.id,
         name="Password Validation",
         slug="password-validation",
@@ -73,7 +91,7 @@ def setup_test_data(db_session: Session):
     )
     signup = Behavior(
         id=uuid4(),
-        journey_id=uuid4(),
+        journey_id=journey_auth.id,
         repository_id=repo.id,
         name="Signup",
         slug="signup",
@@ -83,7 +101,7 @@ def setup_test_data(db_session: Session):
     )
     password_reset = Behavior(
         id=uuid4(),
-        journey_id=uuid4(),
+        journey_id=journey_auth.id,
         repository_id=repo.id,
         name="Password Reset",
         slug="password-reset",
@@ -101,15 +119,20 @@ def create_pr_with_intent(db_session: Session, repo: Repository):
     """Create PR with good business intent."""
     
     print(f"Creating PR with business intent: {PR_WITH_INTENT_TITLE}")
+    from datetime import datetime
     pr = PullRequest(
         id=uuid4(),
         repository_id=repo.id,
+        github_pr_id=123,
         number=123,
         title=PR_WITH_INTENT_TITLE,
-        body=PR_WITH_INTENT_DESCRIPTION,
+        author="test-author",
         source_branch="feature/password-validation",
         target_branch="main",
+        state="open",
         head_commit_sha="abc123",
+        github_created_at=datetime.utcnow(),
+        github_updated_at=datetime.utcnow(),
     )
     db_session.add(pr)
     db_session.commit()
@@ -149,15 +172,20 @@ def create_pr_empty(db_session: Session, repo: Repository):
     """Create PR with empty description."""
     
     print(f"Creating PR with empty description: {PR_EMPTY_TITLE}")
+    from datetime import datetime
     pr = PullRequest(
         id=uuid4(),
         repository_id=repo.id,
+        github_pr_id=124,
         number=124,
         title=PR_EMPTY_TITLE,
-        body=PR_EMPTY_DESCRIPTION,
+        author="test-author",
         source_branch="feature/password-validation",
         target_branch="main",
+        state="open",
         head_commit_sha="def456",
+        github_created_at=datetime.utcnow(),
+        github_updated_at=datetime.utcnow(),
     )
     db_session.add(pr)
     db_session.commit()
@@ -177,7 +205,7 @@ def verify_recommendation_with_intent(db_session: Session, run: RecommendationRu
     impact_profile = run.impact_profile or {}
     
     # Check 1: Recommendation includes Business Intent section
-    print("✓ Check 1: Recommendation includes Business Intent section")
+    print("[PASS] Check 1: Recommendation includes Business Intent section")
     business_intent_matrix = impact_profile.get("business_intent_coverage_matrix")
     if business_intent_matrix:
         print(f"  PASS: Business intent matrix exists")
@@ -189,7 +217,7 @@ def verify_recommendation_with_intent(db_session: Session, run: RecommendationRu
     print()
     
     # Check 2: Acceptance criteria coverage matrix exists
-    print("✓ Check 2: Acceptance criteria coverage matrix exists")
+    print("[PASS] Check 2: Acceptance criteria coverage matrix exists")
     if business_intent_matrix and business_intent_matrix.get('rows'):
         print(f"  PASS: AC coverage matrix has {len(business_intent_matrix['rows'])} rows")
     else:
@@ -198,7 +226,7 @@ def verify_recommendation_with_intent(db_session: Session, run: RecommendationRu
     print()
     
     # Check 3: Expected behavior scenarios are generated
-    print("✓ Check 3: Expected behavior scenarios are generated")
+    print("[PASS] Check 3: Expected behavior scenarios are generated")
     signal_breakdown = impact_profile.get("business_intent_signal_breakdown", {})
     expected_scenarios = signal_breakdown.get("business_intent_signals", {}).get("expected_scenarios_count", 0)
     if expected_scenarios > 0:
@@ -209,7 +237,7 @@ def verify_recommendation_with_intent(db_session: Session, run: RecommendationRu
     print()
     
     # Check 4: Tests mapped to AC rank higher
-    print("✓ Check 4: Tests mapped to AC rank higher")
+    print("[PASS] Check 4: Tests mapped to AC rank higher")
     scoring_boosts = signal_breakdown.get("business_intent_signals", {}).get("scoring_boosts_applied", {})
     if scoring_boosts.get("tests_with_ac_boost", 0) > 0:
         print(f"  PASS: {scoring_boosts.get('tests_with_ac_boost')} tests received AC boost")
@@ -219,14 +247,14 @@ def verify_recommendation_with_intent(db_session: Session, run: RecommendationRu
     print()
     
     # Check 5: Missing AC scenarios appear as suggested tests
-    print("✓ Check 5: Missing AC scenarios appear as suggested tests")
+    print("[PASS] Check 5: Missing AC scenarios appear as suggested tests")
     # In a real implementation, this would check suggested_scenarios
     # For this test, we verify the structure supports it
     print(f"  PASS: Structure supports suggested scenarios for missing AC")
     print()
     
     # Check 6: Requirement gaps are empty when AC is good
-    print("✓ Check 6: Requirement gaps are empty when AC is good")
+    print("[PASS] Check 6: Requirement gaps are empty when AC is good")
     requirement_gaps = impact_profile.get("requirement_gap_report", {})
     if requirement_gaps.get("total_gaps", 0) == 0:
         print(f"  PASS: No requirement gaps (good AC)")
@@ -236,7 +264,7 @@ def verify_recommendation_with_intent(db_session: Session, run: RecommendationRu
     print()
     
     # Check 7: Completeness improves (baseline comparison)
-    print("✓ Check 7: Completeness is high with good AC")
+    print("[PASS] Check 7: Completeness is high with good AC")
     trust_level = requirement_gaps.get("overall_trust_level", "UNKNOWN")
     if trust_level in ["HIGH", "MEDIUM"]:
         print(f"  PASS: Trust level is {trust_level}")
@@ -260,7 +288,7 @@ def verify_recommendation_empty(db_session: Session, run: RecommendationRun):
     impact_profile = run.impact_profile or {}
     
     # Check 1: Requirement gap is shown
-    print("✓ Check 1: Requirement gap is shown")
+    print("[PASS] Check 1: Requirement gap is shown")
     requirement_gaps = impact_profile.get("requirement_gap_report", {})
     if requirement_gaps.get("total_gaps", 0) > 0:
         print(f"  PASS: {requirement_gaps.get('total_gaps')} requirement gaps detected")
@@ -272,7 +300,7 @@ def verify_recommendation_empty(db_session: Session, run: RecommendationRun):
     print()
     
     # Check 2: Confidence/completeness reduced
-    print("✓ Check 2: Confidence/completeness reduced")
+    print("[PASS] Check 2: Confidence/completeness reduced")
     business_intent_matrix = impact_profile.get("business_intent_coverage_matrix")
     if business_intent_matrix:
         confidence_impact = business_intent_matrix.get("confidence_impact", "NONE")
@@ -287,7 +315,7 @@ def verify_recommendation_empty(db_session: Session, run: RecommendationRun):
     print()
     
     # Check 3: Recommendation still runs
-    print("✓ Check 3: Recommendation still runs")
+    print("[PASS] Check 3: Recommendation still runs")
     if run and run.recommended_tests_count > 0:
         print(f"  PASS: Recommendation generated {run.recommended_tests_count} tests")
     else:
@@ -361,43 +389,35 @@ def run_verification(db_session: Session):
     mappings = []
     mappings.append(BusinessBehaviorMapping(
         id=uuid4(),
-        repository_id=repo.id,
         pull_request_id=pr_intent.id,
         acceptance_criterion_id=ac_intent[0].id,
         behavior_id=password_validation.id,
         behavior_scenario_id=None,
-        confidence=0.85,
-        source="AUTOMATIC_EXTRACTION",
+        match_confidence=0.85,
     ))
     mappings.append(BusinessBehaviorMapping(
         id=uuid4(),
-        repository_id=repo.id,
         pull_request_id=pr_intent.id,
         acceptance_criterion_id=ac_intent[1].id,
         behavior_id=password_validation.id,
         behavior_scenario_id=None,
-        confidence=0.85,
-        source="AUTOMATIC_EXTRACTION",
+        match_confidence=0.85,
     ))
     mappings.append(BusinessBehaviorMapping(
         id=uuid4(),
-        repository_id=repo.id,
         pull_request_id=pr_intent.id,
         acceptance_criterion_id=ac_intent[2].id,
         behavior_id=signup.id,
         behavior_scenario_id=None,
-        confidence=0.85,
-        source="AUTOMATIC_EXTRACTION",
+        match_confidence=0.85,
     ))
     mappings.append(BusinessBehaviorMapping(
         id=uuid4(),
-        repository_id=repo.id,
         pull_request_id=pr_intent.id,
         acceptance_criterion_id=ac_intent[3].id,
         behavior_id=password_reset.id,
         behavior_scenario_id=None,
-        confidence=0.85,
-        source="AUTOMATIC_EXTRACTION",
+        match_confidence=0.85,
     ))
     db_session.add_all(mappings)
     db_session.commit()
@@ -417,8 +437,8 @@ def run_verification(db_session: Session):
         dependency_expansion_strategy_version="expansion-strategy-v1",
         recommendation_reasoning_summary="Test recommendation with intent",
         pull_request_id=pr_intent.id,
-        pr_snapshot_id=uuid4(),
-        pr_sync_job_id=uuid4(),
+        pr_snapshot_id=None,
+        pr_sync_job_id=None,
         evidence_health_status="HEALTHY",
         recommendation_readiness_state="READY",
         evidence_consistency_status="CONSISTENT",
@@ -524,8 +544,8 @@ def run_verification(db_session: Session):
         dependency_expansion_strategy_version="expansion-strategy-v1",
         recommendation_reasoning_summary="Test recommendation empty",
         pull_request_id=pr_empty.id,
-        pr_snapshot_id=uuid4(),
-        pr_sync_job_id=uuid4(),
+        pr_snapshot_id=None,
+        pr_sync_job_id=None,
         evidence_health_status="HEALTHY",
         recommendation_readiness_state="READY",
         evidence_consistency_status="CONSISTENT",
@@ -620,18 +640,18 @@ def run_verification(db_session: Session):
     print("=" * 80)
     print()
     print("All checks passed:")
-    print("  ✓ Business intent improves precision")
-    print("  ✓ Recommendation still runs without business intent")
-    print("  ✓ Business intent is not mandatory")
+    print("  [PASS] Business intent improves precision")
+    print("  [PASS] Recommendation still runs without business intent")
+    print("  [PASS] Business intent is not mandatory")
     print()
     
     return True
 
 
 if __name__ == "__main__":
-    from app.database import get_db
+    from app.db.session import SessionLocal
     
-    db = next(get_db())
+    db = SessionLocal()
     try:
         success = run_verification(db)
         sys.exit(0 if success else 1)

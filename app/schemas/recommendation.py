@@ -704,6 +704,7 @@ class RecommendationInputSnapshotResponse(BaseModel):
     coverage_confidence: str
     readiness_state: str
     readiness_reasons: List[str]
+    readiness_input_summary: Optional[Dict[str, Any]] = None
     fragility_patterns: List[FragilityPatternSnapshotItem]
     behaviors: List[BehaviorSnapshotItem] = []
     journeys: List[JourneySnapshotItem] = []

@@ -365,10 +365,16 @@ export default function RepositoryDetailPage({ params }: PageProps) {
       setRefreshResult(result);
 
       if (!res.ok) {
-        setRefreshState("failed");
-        setRefreshError(result?.error || result?.message || "Unknown error");
+        const rawRefreshError = result?.error || result?.message;
+        const refreshErrorText =
+          typeof rawRefreshError === "string"
+            ? rawRefreshError
+            : typeof rawRefreshError === "object" && rawRefreshError !== null
+            ? (rawRefreshError.message || JSON.stringify(rawRefreshError))
+            : "Unknown error";
+        setRefreshError(refreshErrorText);
         toast.error("Intelligence refresh failed", {
-          description: result?.error || result?.message || "Unknown error",
+          description: refreshErrorText,
         });
         return;
       }
@@ -674,7 +680,13 @@ export default function RepositoryDetailPage({ params }: PageProps) {
       }
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        let description = data?.detail || data?.message || data?.error || `Engine error (${res.status})`;
+        const rawDetail = data?.detail || data?.message || data?.error;
+        let description =
+          typeof rawDetail === "string"
+            ? rawDetail
+            : typeof rawDetail === "object" && rawDetail !== null
+            ? (rawDetail.message || JSON.stringify(rawDetail))
+            : `Engine error (${res.status})`;
 
         // If backend provided a detailed error, use it
         if (data?.error_code) {

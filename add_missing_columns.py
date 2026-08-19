@@ -27,6 +27,8 @@ input_snapshot_cols = [
     "ALTER TABLE recommendation_input_snapshots ADD COLUMN IF NOT EXISTS external_requirement_coverage JSONB",
     "ALTER TABLE recommendation_input_snapshots ADD COLUMN IF NOT EXISTS integration_sync_status JSONB",
     "ALTER TABLE recommendation_input_snapshots ADD COLUMN IF NOT EXISTS external_context_gaps JSONB",
+    "ALTER TABLE recommendation_input_snapshots ADD COLUMN IF NOT EXISTS business_behavior_mappings JSONB",
+    "ALTER TABLE recommendation_input_snapshots ADD COLUMN IF NOT EXISTS behavior_scenario_coverages JSONB",
 ]
 
 all_statements = test_outcome_cols + input_snapshot_cols

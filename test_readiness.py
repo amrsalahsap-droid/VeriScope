@@ -165,7 +165,7 @@ def test_low_confidence():
         service = RecommendationReadinessService(db)
         assessment = service.assess_readiness(repo.id, pr.id)
         assert assessment.readiness_level == "MINIMUM_READY"
-        assert assessment.expected_confidence == "MEDIUM"
+        assert assessment.expected_confidence == "LOW"
         assert assessment.can_generate is True
     finally:
         db.close()
@@ -492,7 +492,7 @@ def test_source_code_pr_diff_exists():
         assert assessment.readiness_level != "BLOCKED"
         assert assessment.readiness_level == "MINIMUM_READY"
         assert assessment.can_generate is True
-        assert assessment.readiness_score >= 0.4  # source_code (20) + pull_request_diff (20) = 40
+        assert assessment.readiness_score >= 0.27  # source_code (20) + pull_request_diff (20) / 135 total = 0.296
         assert "source_code" in [s["key"] for s in assessment.available_inputs]
         assert "pull_request_diff" in [s["key"] for s in assessment.available_inputs]
     finally:
@@ -817,5 +817,288 @@ def test_no_duplicate_signal_keys():
         # Check no overlap between available and missing
         overlap = set(available_keys) & set(missing_keys)
         assert len(overlap) == 0, f"Keys in both available and missing: {overlap}"
+    finally:
+        db.close()
+
+def clear_recommendations(db: Session, pull_request_id: uuid.UUID):
+    from app.models.recommendation import RecommendationRun
+    db.query(RecommendationRun).filter(RecommendationRun.pull_request_id == pull_request_id).delete()
+    db.commit()
+
+def test_pr_package_ready_without_recommendation_snapshot():
+    db = SessionLocal()
+    try:
+        workspace_id = setup_test_auth_db(db)
+        repo, pr = get_or_create_repo_pr(db, workspace_id)
+        clear_signals(db, repo.id, pr.id)
+        clear_recommendations(db, pr.id)
+        
+        pr.head_commit_sha = "7ff6d2"
+        pr.changed_files_count = 6
+        db.commit()
+        
+        headers = get_auth_headers()
+        response = client.get(f"/readiness/repositories/{repo.id}/pull-requests/{pr.id}", headers=headers)
+        assert response.status_code == 200, response.text
+        data = response.json()
+        
+        assert "pr_package" in data
+        assert "recommendation_audit" in data
+        assert data["pr_package"]["status"] == "READY"
+        assert data["recommendation_audit"]["status"] == "NO_RECOMMENDATION_YET"
+    finally:
+        db.close()
+
+def test_snapshot_missing_does_not_block_pr_package_readiness():
+    db = SessionLocal()
+    try:
+        workspace_id = setup_test_auth_db(db)
+        repo, pr = get_or_create_repo_pr(db, workspace_id)
+        clear_signals(db, repo.id, pr.id)
+        clear_recommendations(db, pr.id)
+        
+        pr.head_commit_sha = "7ff6d2"
+        pr.changed_files_count = 6
+        db.commit()
+        
+        from app.models.recommendation import RecommendationRun
+        run = RecommendationRun(
+            id=uuid.uuid4(),
+            repository_id=repo.id,
+            pr_id=str(pr.number),
+            pull_request_id=pr.id,
+            triggered_by="test_user",
+            evidence_quality="LOW",
+            engine_version="v3",
+            ruleset_version="rules-v1",
+            degradation_policy_version="policy-v1",
+            recommendation_reasoning_summary="test reasoning",
+            readiness_score_at_generation=0.8,
+            readiness_level_at_generation="HIGH_CONFIDENCE_READY",
+            expected_confidence_at_generation="HIGH",
+            can_generate_at_generation=True,
+            created_at=datetime.utcnow()
+        )
+        db.add(run)
+        db.commit()
+        
+        headers = get_auth_headers()
+        response = client.get(f"/readiness/repositories/{repo.id}/pull-requests/{pr.id}", headers=headers)
+        assert response.status_code == 200, response.text
+        data = response.json()
+        
+        assert data["pr_package"]["status"] == "READY"
+        assert data["recommendation_audit"]["status"] == "LEGACY_NO_SNAPSHOT"
+    finally:
+        db.close()
+
+def test_legacy_recommendation_without_snapshot_returns_legacy_audit_status():
+    db = SessionLocal()
+    try:
+        workspace_id = setup_test_auth_db(db)
+        repo, pr = get_or_create_repo_pr(db, workspace_id)
+        clear_signals(db, repo.id, pr.id)
+        clear_recommendations(db, pr.id)
+        
+        pr.head_commit_sha = "7ff6d2"
+        pr.changed_files_count = 6
+        db.commit()
+        
+        from app.models.recommendation import RecommendationRun
+        run = RecommendationRun(
+            id=uuid.uuid4(),
+            repository_id=repo.id,
+            pr_id=str(pr.number),
+            pull_request_id=pr.id,
+            triggered_by="test_user",
+            evidence_quality="LOW",
+            engine_version="v3",
+            ruleset_version="rules-v1",
+            degradation_policy_version="policy-v1",
+            recommendation_reasoning_summary="test reasoning",
+            readiness_score_at_generation=0.8,
+            readiness_level_at_generation="HIGH_CONFIDENCE_READY",
+            expected_confidence_at_generation="HIGH",
+            can_generate_at_generation=True,
+            created_at=datetime.utcnow()
+        )
+        db.add(run)
+        db.commit()
+        
+        headers = get_auth_headers()
+        response = client.get(f"/readiness/repositories/{repo.id}/pull-requests/{pr.id}", headers=headers)
+        assert response.status_code == 200, response.text
+        data = response.json()
+        
+        assert data["recommendation_audit"]["status"] == "LEGACY_NO_SNAPSHOT"
+    finally:
+        db.close()
+
+def create_dummy_pr_snapshot(db: Session, repo_id: uuid.UUID, pr, head_commit_sha: str):
+    from app.models.artifact import RawArtifact
+    from app.models.pull_request import PullRequestSnapshot
+    
+    artifact = RawArtifact(
+        id=uuid.uuid4(),
+        repository_id=repo_id,
+        artifact_type="PULL_REQUEST_FILES_SNAPSHOT",
+        storage_path=f"test_snapshots/{pr.id}.json",
+        artifact_metadata={}
+    )
+    db.add(artifact)
+    db.flush()
+    
+    snapshot = PullRequestSnapshot(
+        id=uuid.uuid4(),
+        pull_request_id=pr.id,
+        repository_id=repo_id,
+        head_commit_sha=head_commit_sha,
+        github_pr_updated_at=datetime.utcnow(),
+        snapshot_reason="test",
+        snapshot_schema_version="pr_snapshot.v1",
+        normalization_engine_version="1.0.0",
+        snapshot_artifact_id=artifact.id,
+        evidence_health_status="HEALTHY",
+        sync_integrity_status="FULL_SUCCESS"
+    )
+    db.add(snapshot)
+    db.commit()
+    return snapshot
+
+def test_new_recommendation_returns_auditable_status():
+    db = SessionLocal()
+    try:
+        workspace_id = setup_test_auth_db(db)
+        repo, pr = get_or_create_repo_pr(db, workspace_id)
+        clear_signals(db, repo.id, pr.id)
+        clear_recommendations(db, pr.id)
+        
+        pr.head_commit_sha = "7ff6d2"
+        pr.changed_files_count = 6
+        db.commit()
+        
+        snapshot = create_dummy_pr_snapshot(db, repo.id, pr, "7ff6d2")
+        
+        from app.models.recommendation import RecommendationRun
+        run = RecommendationRun(
+            id=uuid.uuid4(),
+            repository_id=repo.id,
+            pr_id=str(pr.number),
+            pull_request_id=pr.id,
+            pr_snapshot_id=snapshot.id,
+            triggered_by="test_user",
+            evidence_quality="LOW",
+            engine_version="v3",
+            ruleset_version="rules-v1",
+            degradation_policy_version="policy-v1",
+            recommendation_reasoning_summary="test reasoning",
+            readiness_score_at_generation=0.8,
+            readiness_level_at_generation="HIGH_CONFIDENCE_READY",
+            expected_confidence_at_generation="HIGH",
+            can_generate_at_generation=True,
+            created_at=datetime.utcnow()
+        )
+        db.add(run)
+        db.commit()
+        
+        headers = get_auth_headers()
+        response = client.get(f"/readiness/repositories/{repo.id}/pull-requests/{pr.id}", headers=headers)
+        assert response.status_code == 200, response.text
+        data = response.json()
+        
+        assert data["recommendation_audit"]["status"] == "AUDITABLE"
+    finally:
+        db.close()
+
+def test_missing_head_sha_blocks_pr_package():
+    db = SessionLocal()
+    try:
+        workspace_id = setup_test_auth_db(db)
+        repo, pr = get_or_create_repo_pr(db, workspace_id)
+        clear_signals(db, repo.id, pr.id)
+        clear_recommendations(db, pr.id)
+        
+        pr.head_commit_sha = ""
+        pr.changed_files_count = 6
+        db.commit()
+        
+        headers = get_auth_headers()
+        response = client.get(f"/readiness/repositories/{repo.id}/pull-requests/{pr.id}", headers=headers)
+        assert response.status_code == 200, response.text
+        data = response.json()
+        
+        assert data["pr_package"]["status"] == "BLOCKED"
+        assert "HEAD_SHA_MISSING" in data["pr_package"]["blockers"]
+    finally:
+        db.close()
+
+def test_missing_changed_files_blocks_pr_package():
+    db = SessionLocal()
+    try:
+        workspace_id = setup_test_auth_db(db)
+        repo, pr = get_or_create_repo_pr(db, workspace_id)
+        clear_signals(db, repo.id, pr.id)
+        clear_recommendations(db, pr.id)
+        
+        pr.head_commit_sha = "7ff6d2"
+        pr.changed_files_count = 0
+        
+        # Make sure no changed files exist in the DB for this PR
+        from app.models.pull_request import PullRequestChangedFile
+        db.query(PullRequestChangedFile).filter(PullRequestChangedFile.pull_request_id == pr.id).delete()
+        db.commit()
+        
+        headers = get_auth_headers()
+        response = client.get(f"/readiness/repositories/{repo.id}/pull-requests/{pr.id}", headers=headers)
+        assert response.status_code == 200, response.text
+        data = response.json()
+        
+        assert data["pr_package"]["status"] == "BLOCKED"
+        assert "CHANGED_FILES_MISSING" in data["pr_package"]["blockers"]
+    finally:
+        db.close()
+
+def test_pr_head_change_returns_outdated_audit_status():
+    db = SessionLocal()
+    try:
+        workspace_id = setup_test_auth_db(db)
+        repo, pr = get_or_create_repo_pr(db, workspace_id)
+        clear_signals(db, repo.id, pr.id)
+        clear_recommendations(db, pr.id)
+        
+        pr.head_commit_sha = "new_sha"
+        pr.changed_files_count = 6
+        db.commit()
+        
+        snapshot = create_dummy_pr_snapshot(db, repo.id, pr, "old_sha")
+        
+        from app.models.recommendation import RecommendationRun
+        run = RecommendationRun(
+            id=uuid.uuid4(),
+            repository_id=repo.id,
+            pr_id=str(pr.number),
+            pull_request_id=pr.id,
+            pr_snapshot_id=snapshot.id,
+            triggered_by="test_user",
+            evidence_quality="LOW",
+            engine_version="v3",
+            ruleset_version="rules-v1",
+            degradation_policy_version="policy-v1",
+            recommendation_reasoning_summary="test reasoning",
+            readiness_score_at_generation=0.8,
+            readiness_level_at_generation="HIGH_CONFIDENCE_READY",
+            expected_confidence_at_generation="HIGH",
+            can_generate_at_generation=True,
+            created_at=datetime.utcnow()
+        )
+        db.add(run)
+        db.commit()
+        
+        headers = get_auth_headers()
+        response = client.get(f"/readiness/repositories/{repo.id}/pull-requests/{pr.id}", headers=headers)
+        assert response.status_code == 200, response.text
+        data = response.json()
+        
+        assert data["recommendation_audit"]["status"] == "OUTDATED"
     finally:
         db.close()

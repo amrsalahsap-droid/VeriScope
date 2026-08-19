@@ -85,6 +85,275 @@ def _is_pr_package_ready(pr: Any) -> bool:
         return file_count > 0
     finally:
         db.close()
+
+
+def _persist_evidence_graph_snapshot(
+    db: Session,
+    run: RecommendationRun,
+    pr,
+    changed_files: List[str],
+    repository_id: UUID,
+    commit: bool = True,
+) -> bool:
+    """Build and persist the requirement evidence graph snapshot linked to a recommendation run.
+
+    Uses the canonical AcceptanceCriterion rows so the snapshot is authoritative and
+    does not depend on fragile PR-description re-extraction.  Failures are logged but
+    do not abort recommendation generation, so downstream endpoints must fall back to
+    the recommendation input snapshot if needed.
+
+    When called during recommendation generation, pass ``commit=False`` so the final
+    commit happens once all related records are flushed.
+    """
+    try:
+        from app.services.evidence_graph.requirement_evidence_graph_service import RequirementEvidenceGraphService
+
+        graph_service = RequirementEvidenceGraphService(db)
+        ac_rows = db.query(AcceptanceCriterion).filter(
+            AcceptanceCriterion.pull_request_id == pr.id,
+            AcceptanceCriterion.status.in_(["ACCEPTED", "NEEDS_REVIEW"]),
+        ).all()
+        view_model = graph_service.build_evidence_graph(
+            repository_id=str(repository_id),
+            pull_request_id=str(pr.id),
+            head_sha=pr.head_commit_sha,
+            changed_files=changed_files,
+            pr_description=None,
+            recommendation_run_id=str(run.id),
+            canonical_ac_rows=ac_rows,
+        )
+
+        snapshot = {
+            "health": view_model.health,
+            "counts": view_model.counts,
+            "decisionCopy": {
+                "headline": view_model.decision_copy.headline,
+                "explanation": view_model.decision_copy.explanation,
+                "nextAction": view_model.decision_copy.next_action,
+            },
+            "acTraceability": [
+                {
+                    "requirementId": row.requirement_id,
+                    "readableId": row.readable_id,
+                    "title": row.title,
+                    "fullText": row.full_text,
+                    "coverageStatus": row.coverage_status,
+                    "linkedExistingTests": row.linked_existing_tests,
+                    "linkedMissingTest": row.linked_missing_test,
+                    "priority": row.priority,
+                    "notes": row.notes,
+                }
+                for row in (view_model.ac_traceability or [])
+            ],
+            "missingTests": [
+                {
+                    "readableId": mt.readable_id,
+                    "requirementTitle": mt.requirement_title,
+                    "suggestedTestObjective": mt.suggested_test_objective,
+                    "riskIfSkipped": mt.risk_if_skipped,
+                }
+                for mt in (view_model.missing_tests or [])
+            ],
+        }
+        run.requirement_evidence_snapshot_json = json.dumps(snapshot)
+        if commit:
+            db.commit()
+        else:
+            db.flush()
+        return True
+    except Exception as exc:
+        import logging
+        logger = logging.getLogger("veriscope.recommendation")
+        logger.exception(f"Failed to persist evidence graph snapshot for run {run.id}: {exc}")
+        return False
+
+
+def _build_ac_traceability_snapshot(
+    acs: List[AcceptanceCriterion],
+    mapping_res: Optional[Dict[str, Any]],
+    pr_head_sha: Optional[str]
+) -> List[Dict[str, Any]]:
+    """Build the AC traceability snapshot consumed by the recommendation read model."""
+    ac_statuses = (mapping_res or {}).get("ac_level_statuses", {})
+    snapshot = []
+    for ac in acs:
+        ac_id = str(ac.id)
+        status = ac_statuses.get(ac_id, "no_candidate")
+        if status in (
+            "confirmed",
+            "evidence_verified_aligned",
+            "metadata_conflict_semantic_match",
+            "suggested",
+            "accepted_gap",
+        ):
+            coverage_status = "covered"
+        elif status == "partial_support":
+            coverage_status = "partially covered"
+        else:
+            coverage_status = "missing"
+        snapshot.append({
+            "ac_id": ac_id,
+            "stable_ac_key": getattr(ac, "stable_ac_key", None),
+            "ac_title": getattr(ac, "title", None) or getattr(ac, "text", ""),
+            "mapping_status": status,
+            "coverageStatus": coverage_status,
+            "pr_head_sha": pr_head_sha,
+        })
+    return snapshot
+
+
+def _build_readiness_input_summary(
+    db: Session,
+    run: RecommendationRun,
+    pr,
+    mapping_res: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Derive the normalized readiness input summary displayed on the recommendation page."""
+    summary = {
+        "accepted_acs": 0,
+        "trusted_ac_coverage": 0,
+        "auto_trusted": 0,
+        "review_required": 0,
+        "current_pr_tests_passed": 0,
+        "current_pr_tests_failed": 0,
+        "current_pr_tests_skipped": 0,
+        "coverage_current": False,
+        "changed_source_files_covered": 0,
+        "changed_source_files_total": 0,
+    }
+
+    if mapping_res and "mapping_summary" in mapping_res:
+        ms = mapping_res["mapping_summary"]
+        summary["accepted_acs"] = ms.get("total_acs", 0)
+        summary["trusted_ac_coverage"] = (
+            ms.get("user_confirmed", 0)
+            + ms.get("evidence_verified_aligned", 0)
+            + ms.get("metadata_conflict_semantic_match", 0)
+        )
+        summary["auto_trusted"] = (
+            ms.get("evidence_verified_aligned", 0)
+            + ms.get("metadata_conflict_semantic_match", 0)
+            + ms.get("suggested", 0)
+        )
+        summary["review_required"] = (
+            ms.get("partial_support", 0)
+            + ms.get("no_candidate", 0)
+            + ms.get("rejected", 0)
+        )
+
+    # Derive current PR test counts from actual TestResult rows. TestRun metadata
+    # counters can be stale or inconsistent with the granular result set, so the
+    # row counts are the authoritative source of truth for the readiness summary.
+    if pr:
+        result_counts = _latest_pr_test_run_result_counts(db, run, pr)
+        summary["current_pr_tests_passed"] = result_counts["passed"]
+        summary["current_pr_tests_failed"] = result_counts["failed"]
+        summary["current_pr_tests_skipped"] = result_counts["skipped"]
+
+    if run.coverage_report_id and pr:
+        cr = db.query(CoverageReport).filter(CoverageReport.id == run.coverage_report_id).first()
+        if cr and cr.commit_sha == pr.head_commit_sha:
+            summary["coverage_current"] = True
+
+    changed_files_snapshot = run.changed_files_snapshot_json or []
+    source_changed_files = [
+        f for f in changed_files_snapshot
+        if not (f.get("file_path") or "").lower().endswith(
+            (".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".lock")
+        )
+    ]
+    covered_paths = set()
+    if run.coverage_report_id:
+        cr = db.query(CoverageReport).filter(CoverageReport.id == run.coverage_report_id).first()
+        if cr:
+            entries = cr.file_entries if hasattr(cr, "file_entries") and cr.file_entries else []
+            if not entries:
+                entries = db.query(CoverageFileEntry).filter(
+                    CoverageFileEntry.coverage_report_id == cr.id
+                ).all()
+            for e in entries:
+                fp = getattr(e, "file_path", None)
+                if fp:
+                    covered_paths.add(fp)
+
+    summary["changed_source_files_total"] = len(source_changed_files)
+    summary["changed_source_files_covered"] = sum(
+        1 for f in source_changed_files
+        if (f.get("file_path") or "") in covered_paths
+    )
+    return summary
+
+
+def _latest_pr_test_run_result_counts(db: Session, run: RecommendationRun, pr) -> Dict[str, int]:
+    """Return passed/failed/skipped counts from the granular TestResult rows
+    of the most recent PR test run. This is the authoritative source because
+    TestRun metadata counters can be inconsistent with the actual result set.
+    """
+    counts = {"passed": 0, "failed": 0, "skipped": 0}
+    if not pr:
+        return counts
+    latest_run = db.query(TestRun).filter(
+        TestRun.repository_id == run.repository_id,
+        TestRun.pull_request_id == pr.id,
+    ).order_by(TestRun.created_at.desc()).first()
+    if not latest_run:
+        return counts
+    counts["passed"] = (
+        db.query(func.count(TestResult.id)).filter(
+            TestResult.test_run_id == latest_run.id,
+            func.lower(TestResult.status).in_(["passed", "success"]),
+        ).scalar() or 0
+    )
+    counts["failed"] = (
+        db.query(func.count(TestResult.id)).filter(
+            TestResult.test_run_id == latest_run.id,
+            func.lower(TestResult.status).in_(["failed", "failure", "error"]),
+        ).scalar() or 0
+    )
+    counts["skipped"] = (
+        db.query(func.count(TestResult.id)).filter(
+            TestResult.test_run_id == latest_run.id,
+            func.lower(TestResult.status).in_(["skipped", "skip"]),
+        ).scalar() or 0
+    )
+    return counts
+
+
+def _current_pr_passed_test_cases(db: Session, run: RecommendationRun, pr):
+    """Return test cases that passed in the most recent PR test run."""
+    if not pr:
+        return []
+    latest_run = db.query(TestRun).filter(
+        TestRun.repository_id == run.repository_id,
+        TestRun.pull_request_id == pr.id,
+    ).order_by(TestRun.created_at.desc()).first()
+    if not latest_run:
+        return []
+    passed_results = db.query(TestResult).filter(
+        TestResult.test_run_id == latest_run.id,
+        func.lower(TestResult.status).in_(["passed", "success"]),
+    ).all()
+    tcs = {
+        str(tc.id): tc
+        for tc in db.query(TestCase).filter(
+            TestCase.repository_id == run.repository_id
+        ).all()
+    }
+    out = []
+    for result in passed_results:
+        tc = tcs.get(str(getattr(result, "test_case_id", None)))
+        if not tc:
+            continue
+        parts = tc.stable_identity.split("::")
+        out.append({
+            "stable_identity": tc.stable_identity,
+            "display_name": parts[-1] if parts else tc.stable_identity,
+            "suite_name": parts[0] if len(parts) > 1 else "",
+            "test_case_id": str(tc.id),
+        })
+    return out
+
+
 from app.models.recommendation import (
     RecommendationRun,
     RecommendationTest,
@@ -93,9 +362,10 @@ from app.models.recommendation import (
     RecommendationReasoningEntry,
     RecommendationInputSnapshot,
 )
-from app.models.coverage import CoverageReport, FileTestLink
+from app.models.acceptance_criterion import AcceptanceCriterion
+from app.models.coverage import CoverageReport, FileTestLink, CoverageFileEntry
 from app.models.flaky_test import FlakyTestProfile
-from app.models.test_result import TestCase, TestResult
+from app.models.test_result import TestCase, TestResult, TestRun
 from app.models.dependency import FileDependency
 from app.schemas.recommendation import (
     RecommendationRunCreate,
@@ -163,6 +433,12 @@ class RecommendationService:
             import logging
             logger = logging.getLogger("veriscope.recommendation")
             logger.exception(f"Failed to generate ProjectContextIndex: {exc}")
+            # If the project-context persistence failed, rollback so the aborted
+            # transaction does not poison later read queries in this same session.
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
 
         # Retrieve pull request if available
         from app.models.pull_request import PullRequest
@@ -516,6 +792,12 @@ class RecommendationService:
         )
         
         # behavior_covered_by_test edges
+        # Ensure any aborted transaction from the mapping sync is not carried
+        # into the coverage read query below.
+        try:
+            self.db.rollback()
+        except Exception:
+            pass
         from app.models.behavior_scenario_coverage import BehaviorScenarioCoverage
         scenario_coverages_for_graph = self.db.query(BehaviorScenarioCoverage).filter(
             BehaviorScenarioCoverage.repository_id == run_in.repository_id
@@ -525,6 +807,21 @@ class RecommendationService:
             for bm in bb_mappings_for_graph:
                 if bm.behavior_scenario_id == sc.behavior_scenario_id:
                     for test_ident in (sc.existing_tests or []):
+                        # existing_tests is a JSONB field that may contain either string
+                        # identifiers or dict references from the coverage mapper.
+                        if isinstance(test_ident, dict):
+                            test_ident = (
+                                test_ident.get("test_identifier")
+                                or test_ident.get("stable_identity")
+                                or test_ident.get("test_name")
+                                or test_ident.get("id")
+                            )
+                        if not test_ident:
+                            logger.warning(
+                                f"Skipping unresolvable existing_tests entry in "
+                                f"behavior_scenario_coverage {sc.id}: {test_ident}"
+                            )
+                            continue
                         tc_obj = tcs_by_identity.get(test_ident)
                         if tc_obj:
                             TraceabilityGraphService.upsert_edge(
@@ -562,11 +859,17 @@ class RecommendationService:
         # Collect graph-derived candidate tests
         from app.models.acceptance_criterion import AcceptanceCriterion
         graph_candidates = set()
-        active_ac_ids = [str(ac.id) for ac in self.db.query(AcceptanceCriterion).filter(
+        active_acs = self.db.query(AcceptanceCriterion).filter(
             AcceptanceCriterion.pull_request_id == db_pr.id,
-            AcceptanceCriterion.status == "ACTIVE"
-        ).all()]
-        
+            AcceptanceCriterion.status.in_(["ACCEPTED", "NEEDS_REVIEW"])
+        ).all()
+        active_ac_ids = [str(ac.id) for ac in active_acs]
+        ac_traceability_snapshot = _build_ac_traceability_snapshot(
+            active_acs,
+            mapping_res,
+            getattr(db_pr, "head_commit_sha", None)
+        )
+
         ac_to_test_edges = TraceabilityGraphService.find_edges(
             db=self.db,
             repository_id=run_in.repository_id,
@@ -830,6 +1133,7 @@ class RecommendationService:
             import logging
             logger = logging.getLogger("veriscope.recommendation")
             logger.exception(f"Failed to execute SMEOrchestrator early in recommendation: {exc}")
+            self.db.rollback()
 
         # Get business_behavior_mappings early for both V2 and V3
         from app.models.business_behavior_mapping import BusinessBehaviorMapping
@@ -1309,14 +1613,49 @@ class RecommendationService:
         workspace = self.db.query(Workspace).filter(Workspace.id == db_repo.workspace_id).first()
         workspace_id = workspace.id if workspace else None
 
-        from app.services.recommendation_input_builder import RecommendationInputBuilder
-        input_snapshot_resp = RecommendationInputBuilder.build_snapshot(
-            db=self.db,
-            repository_id=run_in.repository_id,
-            pull_request_id=db_pr.id,
-            workspace=workspace
+        from app.services.recommendation_input_builder import (
+            RecommendationInputBuilder,
+            RecommendationInputBuilderError,
         )
-        input_snapshot_hash = input_snapshot_resp.input_snapshot_hash
+        try:
+            input_snapshot_resp = RecommendationInputBuilder.build_snapshot(
+                db=self.db,
+                repository_id=run_in.repository_id,
+                pull_request_id=db_pr.id,
+                workspace=workspace
+            )
+            input_snapshot_hash = input_snapshot_resp.input_snapshot_hash
+        except RecommendationInputBuilderError as rib_err:
+            self.db.rollback()
+            logger.exception(
+                f"RecommendationInputBuilder failed for repo {run_in.repository_id} "
+                f"pr {db_pr.id}: stage={rib_err.stage}, request_id={rib_err.request_id}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "error_code": "RECOMMENDATION_INPUT_BUILD_FAILED",
+                    "message": "VeriScope could not build recommendation inputs. Check backend logs with the provided request ID.",
+                    "stage": rib_err.stage,
+                    "request_id": rib_err.request_id,
+                    "can_retry": True,
+                },
+            ) from rib_err
+        except SQLAlchemyError as sa_err:
+            self.db.rollback()
+            logger.exception(
+                f"SQLAlchemy error during recommendation input build for repo "
+                f"{run_in.repository_id} pr {db_pr.id}: {sa_err}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "error_code": "RECOMMENDATION_INPUT_BUILD_FAILED",
+                    "message": "VeriScope could not build recommendation inputs. Check backend logs for the request ID.",
+                    "stage": "input_builder",
+                    "can_retry": True,
+                },
+            ) from sa_err
 
         # Extract manually pasted AC from input snapshot if available
         manual_ac_override = input_snapshot_resp.business_intent_override
@@ -2267,6 +2606,14 @@ class RecommendationService:
             acceptance_criteria_snapshot_json=_serialize_datetime(acceptance_criteria_snapshot),
             stable_ac_keys_snapshot_json=_serialize_datetime(stable_ac_keys_snapshot),
             requirement_package_ready_at_generation=requirement_package_ready,
+            # AC-Test mapping traceability snapshots
+            ac_traceability_snapshot_json=_serialize_datetime(ac_traceability_snapshot),
+            execution_mapping_snapshot_json=_serialize_datetime(
+                (mapping_res or {}).get("execution_summary")
+            ),
+            missing_test_mapping_snapshot_json=_serialize_datetime(
+                (mapping_res or {}).get("unmapped_ac_list")
+            ),
             # Input 3 (Behavior Mapping) snapshot fields
             product_behavior_map_snapshot_json=_serialize_datetime(input_snapshot_resp.behaviors),
             behavior_areas_snapshot_json=_serialize_datetime(input_snapshot_resp.journeys),
@@ -2289,6 +2636,24 @@ class RecommendationService:
             test_inventory_status_at_generation=test_inventory_status,
         )
         self.repo.create_run(db_run)
+
+        # Persist normalized readiness input summary for the recommendation page.
+        # Prefer the authoritative snapshot built by RecommendationInputBuilder,
+        # which already uses the same granular TestResult / CoverageReport sources
+        # as the readiness cards.
+        normalized_readiness = (
+            input_snapshot_resp.readiness_input_summary
+            if input_snapshot_resp and getattr(input_snapshot_resp, "readiness_input_summary", None)
+            else None
+        )
+        if not normalized_readiness:
+            normalized_readiness = _build_readiness_input_summary(
+                self.db, db_run, db_pr, mapping_res
+            )
+        db_run.evidence_summary_at_generation = {
+            **(db_run.evidence_summary_at_generation or {}),
+            "readiness_input_summary": normalized_readiness,
+        }
 
         logger.info(
             "[RECOMMENDATION_GENERATION_OUTPUT] run_id=%s head_commit_sha_at_generation=%s "
@@ -2764,7 +3129,7 @@ class RecommendationService:
         from app.models.acceptance_criterion import AcceptanceCriterion
         ac_list = self.db.query(AcceptanceCriterion).filter(
             AcceptanceCriterion.pull_request_id == db_pr.id,
-            AcceptanceCriterion.status == "ACTIVE"
+            AcceptanceCriterion.status.in_(["ACCEPTED", "NEEDS_REVIEW"])
         ).all()
         for ac in sorted(ac_list, key=lambda x: str(x.id)):
             acceptance_criteria_snapshot.append({
@@ -2857,6 +3222,16 @@ class RecommendationService:
             created_at=datetime.utcnow()
         )
         self.db.add(db_snapshot)
+
+        # 16a. Persist Requirement Evidence Graph Snapshot for downstream regression scope.
+        _persist_evidence_graph_snapshot(
+            db=self.db,
+            run=db_run,
+            pr=db_pr,
+            changed_files=changed_files,
+            repository_id=run_in.repository_id,
+            commit=False,
+        )
 
         # 16b. Persist FragilitySnapshot (Refined deterministic snapshots)
         from app.models.fragility_pattern import FragilitySnapshot, FragilityPattern

@@ -64,6 +64,157 @@ class RegressionScopeV2Service:
     MANUAL_TEST_DEFAULT_MINUTES = 10
 
     @staticmethod
+    def _build_regression_scope_v2(
+        run: RecommendationRun,
+        mode: ScopeMode,
+        items: List[ScopeItem],
+        diagnostics_data: Dict[str, Any],
+        include_diagnostics: bool,
+        traceability_summary=None,
+        release_decision=None,
+        recommendations=None,
+        evidence_items=None,
+    ) -> RegressionScopeV2:
+        """Build a schema-valid RegressionScopeV2 from bucketed scope items."""
+        import hashlib
+        import json
+
+        group_map: Dict[ScopeGroup, List[ScopeItem]] = {}
+        for item in items:
+            group_map.setdefault(item.group, []).append(item)
+
+        groups: Dict[str, ScopeGroupSummary] = {}
+        for group, group_items in group_map.items():
+            groups[group.value] = ScopeGroupSummary(
+                group=group,
+                count=len(group_items),
+                items=group_items,
+            )
+
+        required_items = group_map.get(ScopeGroup.REQUIRED, [])
+        review_items = group_map.get(ScopeGroup.REVIEW_NEEDED, [])
+        recommended_items = group_map.get(ScopeGroup.RECOMMENDED, [])
+        optional_items = group_map.get(ScopeGroup.OPTIONAL, [])
+        already_verified_items = group_map.get(ScopeGroup.EXCLUDED_ALREADY_VERIFIED, [])
+        already_passed_items = group_map.get(ScopeGroup.EXCLUDED_ALREADY_PASSED_TESTS, [])
+        safe_to_skip_items = group_map.get(ScopeGroup.SAFE_TO_SKIP, [])
+
+        total_executable = (
+            len(required_items)
+            + len(recommended_items)
+            + len(optional_items)
+            + len(review_items)
+        )
+        total_items = len(items) if items else 0
+
+        execution_plan = ExecutionPlan(
+            required_count=len(required_items),
+            recommended_count=len(recommended_items),
+            optional_count=len(optional_items),
+            safe_to_skip_count=len(safe_to_skip_items),
+            review_needed_count=len(review_items),
+            deferred_coverage_debt_count=len(group_map.get(ScopeGroup.DEFERRED_COVERAGE_DEBT, [])),
+            total_executable_count=total_executable,
+            estimated_execution_reduction=0.0 if total_items == 0 else (len(safe_to_skip_items) / total_items * 100),
+            confidence_level=0.0,
+            plan_summary=(
+                f"{len(required_items)} required, {len(recommended_items)} recommended, "
+                f"{len(review_items)} review needed, {len(safe_to_skip_items)} safe to skip"
+            ),
+            advisory_notice="Scope generated from evidence graph and structural impact analysis.",
+        )
+
+        exclusions = ScopeExclusions(
+            already_verified_count=len(already_verified_items),
+            already_passed_tests_count=len(already_passed_items),
+            already_verified_items=already_verified_items,
+            already_passed_test_items=already_passed_items,
+        )
+
+        optimization_metrics = ScopeOptimizationMetrics(
+            current_regression_size=total_items,
+            optimized_required_count=len(required_items),
+            optimized_recommended_count=len(recommended_items),
+            optimized_optional_count=len(optional_items),
+            safe_to_skip_count=len(safe_to_skip_items),
+            optimization_percentage=0.0,
+            execution_reduction=execution_plan.estimated_execution_reduction,
+            coverage_confidence=0.0,
+        )
+
+        governance = ScopeGovernance(
+            risk_reviews_count=0,
+            overridden_count=0,
+            needs_discussion_count=len(review_items),
+            release_decision_required=(len(required_items) > 0 or len(review_items) > 0),
+            release_decision_status=release_decision.verdict if release_decision else None,
+        )
+
+        diagnostics = ScopeDiagnostics(
+            generation_timestamp=datetime.utcnow(),
+            generation_duration_ms=None,
+            rules_applied=["STRUCTURAL_FIRST"],
+            warnings=[],
+            errors=[],
+            change_impact_diagnostics=diagnostics_data if include_diagnostics else None,
+        )
+
+        payload = {
+            "run_id": str(run.id),
+            "mode": mode.value,
+            "items": [item.model_dump() for item in items],
+        }
+        snapshot_hash = hashlib.md5(
+            json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+
+        return RegressionScopeV2(
+            recommendation_run_id=str(run.id),
+            snapshot_hash=snapshot_hash,
+            generated_at=datetime.utcnow(),
+            scope_type=mode.value.upper(),
+            source=ScopeSource.EVIDENCE_BASED,
+            summary=(
+                f"Regression scope contains {len(required_items)} required, "
+                f"{len(recommended_items)} recommended, {len(review_items)} review needed items."
+            ),
+            execution_plan=execution_plan,
+            groups=groups,
+            exclusions=exclusions,
+            optimization_metrics=optimization_metrics,
+            governance=governance,
+            diagnostics=diagnostics,
+            traceability_summary=traceability_summary,
+            release_decision=release_decision,
+            recommendations=recommendations or [],
+            evidence_items=evidence_items or [],
+        )
+
+    @staticmethod
+    def _blocked_regression_scope_v2(
+        run: RecommendationRun,
+        mode: ScopeMode,
+        reason: str,
+        blockers: List[str],
+        include_diagnostics: bool,
+    ) -> RegressionScopeV2:
+        """Return a schema-valid RegressionScopeV2 when the PR package cannot support confident scope."""
+        diagnostics_data = {
+            "pr_package_ready": False,
+            "pr_package_blockers": blockers,
+            "can_generate_confident_regression_plan": False,
+            "reason": reason,
+            "fallback_mode": "FULL_SUITE",
+        }
+        return RegressionScopeV2Service._build_regression_scope_v2(
+            run=run,
+            mode=mode,
+            items=[],
+            diagnostics_data=diagnostics_data,
+            include_diagnostics=include_diagnostics,
+        )
+
+    @staticmethod
     def _create_scope_items_from_structural_impact(
         structural_result,
         pr,
@@ -217,7 +368,8 @@ class RegressionScopeV2Service:
                 test_references=[],
                 can_auto_execute=False,
                 execution_status="NOT_RUN",
-                estimated_effort=10,  # Manual test default
+                estimated_effort=f"{RegressionScopeV2Service.MANUAL_TEST_DEFAULT_MINUTES} min",
+                estimated_effort_minutes=RegressionScopeV2Service.MANUAL_TEST_DEFAULT_MINUTES,
                 is_required_for_release=False,
                 is_manual_only=True,
                 release_action=ReleaseAction.MANUAL_REVIEW,
@@ -428,29 +580,27 @@ class RegressionScopeV2Service:
         already_verified_items = [item for item in filtered_items if item.group == ScopeGroup.EXCLUDED_ALREADY_VERIFIED]
         safe_to_skip_items = [item for item in filtered_items if item.group == ScopeGroup.SAFE_TO_SKIP] if include_safe_to_skip else []
         
-        # Build scope
-        scope = RegressionScopeV2(
-            scope_id=str(run.id),
-            scope_type=mode.value.upper(),
-            generated_at=datetime.utcnow(),
-            total_items=len(filtered_items),
-            required_count=len(required_items),
-            recommended_count=len(recommended_items),
-            safe_to_skip_count=len(safe_to_skip_items),
-            excluded_count=len(already_verified_items),
-            items=required_items + review_needed_items + recommended_items + optional_items + already_verified_items + safe_to_skip_items,
-            diagnostics={
-                "structural_impact_used": structural_result is not None,
-                "structural_test_count": len(structural_result.structurally_impacted_tests) if structural_result else 0,
-                "coverage_level": structural_result.coverage_level if structural_result else None,
-                "unmapped_impacted_files": structural_result.unmapped_impacted_files if structural_result else [],
-                "selection_confidence": structural_result.selection_confidence if structural_result else None,
-            } if include_diagnostics else None
-        )
-        
+        # Build raw ordered items and diagnostics for the final schema-valid scope.
+        # Keep all bucketed items in the returned scope; mode filtering is reflected
+        # in the execution plan and summary counts, not by dropping items.
+        ordered_items = all_scope_items
+        diagnostics = {
+            "structural_impact_used": structural_result is not None,
+            "structural_test_count": len(structural_result.structurally_impacted_tests) if structural_result else 0,
+            "coverage_level": structural_result.coverage_level if structural_result else None,
+            "unmapped_impacted_files": structural_result.unmapped_impacted_files if structural_result else [],
+            "selection_confidence": structural_result.selection_confidence if structural_result else None,
+        }
+
         logger.info(f"Generated structural-first scope: {len(required_items)} required, {len(review_needed_items)} review needed, {len(already_verified_items)} already verified")
-        
-        return scope
+
+        return RegressionScopeV2Service._build_regression_scope_v2(
+            run=run,
+            mode=mode,
+            items=ordered_items,
+            diagnostics_data=diagnostics,
+            include_diagnostics=include_diagnostics,
+        )
 
     @staticmethod
     def generate_scope_v2(
@@ -474,6 +624,7 @@ class RegressionScopeV2Service:
         Returns:
             RegressionScopeV2: Unified regression scope
         """
+        import json
         import uuid
         if isinstance(run_id, str):
             try:
@@ -512,42 +663,42 @@ class RegressionScopeV2Service:
             pr_package_ready = False
             pr_package_blockers.append("HEAD_SHA_MISSING")
         
-        # Check changed_files_count > 0
-        if not pr.changed_files_count or pr.changed_files_count == 0:
+        # Check changed_files_count > 0 or use the snapshot as fallback.
+        snapshot_changed_files = []
+        if run.requirement_evidence_snapshot_json:
+            raw = run.requirement_evidence_snapshot_json
+            if isinstance(raw, str):
+                try:
+                    import json
+                    raw = json.loads(raw)
+                except Exception:
+                    raw = {}
+            snapshot_changed_files = raw.get("changedFiles") or []
+        if not snapshot_changed_files and run.changed_files_snapshot_json:
+            snapshot_changed_files = run.changed_files_snapshot_json or []
+
+        if (not pr.changed_files_count or pr.changed_files_count == 0) and not snapshot_changed_files:
             pr_package_ready = False
             pr_package_blockers.append("CHANGED_FILES_MISSING")
         
-        # Check PullRequestChangedFile records exist
+        # Check PullRequestChangedFile records exist (snapshot changed files satisfy the package)
         from app.models.pull_request import PullRequestChangedFile
         changed_file_count = db.query(PullRequestChangedFile).filter(
             PullRequestChangedFile.pull_request_id == pr.id
         ).count()
-        if changed_file_count == 0:
+        if changed_file_count == 0 and not snapshot_changed_files:
             pr_package_ready = False
             pr_package_blockers.append("CHANGED_FILES_DB_MISSING")
         
         # Block confident targeted/risk-based regression if PR package not ready
         if not pr_package_ready and mode in (ScopeMode.TARGETED, ScopeMode.RISK_BASED):
-            # Return a blocked response
-            blocked_scope = RegressionScopeV2(
-                scope_id=str(run_id),
-                scope_type=mode.value.upper(),
-                generated_at=datetime.utcnow(),
-                total_items=0,
-                required_count=0,
-                recommended_count=0,
-                safe_to_skip_count=0,
-                excluded_count=0,
-                items=[],
-                diagnostics={
-                    "pr_package_ready": False,
-                    "pr_package_blockers": pr_package_blockers,
-                    "can_generate_confident_regression_plan": False,
-                    "reason": "PR package is incomplete. Changed files/head SHA are required for confident targeted/risk-based regression.",
-                    "fallback_mode": "FULL_SUITE"
-                } if include_diagnostics else None
+            return RegressionScopeV2Service._blocked_regression_scope_v2(
+                run=run,
+                mode=mode,
+                reason="PR package is incomplete. Changed files/head SHA are required for confident targeted/risk-based regression.",
+                blockers=pr_package_blockers,
+                include_diagnostics=include_diagnostics,
             )
-            return blocked_scope
 
         # Get acceptance criteria
         # First try to get ACs for this specific PR
@@ -584,11 +735,83 @@ class RegressionScopeV2Service:
                 AcceptanceCriterion.repository_id == run.repository_id
             ).all()
 
-        # Get evidence graph snapshot
+        # Get evidence graph snapshot - fall back to the recommendation input snapshot if missing.
         if not run.requirement_evidence_snapshot_json:
-            raise ValueError(f"Evidence graph snapshot not available for run {run_id}")
+            if not run.input_snapshot:
+                raise ValueError(
+                    f"Evidence graph snapshot not available for run {run_id} and no recommendation input snapshot exists for fallback."
+                )
 
-        import json
+            try:
+                from app.services.evidence_graph.requirement_evidence_graph_service import RequirementEvidenceGraphService
+
+                logger.info(f"[ScopeGen] Evidence graph snapshot missing for run {run_id}; building from input snapshot.")
+                changed_files_for_graph = []
+                if run.input_snapshot.changed_files:
+                    changed_files_for_graph = run.input_snapshot.changed_files
+                elif run.changed_files_snapshot_json:
+                    changed_files_for_graph = [
+                        f.get("file_path") for f in run.changed_files_snapshot_json
+                        if f.get("file_path")
+                    ]
+
+                graph_service = RequirementEvidenceGraphService(db)
+                view_model = graph_service.build_evidence_graph(
+                    repository_id=str(run.repository_id),
+                    pull_request_id=str(pr.id),
+                    head_sha=pr.head_commit_sha,
+                    changed_files=changed_files_for_graph,
+                    pr_description=None,
+                    recommendation_run_id=str(run.id),
+                    canonical_ac_rows=ac_rows,
+                )
+                graph_service.persist_graph_snapshot(str(run.id), view_model)
+                # Refresh run so the persisted snapshot is visible in this session.
+                db.refresh(run)
+
+                # Defensive direct persistence for SQLite/UUID binding edge cases.
+                if not run.requirement_evidence_snapshot_json:
+                    snapshot = {
+                        "health": view_model.health,
+                        "counts": view_model.counts,
+                        "decisionCopy": {
+                            "headline": view_model.decision_copy.headline,
+                            "explanation": view_model.decision_copy.explanation,
+                            "nextAction": view_model.decision_copy.next_action,
+                        },
+                        "acTraceability": [
+                            {
+                                "requirementId": row.requirement_id,
+                                "readableId": row.readable_id,
+                                "title": row.title,
+                                "fullText": row.full_text,
+                                "coverageStatus": row.coverage_status,
+                                "linkedExistingTests": row.linked_existing_tests,
+                                "linkedMissingTest": row.linked_missing_test,
+                                "priority": row.priority,
+                                "notes": row.notes,
+                            }
+                            for row in (view_model.ac_traceability or [])
+                        ],
+                        "missingTests": [
+                            {
+                                "readableId": mt.readable_id,
+                                "requirementTitle": mt.requirement_title,
+                                "suggestedTestObjective": mt.suggested_test_objective,
+                                "riskIfSkipped": mt.risk_if_skipped,
+                            }
+                            for mt in (view_model.missing_tests or [])
+                        ],
+                    }
+                    run.requirement_evidence_snapshot_json = json.dumps(snapshot)
+                    db.commit()
+                    db.refresh(run)
+            except Exception as exc:
+                logger.error(f"[ScopeGen] Failed to build evidence graph snapshot fallback for run {run_id}: {exc}")
+                raise ValueError(
+                    f"Evidence graph snapshot not available for run {run_id} and could not be rebuilt: {exc}"
+                )
+
         raw_snapshot = run.requirement_evidence_snapshot_json
         # JSONB columns are already deserialized by SQLAlchemy; only call json.loads on strings
         if isinstance(raw_snapshot, str):
@@ -603,7 +826,7 @@ class RegressionScopeV2Service:
         # Generate scope based on structural impact as primary core
         # Structural impact produces base candidates, then AC/risk overlays add context
         scope = RegressionScopeV2Service._generate_structural_first_scope(
-            run, pr, ac_rows, snapshot_data, structural_result, 
+            run, pr, ac_rows, snapshot_data, structural_result,
             include_safe_to_skip, audit, db=db, include_diagnostics=include_diagnostics, mode=mode
         )
 
@@ -758,8 +981,66 @@ class RegressionScopeV2Service:
             risk_gaps = GapAnalyzer.analyze_risk_heuristics(impacted_flows, existing_test_names, change_summaries)
             
             recommendations = deduplicate(req_gaps + cov_gaps + risk_gaps, existing_test_names)
+
+            # ── Filter out recommendations for already-verified requirements ──
+            # A verified AC must never appear in Test Gaps. Build a set of
+            # verified requirement identifiers from the scope groups that
+            # represent verified/passed/safe-to-skip items.
+            verified_ids: set = set()
+            verified_readable_ids: set = set()
+            verified_titles_normalized: set = set()
+            for group_key in (
+                ScopeGroup.EXCLUDED_ALREADY_VERIFIED.value,
+                ScopeGroup.SAFE_TO_SKIP.value,
+                ScopeGroup.EXCLUDED_ALREADY_PASSED_TESTS.value,
+            ):
+                group_data = scope.groups.get(group_key)
+                if not group_data or not group_data.items:
+                    continue
+                for item in group_data.items:
+                    if item.id:
+                        verified_ids.add(str(item.id))
+                    if item.readable_id:
+                        verified_readable_ids.add(str(item.readable_id).strip().upper())
+                    if item.source_ac_number is not None:
+                        verified_readable_ids.add(f"AC-{item.source_ac_number}")
+                    if item.title:
+                        verified_titles_normalized.add(
+                            item.title.strip().lower()
+                        )
+
+            def _is_verified(rec) -> bool:
+                """Check if a recommendation corresponds to a verified AC."""
+                # 1. Direct ID match
+                linked_req_id = getattr(rec, 'linked_requirement_id', None)
+                if linked_req_id and str(linked_req_id) in verified_ids:
+                    return True
+
+                # 2. Readable ID match (e.g. "AC-01" in title or linked_requirement_id)
+                rec_title = getattr(rec, 'title', '') or ''
+                rec_title_upper = rec_title.strip().upper()
+                for rid in verified_readable_ids:
+                    if rid and rid in rec_title_upper:
+                        return True
+
+                # 3. Normalized title overlap (exact match on lowercased text)
+                rec_title_lower = rec_title.strip().lower()
+                if rec_title_lower in verified_titles_normalized:
+                    return True
+
+                return False
+
+            pre_filter_count = len(recommendations)
+            recommendations = [r for r in recommendations if not _is_verified(r)]
+            filtered_count = pre_filter_count - len(recommendations)
+            if filtered_count > 0:
+                logger.info(
+                    f"[Phase8] Filtered {filtered_count} recommendation(s) "
+                    f"that correspond to already-verified ACs"
+                )
+
             recommendations = recommendations[:15]
-            
+
             # Update release decision reason to include recommendation count
             if recommendations:
                 current_reason = release_decision.reason
@@ -2422,6 +2703,7 @@ class RegressionScopeV2Service:
             can_auto_execute=False,
             execution_status=outcome or "NOT_EXECUTED",
             estimated_effort=f"{RegressionScopeV2Service.MANUAL_TEST_DEFAULT_MINUTES} min (manual_test_default)",
+            estimated_effort_minutes=RegressionScopeV2Service.MANUAL_TEST_DEFAULT_MINUTES,
             is_required_for_release=(group == ScopeGroup.REQUIRED),
             is_manual_only=True,
             provider=provider,
@@ -2993,7 +3275,7 @@ class RegressionScopeV2Service:
                 ).all()
                 covered_files = {l.file_path for l in covered_links}
                 
-                exec_status, freshness, reason = (
+                exec_status, freshness, mapping_status, latest_at, reason = (
                     RegressionScopeV2Service
                     ._get_execution_status_for_test_cases(
                         tc_ids, pr, db
@@ -3002,6 +3284,8 @@ class RegressionScopeV2Service:
                 return {
                     'execution_status': exec_status,
                     'freshness_status': freshness,
+                    'mapping_status': mapping_status,
+                    'latest_at': latest_at,
                     'freshness_reason': reason,
                     'test_case_ids': tc_ids,
                     'covered_file_paths': covered_files,
@@ -3346,44 +3630,104 @@ class RegressionScopeV2Service:
         
         return scope
 
+    # Status → bucket mapping for traceability summary
+    _TRACEABILITY_STATUS_BUCKETS: Dict[str, str] = {
+        # --- covered ---
+        "COVERED": "covered",
+        "VERIFIED": "covered",
+        "VERIFIED_BY_CURRENT_PR_EXECUTION": "covered",
+        "USER_CONFIRMED": "covered",
+        "AUTO_TRUSTED": "covered",
+        "EVIDENCE_VERIFIED_ALIGNED": "covered",
+        "Covered": "covered",
+        "Already Verified": "covered",
+        "Safe to Skip": "covered",
+        # --- missing ---
+        "MISSING": "missing",
+        "NO_CANDIDATE": "missing",
+        "TEST_GAP": "missing",
+        "Required": "missing",
+        "Coverage Gap": "missing",
+        "Not Run": "missing",
+        # --- not_mapped ---
+        "NOT_MAPPED_TRACEABILITY_RISK": "not_mapped",
+        "TRACEABILITY_INCOMPLETE": "not_mapped",
+        # --- review_required ---
+        "PARTIAL": "review_required",
+        "PARTIAL_SUPPORT": "review_required",
+        "METADATA_CONFLICT_SEMANTIC_MATCH": "review_required",
+        "REVIEW_REQUIRED": "review_required",
+        "Review Needed": "review_required",
+        "Coverage Recommendation": "review_required",
+        "Mapping Recommendation": "review_required",
+        "Failed": "review_required",
+        "Skipped": "review_required",
+        "Deferred": "review_required",
+        "Optional": "review_required",
+    }
+
     @staticmethod
     def _build_traceability_summary(traceability: List[Dict[str, Any]]) -> TraceabilitySummary:
         """Build traceability summary from evidence graph snapshot.
-        
+
+        Normalizes all known evidence graph coverage statuses (both display
+        strings and enum-like values) into four mutually-exclusive buckets:
+        covered, missing, not_mapped, review_required.
+
+        Unknown statuses are counted as review_required and collected for
+        diagnostics.
+
         Args:
             traceability: List of AC traceability entries from the snapshot
-            
+
         Returns:
-            TraceabilitySummary with counts for covered, missing, not_mapped, partial
+            TraceabilitySummary with counts and unknown_statuses list
         """
         total = len(traceability)
         covered = 0
         missing = 0
         not_mapped = 0
-        partial = 0
-        
+        review_required = 0
+        unknown_statuses: List[str] = []
+
         for trace in traceability:
             coverage_status = trace.get("coverageStatus", "MISSING")
             database_ac_id = trace.get("databaseAcId")
-            
-            # Count not_mapped (no database_ac_id)
-            if not database_ac_id:
-                not_mapped += 1
-            
-            # Count by coverage status
-            if coverage_status == "COVERED":
+
+            bucket = RegressionScopeV2Service._TRACEABILITY_STATUS_BUCKETS.get(coverage_status)
+
+            if bucket is None:
+                if coverage_status == "Evidence Gap":
+                    # "Evidence Gap" is ambiguous — it can be either
+                    # MISSING_AUTOMATED_COVERAGE or NOT_MAPPED_TRACEABILITY_RISK.
+                    # Use databaseAcId to disambiguate.
+                    bucket = "not_mapped" if not database_ac_id else "missing"
+                else:
+                    # Unknown status → review_required (rule 2)
+                    bucket = "review_required"
+                    if coverage_status not in unknown_statuses:
+                        unknown_statuses.append(coverage_status)
+                        logger.warning(
+                            f"[TraceabilitySummary] Unknown coverageStatus "
+                            f"'{coverage_status}' counted as review_required"
+                        )
+
+            if bucket == "covered":
                 covered += 1
-            elif coverage_status == "MISSING":
+            elif bucket == "missing":
                 missing += 1
-            elif coverage_status == "PARTIAL":
-                partial += 1
-        
+            elif bucket == "not_mapped":
+                not_mapped += 1
+            elif bucket == "review_required":
+                review_required += 1
+
         return TraceabilitySummary(
             total_requirements=total,
             covered=covered,
             missing=missing,
             not_mapped=not_mapped,
-            partial=partial
+            review_required=review_required,
+            unknown_statuses=unknown_statuses,
         )
     
     @staticmethod

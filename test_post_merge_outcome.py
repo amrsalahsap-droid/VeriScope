@@ -30,7 +30,7 @@ def test_post_merge_outcome():
     print("\n[2] Defect Escaped Field")
     print("-" * 70)
     
-    with open(component_path, "r") as f:
+    with open(component_path, "r", encoding="utf-8") as f:
         content = f.read()
         
         if "defectEscaped" in content or "defect_escaped" in content:
@@ -49,7 +49,7 @@ def test_post_merge_outcome():
     print("\n[3] Rollback Occurred Field")
     print("-" * 70)
     
-    with open(component_path, "r") as f:
+    with open(component_path, "r", encoding="utf-8") as f:
         content = f.read()
         
         if "rollbackOccurred" in content or "rollback_occurred" in content:
@@ -68,7 +68,7 @@ def test_post_merge_outcome():
     print("\n[4] Incident URL Field")
     print("-" * 70)
     
-    with open(component_path, "r") as f:
+    with open(component_path, "r", encoding="utf-8") as f:
         content = f.read()
         
         if "incidentUrl" in content or "production_incident_url" in content:
@@ -87,7 +87,7 @@ def test_post_merge_outcome():
     print("\n[5] Notes Field")
     print("-" * 70)
     
-    with open(component_path, "r") as f:
+    with open(component_path, "r", encoding="utf-8") as f:
         content = f.read()
         
         if "notes" in content or "feedback_comment" in content:
@@ -106,7 +106,7 @@ def test_post_merge_outcome():
     print("\n[6] API Integration")
     print("-" * 70)
     
-    with open(component_path, "r") as f:
+    with open(component_path, "r", encoding="utf-8") as f:
         content = f.read()
         
         if "/outcome" in content:
@@ -126,7 +126,7 @@ def test_post_merge_outcome():
     print("-" * 70)
     
     page_path = "landing-page/app/app/recommendations/[recommendationRunId]/page.tsx"
-    with open(page_path, "r") as f:
+    with open(page_path, "r", encoding="utf-8") as f:
         content = f.read()
         
         if "PostMergeOutcome" in content:
@@ -139,7 +139,7 @@ def test_post_merge_outcome():
     print("\n[8] Outcome State")
     print("-" * 70)
     
-    with open(page_path, "r") as f:
+    with open(page_path, "r", encoding="utf-8") as f:
         content = f.read()
         
         if "defect_escaped" in content:
@@ -164,7 +164,7 @@ def test_post_merge_outcome():
     print("\n[9] Optional Fields")
     print("-" * 70)
     
-    with open(component_path, "r") as f:
+    with open(component_path, "r", encoding="utf-8") as f:
         content = f.read()
         
         if "optional" in content.lower():
@@ -177,7 +177,7 @@ def test_post_merge_outcome():
     print("\n[10] Toast Notifications")
     print("-" * 70)
     
-    with open(component_path, "r") as f:
+    with open(component_path, "r", encoding="utf-8") as f:
         content = f.read()
         
         if "toast.success" in content:

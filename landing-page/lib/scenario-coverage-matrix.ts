@@ -128,6 +128,32 @@ export interface MatrixGenerationInput {
   impactedAreas: string[];
 }
 
+/**
+ * Deterministic, stable identity key for a ScenarioCoverageMatrix row.
+ *
+ * Uses only fields that exist on the interface: impactedArea, testingType,
+ * requiredScenario, scenarioType, primaryTriggerFile.
+ * primaryTriggerFile disambiguates scenarios that share the same
+ * requiredScenario text across different template sets (e.g. "expired token
+ * rejected" in both AUTH_SECURITY and PASSWORD_RESET templates).
+ */
+export function getScenarioMatrixKey(scenario: {
+  impactedArea: string;
+  testingType: string;
+  requiredScenario: string;
+  scenarioType?: string;
+  primaryTriggerFile?: string;
+}): string {
+  const parts = [
+    scenario.impactedArea || "",
+    scenario.testingType || "",
+    scenario.requiredScenario || "",
+    scenario.scenarioType || "",
+    scenario.primaryTriggerFile || "",
+  ];
+  return parts.map(p => p.toLowerCase().trim()).join("|");
+}
+
 // ── Scenario Coverage Matrix Types ────────────────────────────────────────────────
 
 export interface ScenarioCoverageMatrix {

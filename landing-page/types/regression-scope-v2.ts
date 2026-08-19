@@ -86,6 +86,7 @@ export interface ScopeItem {
   can_auto_execute: boolean;
   execution_status?: string;
   estimated_effort?: string;
+  estimated_effort_minutes?: number;
   is_required_for_release: boolean;
   is_manual_only: boolean;
   provider?: string;
@@ -210,7 +211,8 @@ export interface TraceabilitySummary {
   covered: number;
   missing: number;
   not_mapped: number;
-  partial: number;
+  review_required: number;
+  unknown_statuses: string[];
 }
 
 export interface ReleaseDecision {

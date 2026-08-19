@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import {
@@ -41,7 +41,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
-import { generateScenarioCoverageMatrix } from "@/lib/scenario-coverage-matrix";
+import { generateScenarioCoverageMatrix, getScenarioMatrixKey } from "@/lib/scenario-coverage-matrix";
 import { calculateCompletenessScore } from "@/lib/completeness-score";
 import { resolveRecommendationDisplayState } from "@/lib/recommendation-display-state";
 import { resolveCanonicalHealth, CanonicalHealthResult } from "@/lib/recommendation-health-state";
@@ -82,6 +82,8 @@ import { CICDPipelineRunsPanel } from "@/components/CICDPipelineRunsPanel";
 import { QualityGateBadge } from "@/components/QualityGateBadge";
 import { PRPackageSummaryCard, StaleRecommendationBanner, MissingInputWarning } from "@/components/pr-package-readiness";
 import { normalizePRPackage } from "@/lib/adapters/prPackageAdapter";
+import { deriveQualityGate } from "@/lib/quality-gate";
+import { buildTraceabilityRows, isTraceabilityHealthy } from "@/lib/traceability-rows";
 
 export const dynamic = "force-dynamic";
 
@@ -1310,6 +1312,9 @@ export default function RecommendationDetailPage({ params }: PageProps) {
   const [showSafeToSkip, setShowSafeToSkip] = useState<boolean>(false);
   const [auditMode, setAuditMode] = useState<boolean>(false);
   const [govAuditOpen, setGovAuditOpen] = useState<boolean>(false);
+  const [traceabilityOpen, setTraceabilityOpen] = useState<boolean>(true);
+  const [alreadyVerifiedOpen, setAlreadyVerifiedOpen] = useState<boolean>(false);
+  const traceabilityInitialized = useRef(false);
   const [expandedRationales, setExpandedRationales] = useState<Set<string>>(new Set());
   const [showEvidence, setShowEvidence] = useState<boolean>(false);
   const [expandedVerified, setExpandedVerified] = useState<Set<string>>(new Set());
@@ -1540,7 +1545,15 @@ export default function RecommendationDetailPage({ params }: PageProps) {
       const res = await fetch(`/api/recommendations/${id}`, { cache: "no-store" });
       if (res.status === 401) { window.location.href = "/login"; return; }
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) { setError(data?.error || `Error ${res.status}`); return; }
+      if (!res.ok) {
+        const backendError = data?.error;
+        const errorMessage =
+          typeof backendError === "string"
+            ? backendError
+            : backendError?.message || `Error ${res.status}`;
+        setError(errorMessage);
+        return;
+      }
       setRun(data);
       setReadinessData(data.readiness_snapshot || null);
       
@@ -1660,6 +1673,17 @@ export default function RecommendationDetailPage({ params }: PageProps) {
       fetchScope();
     }
   }, [runId, scopeMode]);
+
+  // Auto-collapse traceability section once evidence loads and is healthy.
+  // Must be before early returns to respect React hooks order.
+  const _traceabilityRows = buildTraceabilityRows(regressionEvidence);
+  const _traceabilityHealthy = isTraceabilityHealthy(_traceabilityRows);
+  useEffect(() => {
+    if (!traceabilityInitialized.current && _traceabilityRows.length > 0 && _traceabilityHealthy) {
+      setTraceabilityOpen(false);
+      traceabilityInitialized.current = true;
+    }
+  }, [_traceabilityRows.length, _traceabilityHealthy]);
 
   const refreshRun = useCallback(() => {
     if (runId) fetchRun(runId);
@@ -2084,6 +2108,19 @@ export default function RecommendationDetailPage({ params }: PageProps) {
   // Calculate health state — canonical source: regressionEvidence.decisionSummary.health
   const healthState = getRecommendationHealth(run, evidence_gaps, regressionEvidence);
 
+  // Derive live quality gate model from regression scope release decision.
+  // Replaces stale readiness_snapshot.gate_status (captured at generation time).
+  const hasQualityGateProfile = pipelineRuns.length > 0;
+  const qualityGateModel = deriveQualityGate(
+    regressionScope?.release_decision?.verdict,
+    hasQualityGateProfile,
+  );
+
+  // Build traceability rows from server-side evidence graph (not stale mapACTraceability).
+  // Deduplicates by AC ref and uses live evidence classifications.
+  const traceabilityRows = _traceabilityRows;
+  const traceabilityHealthy = _traceabilityHealthy;
+
   // Compute sectionGapCount using the same consolidation pipeline as the Coverage Gaps section
   // so the Executive Decision count always matches Total gaps in the section.
   const sectionGapCount = (() => {
@@ -2107,20 +2144,20 @@ export default function RecommendationDetailPage({ params }: PageProps) {
     // Scenario matrix gaps that are NOT already in the regression scope (suggested only)
     const suggestedIds = new Set(
       scenarioMatrix.filter(s => s.status === 'suggested')
-        .map((s: any, idx: number) => `scenario-${s.scenario_id ?? s.id ?? s.requiredScenario?.slice(0, 20)?.replace(/\s+/g, '-').toLowerCase() ?? idx}`)
+        .map((s: any) => `scenario-${getScenarioMatrixKey(s)}`)
     );
     scenarioMatrix.forEach((scenario: any) => {
       if (scenario.status === "suggested" || scenario.status === "partial") {
-        const sid = `scenario-${scenario.scenario_id ?? scenario.id ?? scenario.requiredScenario?.slice(0, 20)?.replace(/\s+/g, '-').toLowerCase() ?? 'unknown'}`;
+        const sid = `scenario-${getScenarioMatrixKey(scenario)}`;
         if (suggestedIds.has(sid)) return; // already shown in Create Missing Tests
         rawGaps.push({
           type: "behavior",
-          name: scenario.behavior_name || scenario.scenario_title || "Unknown behavior",
+          name: scenario.requiredScenario || "Unknown behavior",
           coverageStatus: scenario.status === "suggested" ? "missing" : "partial",
-          suggestedAction: scenario.scenario_title || "Add scenario test",
+          suggestedAction: scenario.requiredScenario || "Add scenario test",
           priority: scenario.priority === "BLOCKER" || scenario.priority === "MUST" ? "must" : "recommended",
           reason: scenario.reasons?.[0] || "Behavior not covered by tests",
-          sourceEvidence: scenario.journey_name || "Scenario analysis"
+          sourceEvidence: scenario.impactedArea || "Scenario analysis"
         });
       }
     });
@@ -2186,9 +2223,10 @@ export default function RecommendationDetailPage({ params }: PageProps) {
     scenarioMatrix.forEach((scenario: any) => {
       if (scenario.status !== "suggested") return;
 
-      const scenarioTitle = scenario.scenario_title || scenario.behavior_name || "";
-      const scenarioIntent = scenario.behavior_name || scenario.scenario_intent || "";
+      const scenarioTitle = scenario.requiredScenario || "";
+      const scenarioIntent = scenario.requiredScenario || scenario.purpose || "";
       const scenarioReqId = scenario.requirement_id || "";
+      const scenarioKey = getScenarioMatrixKey(scenario);
       const normalizedTitle = normalize(scenarioTitle);
       const normalizedIntent = normalize(scenarioIntent);
 
@@ -2200,9 +2238,9 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         const normalizedTestName = normalize(testName);
         const normalizedSuite = normalize(testSuite);
 
-        // Layer 1: exact test_id match
-        if (test.stable_identity === scenario.scenario_id || test.stable_identity === scenario.id) {
-          matches.set(scenario.scenario_id || scenario.id, { test, method: "exact_test_id" });
+        // Layer 1: exact test_id match (existingTest holds stable_identity from findExistingTest)
+        if (scenario.existingTest && test.stable_identity === scenario.existingTest) {
+          matches.set(scenarioKey, { test, method: "exact_test_id" });
           if (typeof window !== "undefined") {
             console.log(`[Veriscope] Match: scenario "${scenarioTitle}" -> test "${testName}" (exact_test_id)`);
           }
@@ -2211,7 +2249,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
 
         // Layer 2: normalized name match
         if (normalizedTitle === normalizedTestName) {
-          matches.set(scenario.scenario_id || scenario.id, { test, method: "normalized_name" });
+          matches.set(scenarioKey, { test, method: "normalized_name" });
           if (typeof window !== "undefined") {
             console.log(`[Veriscope] Match: scenario "${scenarioTitle}" -> test "${testName}" (normalized_name)`);
           }
@@ -2221,7 +2259,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         // Layer 3: classname + test name match
         const combinedTest = `${normalizedSuite} ${normalizedTestName}`;
         if (normalizedTitle.includes(normalizedTestName) && normalizedTitle.includes(normalizedSuite)) {
-          matches.set(scenario.scenario_id || scenario.id, { test, method: "classname_testname" });
+          matches.set(scenarioKey, { test, method: "classname_testname" });
           if (typeof window !== "undefined") {
             console.log(`[Veriscope] Match: scenario "${scenarioTitle}" -> test "${testName}" (classname_testname)`);
           }
@@ -2230,7 +2268,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
 
         // Layer 4: AC ID match
         if (scenarioReqId && testReqId && scenarioReqId === testReqId) {
-          matches.set(scenario.scenario_id || scenario.id, { test, method: "ac_id" });
+          matches.set(scenarioKey, { test, method: "ac_id" });
           if (typeof window !== "undefined") {
             console.log(`[Veriscope] Match: scenario "${scenarioTitle}" -> test "${testName}" (ac_id)`);
           }
@@ -2239,7 +2277,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
 
         // Layer 5: requirement title match
         if (test.requirement_title && normalizedTitle.includes(normalize(test.requirement_title))) {
-          matches.set(scenario.scenario_id || scenario.id, { test, method: "requirement_title" });
+          matches.set(scenarioKey, { test, method: "requirement_title" });
           if (typeof window !== "undefined") {
             console.log(`[Veriscope] Match: scenario "${scenarioTitle}" -> test "${testName}" (requirement_title)`);
           }
@@ -2248,7 +2286,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
 
         // Layer 6: scenario intent match
         if (normalizedIntent === normalizedTestName || normalizedIntent.includes(normalizedTestName)) {
-          matches.set(scenario.scenario_id || scenario.id, { test, method: "scenario_intent" });
+          matches.set(scenarioKey, { test, method: "scenario_intent" });
           if (typeof window !== "undefined") {
             console.log(`[Veriscope] Match: scenario "${scenarioTitle}" -> test "${testName}" (scenario_intent)`);
           }
@@ -2257,7 +2295,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
 
         // Layer 7: keyword/semantic intent fallback
         if (hasKeywordOverlap(scenarioTitle, testName, 2) || hasKeywordOverlap(scenarioIntent, testName, 2)) {
-          matches.set(scenario.scenario_id || scenario.id, { test, method: "keyword_semantic" });
+          matches.set(scenarioKey, { test, method: "keyword_semantic" });
           if (typeof window !== "undefined") {
             console.log(`[Veriscope] Match: scenario "${scenarioTitle}" -> test "${testName}" (keyword_semantic)`);
           }
@@ -2271,7 +2309,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         const normalizedTestName = normalize(testName);
 
         if (normalizedTitle === normalizedTestName || hasKeywordOverlap(scenarioTitle, testName, 2)) {
-          matches.set(scenario.scenario_id || scenario.id, { test, method: "failed_or_skipped_match" });
+          matches.set(scenarioKey, { test, method: "failed_or_skipped_match" });
           if (typeof window !== "undefined") {
             console.log(`[Veriscope] Match: scenario "${scenarioTitle}" -> test "${testName}" (failed_or_skipped_match)`);
           }
@@ -2301,24 +2339,24 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         .filter((s: any) => {
           // Only include suggested scenarios that are NOT matched to passed tests
           if (s.status !== 'suggested') return false;
-          const scenarioId = s.scenario_id ?? s.id;
+          const scenarioId = getScenarioMatrixKey(s);
           const match = scenarioToTestMatch.get(scenarioId);
           // Exclude if matched to a passed test
           if (match && prTestClassification.passed.includes(match.test)) {
             if (typeof window !== "undefined") {
-              console.log(`[Veriscope] Excluding scenario "${s.scenario_title || s.behavior_name}" from Create Missing Tests - matched to passed test via ${match.method}`);
+              console.log(`[Veriscope] Excluding scenario "${s.requiredScenario}" from Create Missing Tests - matched to passed test via ${match.method}`);
             }
             return false;
           }
           return true;
         })
         .map((scenario: any, idx: number) => ({
-          id: `missing-${scenario.scenario_id ?? scenario.id ?? scenario.requiredScenario?.slice(0, 20)?.replace(/\s+/g, '-').toLowerCase() ?? idx}`,
+          id: `missing-${getScenarioMatrixKey(scenario)}`,
           title: generateMissingTestTitle(scenario),
           type: 'missing' as const,
           tier: (scenario.priority === 'BLOCKER' || scenario.priority === 'MUST' ? 'must_run' : 'should_run') as "must_run" | "should_run" | "fallback",
           requirement_id: scenario.requirement_id,
-          scenario_intent: scenario.behavior_name,
+          scenario_intent: scenario.requiredScenario,
           originalScenario: scenario
         }))
     ];
@@ -2356,7 +2394,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         renderedTestIds: recommended_tests.map((t: any) => t.stable_identity || t.id || t.display_name),
         renderedScenarioIds: scenarioMatrix
           .filter((s) => s.status === "suggested")
-          .map((s) => s.scenario_id || s.id || s.title),
+          .map((s) => getScenarioMatrixKey(s)),
         createRegressionScopeButtonCount: hasCreatedSuite ? 0 : 1,
         showNeedsMoreEvidence: displayState.showNeedsMoreEvidence,
         displayedConfidenceLabel: displayState.confidenceLabel,
@@ -2665,16 +2703,19 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         </div>
       </div>
 
-      {/* ── 1. Release Decision Section ── */}
+      {/* ── 1. Recommendation Summary (evidence readiness, verdict, confidence) ── */}
       <div id="release-decision" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-4">
         <div className="flex items-center justify-between border-b border-zinc-800/40 pb-3">
           <div className="flex items-center gap-2">
             <Shield className="w-5 h-5 text-emerald-400" />
-            <h2 className="text-lg font-bold text-white">Release Decision</h2>
+            <h2 className="text-lg font-bold text-white">Recommendation Summary</h2>
           </div>
           <div className="flex items-center gap-2">
-            {/* Quality Gate Badge - distinct from Recommendation Health */}
-            <QualityGateBadge gateStatus={readinessData?.gate_status || "UNKNOWN"} />
+            {/* Quality Gate Badge - derived from live regression scope release decision */}
+            <QualityGateBadge
+              qualityGateProfileStatus={qualityGateModel.quality_gate_profile_status}
+              evidenceReadiness={qualityGateModel.evidence_readiness}
+            />
             <span className={`px-2 py-1 text-xs font-semibold rounded border ${
               regressionScope?.release_decision?.verdict === "SAFE_TO_RELEASE" ? "bg-emerald-950/20 text-emerald-400 border-emerald-800/40" :
               regressionScope?.release_decision?.verdict === "DO_NOT_RELEASE" ? "bg-rose-950/20 text-rose-400 border-rose-800/40" :
@@ -2689,7 +2730,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
           </div>
         </div>
 
-        {/* Phase 7: Use unified release decision from regression scope */}
+        {/* Computed verdict summary only — full decision with persisted status is in Final Release Decision section */}
         {regressionScope?.release_decision ? (
           <div className="bg-zinc-950/20 border border-zinc-800/30 rounded-lg p-4 space-y-3">
             <div className="flex items-start justify-between gap-4">
@@ -2818,7 +2859,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
           </>
         )}
 
-        {/* Review CTAs - no approval buttons at top */}
+        {/* Navigation CTAs - no approval buttons here; approval is in Final Release Decision section */}
         <div className="flex gap-3 mt-4">
           {(() => {
             const rawRequiredItems = regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items ?? [];
@@ -2844,7 +2885,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
                   </Button>
                 )}
                 <Button
-                  onClick={() => document.getElementById("regression-scope-plan")?.scrollIntoView({ behavior: "smooth" })}
+                  onClick={() => document.getElementById("final-release-decision")?.scrollIntoView({ behavior: "smooth" })}
                   variant="outline"
                   className="flex-1 border-zinc-700 bg-zinc-800/40 text-zinc-300 hover:bg-zinc-700 hover:text-white font-semibold text-xs py-2 rounded-lg"
                 >
@@ -2856,7 +2897,64 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         </div>
       </div>
 
-      {/* ── 2. Required Before Release Section ── */}
+      {/* ── 2. Evidence Summary (ACs trusted, tests passed, files covered, manual evidence, CI/CD) ── */}
+      <div id="evidence-summary" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-4" data-testid="evidence-summary-section">
+        <div className="flex items-center gap-2">
+          <BarChart2 className="w-5 h-5 text-blue-400" />
+          <h2 className="text-lg font-bold text-white">Evidence Summary</h2>
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+          {(() => {
+            const totalACs = regressionEvidence?.decisionSummary?.counts?.totalRequirements ?? regressionScope?.traceability_summary?.total_requirements ?? 0;
+            const trustedACs = traceabilityRows.filter(r => r.mapping_status === 'TRUSTED').length;
+            const passedTests = regressionEvidence?.decisionSummary?.counts?.uploadedPrTestsPassed ?? prTestClassification.passed.length;
+            const changedFilesCount = executive_summary?.changed_files?.length ?? 0;
+            const coveredFiles = regressionEvidence?.fileImpactMap ? Object.keys(regressionEvidence.fileImpactMap).length : changedFilesCount;
+            const hasManualEvidence = traceabilityRows.some(r => r.manual_validation && r.manual_validation.mapped_manual_tests_count > 0);
+            const cicdConnected = pipelineRuns.length > 0;
+
+            return (
+              <>
+                <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30 text-center" data-testid="evidence-summary-acs">
+                  <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">ACs Trusted</p>
+                  <p className="text-xl font-bold text-emerald-400">{trustedACs} / {totalACs}</p>
+                </div>
+                <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30 text-center" data-testid="evidence-summary-tests">
+                  <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Tests Passed</p>
+                  <p className="text-xl font-bold text-emerald-400">{passedTests}</p>
+                </div>
+                <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30 text-center" data-testid="evidence-summary-files">
+                  <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Files Covered</p>
+                  <p className="text-xl font-bold text-emerald-400">{coveredFiles} / {changedFilesCount}</p>
+                </div>
+                <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30 text-center" data-testid="evidence-summary-manual">
+                  <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Manual Evidence</p>
+                  <p className="text-xl font-bold text-zinc-200">{hasManualEvidence ? "Available" : "None"}</p>
+                </div>
+                <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30 text-center" data-testid="evidence-summary-cicd">
+                  <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">CI/CD</p>
+                  <p className={`text-xl font-bold ${cicdConnected ? "text-emerald-400" : "text-amber-400"}`}>
+                    {cicdConnected ? "Connected" : "Not Connected"}
+                  </p>
+                </div>
+              </>
+            );
+          })()}
+        </div>
+        {(() => {
+          const alreadyVerifiedItems = regressionScope?.groups?.[ScopeGroup.EXCLUDED_ALREADY_VERIFIED]?.items ?? [];
+          const execVerified = alreadyVerifiedFromExecution ?? [];
+          const verifiedCount = alreadyVerifiedItems.length || execVerified.length;
+          if (verifiedCount === 0) return null;
+          return (
+            <p className="text-xs text-emerald-400" data-testid="already-verified-summary-line">
+              {verifiedCount} tests already verified on current PR.
+            </p>
+          );
+        })()}
+      </div>
+
+      {/* ── 3. Required Actions Section ── */}
       <div id="required-before-release" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-3">
         <div className="flex items-center gap-2">
           <AlertCircle className="w-5 h-5 text-rose-400" />
@@ -2865,7 +2963,16 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         <div className="space-y-2">
           {(() => {
             if (regressionScopeError) {
-              return <p className="text-xs text-rose-500 italic">Unable to calculate release blockers. Please retry.</p>;
+              return (
+                <div data-testid="release-blocker-scope-error" className="bg-rose-950/20 border border-rose-800/40 rounded-lg p-4 space-y-1">
+                  <p className="text-sm text-rose-300 font-semibold">Status: BLOCKED</p>
+                  <p className="text-xs text-rose-400">Regression scope could not be generated.</p>
+                  {regressionScopeErrorMessage && (
+                    <p className="text-[11px] text-rose-500">{regressionScopeErrorMessage}</p>
+                  )}
+                  <p className="text-[11px] text-zinc-500">Release approval is disabled until the regression scope is available.</p>
+                </div>
+              );
             }
 
             if (!regressionScope) {
@@ -2958,153 +3065,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         </div>
       </div>
 
-      {/* ── 2.5. Already Verified Section ── */}
-      {(() => {
-        const alreadyVerifiedItems = regressionScope?.groups?.[ScopeGroup.EXCLUDED_ALREADY_VERIFIED]?.items ?? [];
-        // Fall back to execution-aware already-verified tests from the recommendation
-        const execVerified = alreadyVerifiedFromExecution ?? [];
-        if (alreadyVerifiedItems.length === 0 && execVerified.length === 0) return null;
-
-        // If scope has items, render them; otherwise render execution-aware tests
-        if (alreadyVerifiedItems.length === 0 && execVerified.length > 0) {
-          return (
-            <div id="already-verified" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-3">
-              <div className="flex items-center gap-2">
-                <CheckCircle2 className="w-5 h-5 text-emerald-400" />
-                <h2 className="text-lg font-bold text-white">Already Verified ({execVerified.length})</h2>
-              </div>
-              <p className="text-[11px] text-zinc-400">These tests already passed on the current PR head SHA. No re-run needed.</p>
-              <div className="space-y-2">
-                {execVerified.map((t: any, idx: number) => (
-                  <div key={t.stable_identity || idx} className="bg-zinc-950/40 border border-emerald-900/20 rounded-lg p-3 space-y-1">
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-1 flex-wrap">
-                          <span className="text-[10px] font-mono text-zinc-400">{t.suite_name}</span>
-                          <h4 className="text-xs font-semibold text-zinc-200">{t.display_name}</h4>
-                        </div>
-                        <p className="text-[11px] text-zinc-400">{t.reason}</p>
-                        {t.would_have_been_priority && (
-                          <span className="text-[9px] text-zinc-500">Would have been: {t.would_have_been_priority}</span>
-                        )}
-                        {t.evidence_path && t.evidence_path.length > 0 && (
-                          <div className="mt-1 flex flex-wrap gap-1">
-                            {t.evidence_path.map((step: any, sIdx: number) => (
-                              <span key={sIdx} className="text-[9px] font-mono bg-zinc-900 text-zinc-500 px-1.5 py-0.5 rounded border border-zinc-800/60">
-                                {step.step || step.edge_type || "evidence"}
-                              </span>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                      <div className="flex items-center gap-2 shrink-0">
-                        <span className="text-[9px] px-1.5 py-0.5 rounded border border-emerald-950 bg-emerald-950/20 text-emerald-400 uppercase font-semibold">
-                          VERIFIED
-                        </span>
-                        <span className="text-[10px] text-zinc-400">NO RERUN NEEDED</span>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          );
-        }
-
-        return (
-          <div id="already-verified" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-3">
-            <div className="flex items-center gap-2">
-              <CheckCircle2 className="w-5 h-5 text-emerald-400" />
-              <h2 className="text-lg font-bold text-white">Already Verified ({alreadyVerifiedItems.length})</h2>
-            </div>
-            <div className="space-y-2">
-              {alreadyVerifiedItems.map((item: any, idx: number) => (
-                <div key={item.id || idx} className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg p-3 space-y-2">
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 mb-1 flex-wrap">
-                        <span className="text-[10px] font-mono text-zinc-400">{item.readable_id}</span>
-                        <h4 className="text-xs font-semibold text-zinc-200">{item.title}</h4>
-                      </div>
-                      {/* Phase 7: Show impact reason from change impact engine */}
-                      {item.reason && (
-                        <p className="text-[11px] text-zinc-400 mt-1 leading-relaxed">{item.reason}</p>
-                      )}
-                      {/* Phase 7: Show linked test evidence */}
-                      {item.linked_tests && item.linked_tests.length > 0 && (
-                        <div className="mt-2">
-                          <p className="text-[9px] text-zinc-500 font-medium uppercase tracking-wider mb-1">Verified by Tests ({item.linked_tests.length})</p>
-                          <div className="flex flex-wrap gap-1">
-                            {item.linked_tests.slice(0, 3).map((test: string, tIdx: number) => (
-                              <span key={tIdx} className="text-[9px] font-mono bg-emerald-950/20 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-800/40">
-                                {test.split("::").slice(-1)[0].substring(0, 20)}
-                              </span>
-                            ))}
-                            {item.linked_tests.length > 3 && (
-                              <span className="text-[9px] text-zinc-500">+{item.linked_tests.length - 3} more</span>
-                            )}
-                          </div>
-                        </div>
-                      )}
-                      {auditMode && (
-                        <span className="text-[9px] text-zinc-600 font-mono block mt-1">ID: {item.id}</span>
-                      )}
-                      
-                      {/* Collapsible verifying test details */}
-                      {(() => {
-                        const itemEvidence = regressionScope?.evidence_items?.filter(
-                          (ev: any) => ev.requirement_id === item.source_ac_id || ev.requirement_id === item.id
-                        ) || [];
-                        if (itemEvidence.length === 0) return null;
-
-                        return (
-                          <div className="mt-2 pt-2 border-t border-zinc-800/40">
-                            <button
-                              onClick={() => toggleVerified(item.id)}
-                              className="text-[10px] font-semibold text-emerald-400 hover:text-emerald-300 transition-colors flex items-center gap-1"
-                            >
-                              <span>View verifying tests ({itemEvidence.length})</span>
-                              <ChevronDown className={`w-3.5 h-3.5 transition-transform ${expandedVerified.has(item.id) ? "rotate-180" : ""}`} />
-                            </button>
-                            {expandedVerified.has(item.id) && (
-                              <div className="mt-2 space-y-2 pl-2 border-l border-emerald-800/30">
-                                {itemEvidence.map((ev: any, evIdx: number) => (
-                                  <div key={evIdx} className="text-[11px] bg-zinc-950/60 p-2.5 rounded border border-zinc-800/50 space-y-1">
-                                    <div className="flex items-center justify-between gap-2">
-                                      <span className="font-mono text-zinc-350 font-medium break-all text-xs text-zinc-200">{ev.verifying_test}</span>
-                                      <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-950/30 text-emerald-400 border border-emerald-900/30 uppercase font-semibold">
-                                        {ev.test_status}
-                                      </span>
-                                    </div>
-                                    <p className="text-zinc-400 text-[10px] leading-relaxed">{ev.impact_reason}</p>
-                                    <div className="flex items-center gap-2 text-[9px] text-zinc-500">
-                                      <span>Freshness: {ev.test_freshness}</span>
-                                      <span>•</span>
-                                      <span>Bucket: {ev.final_bucket}</span>
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })()}
-                    </div>
-                    <div className="flex items-center gap-2 shrink-0">
-                      <span className="text-[9px] px-1.5 py-0.5 rounded border border-emerald-950 bg-emerald-950/20 text-emerald-400">
-                        VERIFIED
-                      </span>
-                      <span className="text-[10px] text-zinc-400">{item.execution_status} / {item.freshness_status}</span>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        );
-      })()}
-
-      {/* ── 2.5b. Failed Current PR Section ── */}
+      {/* ── 3b. Failed Current PR Section ── */}
       {failedCurrentPRTests.length > 0 && (
         <div id="failed-current-pr" className="bg-zinc-900/30 border border-rose-800/40 rounded-xl p-5 space-y-3">
           <div className="flex items-center gap-2">
@@ -3145,7 +3106,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         </div>
       )}
 
-      {/* ── 2.5c. Stale Rerun Required Section ── */}
+      {/* ── 3c. Stale Rerun Required Section ── */}
       {staleRerunTests.length > 0 && (
         <div id="stale-rerun" className="bg-zinc-900/30 border border-amber-800/40 rounded-xl p-5 space-y-3">
           <div className="flex items-center gap-2">
@@ -3180,7 +3141,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         </div>
       )}
 
-      {/* ── 2.5d. Mapping Review Needed Section ── */}
+      {/* ── 3d. Mapping Review Needed Section ── */}
       {mappingReviewTests.length > 0 && (
         <div id="mapping-review-needed" className="bg-zinc-900/30 border border-blue-800/40 rounded-xl p-5 space-y-3">
           <div className="flex items-center gap-2">
@@ -3275,7 +3236,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         </div>
       )}
 
-      {/* ── 2.6. Recommended Tests Section (Phase 8) ── */}
+      {/* ── 3e. Recommended Tests Section (Phase 8) ── */}
       {(() => {
         const recommendations = regressionScope?.recommendations ?? [];
         if (recommendations.length === 0) return null;
@@ -3380,7 +3341,7 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         );
       })()}
 
-      {/* ── 3. Regression Scope Plan Section ── */}
+      {/* ── 4. Regression Scope Plan Section ── */}
       <div id="regression-scope-plan" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-4">
         <div className="flex items-center justify-between flex-wrap gap-2">
           <div className="flex items-center gap-2">
@@ -3484,11 +3445,11 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         )}
       </div>
 
-      {/* ── 4. Business Risk Review Section ── */}
+      {/* ── 5. Risk Review Section ── */}
       <div id="business-risk-review" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-4">
         <div className="flex items-center gap-2">
           <Shield className="w-5 h-5 text-purple-400" />
-          <h2 className="text-lg font-bold text-white">Business Risk Review</h2>
+          <h2 className="text-lg font-bold text-white">Risk Review</h2>
         </div>
         <div className="space-y-4">
           <RiskReviewGovernancePanel 
@@ -3549,11 +3510,22 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         </div>
       </div>
 
-      {/* ── 5. Coverage & Traceability Section ── */}
+      {/* ── 6. Traceability Audit Section (collapsible when healthy, includes already verified detail) ── */}
       <div id="coverage-traceability" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-4">
-        <div className="flex items-center gap-2">
-          <FileText className="w-5 h-5 text-emerald-400" />
-          <h2 className="text-lg font-bold text-white">Coverage & Traceability</h2>
+        <div
+          className="flex items-center justify-between cursor-pointer"
+          onClick={() => setTraceabilityOpen(!traceabilityOpen)}
+        >
+          <div className="flex items-center gap-2">
+            <FileText className="w-5 h-5 text-emerald-400" />
+            <h2 className="text-lg font-bold text-white">Traceability Audit</h2>
+            {traceabilityHealthy && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded border bg-emerald-950/20 text-emerald-400 border-emerald-800/40">
+                All Covered
+              </span>
+            )}
+          </div>
+          {traceabilityOpen ? <ChevronDown className="w-5 h-5 text-zinc-500" /> : <ChevronRight className="w-5 h-5 text-zinc-500" />}
         </div>
 
         {/* Phase 7: Use unified traceability summary from regression scope */}
@@ -3600,74 +3572,81 @@ export default function RecommendationDetailPage({ params }: PageProps) {
           );
         })()}
 
-        <div className="space-y-2 mt-4">
+        {traceabilityOpen && (
+        <div className="space-y-2 mt-4" data-testid="traceability-detail-rows">
           {(() => {
-            const acTraceability = mapACTraceability(run, recommended_tests);
-            if (acTraceability.length === 0) {
+            if (traceabilityRows.length === 0) {
               return <p className="text-xs text-zinc-500 italic">No acceptance criteria traceability details available.</p>;
             }
 
-            return acTraceability.map((ac: any) => {
-              const statusColor = ac.coverageStatus === 'Covered' ? 'text-emerald-400 bg-emerald-950/20 border-emerald-800/40' :
-                                 ac.coverageStatus === 'Partially covered' ? 'text-amber-400 bg-amber-950/20 border-amber-800/40' :
-                                 ac.coverageStatus === 'Missing' ? 'text-rose-400 bg-rose-950/20 border-rose-800/40' :
+            return traceabilityRows.map((row) => {
+              const statusColor = row.coverage_status === 'COVERED' ? 'text-emerald-400 bg-emerald-950/20 border-emerald-800/40' :
+                                 row.coverage_status === 'PARTIAL' ? 'text-amber-400 bg-amber-950/20 border-amber-800/40' :
+                                 row.coverage_status === 'MISSING' ? 'text-rose-400 bg-rose-950/20 border-rose-800/40' :
                                  'text-zinc-400 bg-zinc-950/20 border-zinc-800/40';
 
-              const signals = ac.manualTraceabilitySignals || run.acceptance_criteria?.find((a: any) => a.id === ac.id)?.manualTraceabilitySignals;
-              const manualVal = ac.manualValidation || run.acceptance_criteria?.find((a: any) => a.id === ac.id)?.manualValidation || (signals ? {
-                status: signals.latestManualExecutionOutcome || 'NOT_EXECUTED',
-                mappedManualTestsCount: signals.mappedManualTestsCount || 0,
-                latestExecutedByName: signals.latestManualExecutionOutcome ? 'QA Tester' : null,
-                latestExecutedAt: signals.latestManualExecutionAt,
-                evidenceUrls: [],
-                manualTests: []
-              } : null);
+              const mappingColor = row.mapping_status === 'TRUSTED' ? 'text-emerald-400 bg-emerald-950/20 border-emerald-800/40' :
+                                   row.mapping_status === 'PARTIAL' ? 'text-amber-400 bg-amber-950/20 border-amber-800/40' :
+                                   'text-rose-400 bg-rose-950/20 border-rose-800/40';
+
+              const execColor = row.execution_status === 'PASSED' ? 'text-emerald-400 bg-emerald-950/20 border-emerald-800/40' :
+                                row.execution_status === 'FAILED' ? 'text-rose-400 bg-rose-950/20 border-rose-800/40' :
+                                row.execution_status === 'SKIPPED' ? 'text-amber-400 bg-amber-950/20 border-amber-800/40' :
+                                'text-zinc-400 bg-zinc-950/20 border-zinc-800/40';
+
+              const mv = row.manual_validation;
 
               return (
-                <div key={ac.id} className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg p-3 space-y-2">
+                <div key={row.requirement_id} data-testid={`traceability-row-${row.ac_ref}`} className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg p-3 space-y-2">
                   <div className="flex items-start justify-between gap-2">
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 mb-1 flex-wrap">
+                        <span className="text-[10px] font-mono text-zinc-300 font-semibold">{row.ac_ref}</span>
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded border ${mappingColor}`}>
+                          {row.mapping_status}
+                        </span>
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded border ${execColor}`}>
+                          {row.execution_status}
+                        </span>
                         <span className={`text-[9px] px-1.5 py-0.5 rounded border ${statusColor}`}>
-                          {ac.coverageStatus}
+                          {row.coverage_status}
                         </span>
                         <span className={`text-[9px] px-1.5 py-0.5 rounded border bg-zinc-850 border-zinc-700 text-zinc-300`}>
-                          {ac.priority || "Must"}
+                          {row.recommendation_status}
                         </span>
                       </div>
-                      <p className="text-xs font-semibold text-zinc-200">{ac.title}</p>
-                      <p className="text-[11px] text-zinc-400 mt-1 leading-relaxed">{ac.fullText}</p>
+                      <p className="text-xs font-semibold text-zinc-200">{row.title}</p>
                     </div>
                   </div>
 
-                  {manualVal && (
+                  {mv && (
                     <div className="mt-2 p-2 rounded bg-zinc-900/40 border border-zinc-800/30 text-xs space-y-1.5">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-zinc-400 font-medium">Manual Validation:</span>
-                        <span className={`text-[9px] px-1.5 py-0.5 rounded border ${getManualBadgeStyleAndLabel(manualVal.status || manualVal.latestOutcome || 'NOT_MAPPED').className}`}>
-                          {getManualBadgeStyleAndLabel(manualVal.status || manualVal.latestOutcome || 'NOT_MAPPED').label}
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded border ${getManualBadgeStyleAndLabel(mv.status || mv.latest_outcome || 'NOT_MAPPED').className}`}>
+                          {getManualBadgeStyleAndLabel(mv.status || mv.latest_outcome || 'NOT_MAPPED').label}
                         </span>
-                        {manualVal.mappedManualTestsCount > 0 && (
+                        {mv.mapped_manual_tests_count > 0 && (
                           <span className="text-zinc-500">
-                            ({manualVal.mappedManualTestsCount} test{manualVal.mappedManualTestsCount > 1 ? 's' : ''} mapped)
+                            ({mv.mapped_manual_tests_count} test{mv.mapped_manual_tests_count > 1 ? 's' : ''} mapped)
                           </span>
                         )}
                       </div>
-                      {manualVal.latestExecutedByName && (
+                      {mv.latest_executed_by_name && (
                         <p className="text-[10px] text-zinc-500">
-                          Executed by {manualVal.latestExecutedByName} on {new Date(manualVal.latestExecutedAt).toLocaleDateString()}
+                          Executed by {mv.latest_executed_by_name} on {mv.latest_executed_at ? new Date(mv.latest_executed_at).toLocaleDateString() : 'N/A'}
                         </p>
                       )}
-                      {manualVal.evidenceUrls && manualVal.evidenceUrls.length > 0 && (
+                      {mv.evidence_urls && mv.evidence_urls.length > 0 && (
                         <div className="text-[10px] text-zinc-500">
-                          Evidence URLs: {manualVal.evidenceUrls.map((url: string, idx: number) => (
+                          Evidence URLs: {mv.evidence_urls.map((url: string, idx: number) => (
                             <a key={idx} href={url} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline ml-1">
                               {url}
                             </a>
                           ))}
                         </div>
                       )}
-                      {manualVal.mappedManualTestsCount > 0 && (
+                      {mv.mapped_manual_tests_count > 0 && (
                         <p className="text-[9px] text-zinc-500 italic mt-1 font-medium">
                           Manual mappings provide traceability only and do not mark requirements covered.
                         </p>
@@ -3679,47 +3658,183 @@ export default function RecommendationDetailPage({ params }: PageProps) {
             });
           })()}
         </div>
+        )}
+
+        {/* Already Verified detail list — collapsed by default, shown under Traceability Audit */}
+        {traceabilityOpen && (() => {
+          const alreadyVerifiedItems = regressionScope?.groups?.[ScopeGroup.EXCLUDED_ALREADY_VERIFIED]?.items ?? [];
+          const execVerified = alreadyVerifiedFromExecution ?? [];
+          if (alreadyVerifiedItems.length === 0 && execVerified.length === 0) return null;
+
+          return (
+            <div className="mt-4" data-testid="already-verified-detail">
+              <button
+                onClick={() => setAlreadyVerifiedOpen(!alreadyVerifiedOpen)}
+                className="flex items-center gap-2 text-sm font-semibold text-zinc-300 hover:text-white transition-colors w-full"
+              >
+                <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                <span>Already Verified ({alreadyVerifiedItems.length || execVerified.length})</span>
+                {alreadyVerifiedOpen ? <ChevronDown className="w-4 h-4 text-zinc-500" /> : <ChevronRight className="w-4 h-4 text-zinc-500" />}
+              </button>
+              {alreadyVerifiedOpen && (
+                <div className="mt-3 space-y-2">
+                  {alreadyVerifiedItems.length > 0 ? (
+                    alreadyVerifiedItems.map((item: any, idx: number) => (
+                      <div key={item.id || idx} className="bg-zinc-950/40 border border-zinc-800/30 rounded-lg p-3 space-y-2">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2 mb-1 flex-wrap">
+                              <span className="text-[10px] font-mono text-zinc-400">{item.readable_id}</span>
+                              <h4 className="text-xs font-semibold text-zinc-200">{item.title}</h4>
+                            </div>
+                            {item.reason && (
+                              <p className="text-[11px] text-zinc-400 mt-1 leading-relaxed">{item.reason}</p>
+                            )}
+                            {item.linked_tests && item.linked_tests.length > 0 && (
+                              <div className="mt-2">
+                                <p className="text-[9px] text-zinc-500 font-medium uppercase tracking-wider mb-1">Verified by Tests ({item.linked_tests.length})</p>
+                                <div className="flex flex-wrap gap-1">
+                                  {item.linked_tests.slice(0, 3).map((test: string, tIdx: number) => (
+                                    <span key={tIdx} className="text-[9px] font-mono bg-emerald-950/20 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-800/40">
+                                      {test.split("::").slice(-1)[0].substring(0, 20)}
+                                    </span>
+                                  ))}
+                                  {item.linked_tests.length > 3 && (
+                                    <span className="text-[9px] text-zinc-500">+{item.linked_tests.length - 3} more</span>
+                                  )}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <span className="text-[9px] px-1.5 py-0.5 rounded border border-emerald-950 bg-emerald-950/20 text-emerald-400">
+                              VERIFIED
+                            </span>
+                            <span className="text-[10px] text-zinc-400">{item.execution_status} / {item.freshness_status}</span>
+                          </div>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    execVerified.map((t: any, idx: number) => (
+                      <div key={t.stable_identity || idx} className="bg-zinc-950/40 border border-emerald-900/20 rounded-lg p-3 space-y-1">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2 mb-1 flex-wrap">
+                              <span className="text-[10px] font-mono text-zinc-400">{t.suite_name}</span>
+                              <h4 className="text-xs font-semibold text-zinc-200">{t.display_name}</h4>
+                            </div>
+                            <p className="text-[11px] text-zinc-400">{t.reason}</p>
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <span className="text-[9px] px-1.5 py-0.5 rounded border border-emerald-950 bg-emerald-950/20 text-emerald-400 uppercase font-semibold">
+                              VERIFIED
+                            </span>
+                            <span className="text-[10px] text-zinc-400">NO RERUN NEEDED</span>
+                          </div>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })()}
       </div>
 
-      {/* ── 6. Execution Optimization Section ── */}
-      <div id="execution-optimization" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-3">
-        <div className="flex items-center gap-2">
-          <Zap className="w-5 h-5 text-amber-400" />
-          <h2 className="text-lg font-bold text-white">Execution Optimization</h2>
-        </div>
-        <div className="grid grid-cols-2 gap-4">
-          <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30 text-center">
-            <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Execution Reduction</p>
-            <p className="text-xl font-bold text-zinc-200">
-              {regressionScope?.optimization_metrics?.execution_reduction ?? 45.5}%
-            </p>
-          </div>
-          <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30 text-center">
-            <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Optimized count</p>
-            <p className="text-xl font-bold text-zinc-200">
-              {regressionScope?.optimization_metrics?.optimized_required_count ?? mustRun.length}
-            </p>
-          </div>
-        </div>
-      </div>
-
-      {/* ── 7. Final Release Decision Gate ── */}
+      {/* ── 7. Final Release Decision (single combined section, rendered once at bottom) ── */}
       <div id="final-release-decision" className="bg-zinc-900/40 border border-zinc-800/60 rounded-xl p-5 space-y-4">
         <div className="flex items-center justify-between border-b border-zinc-800/40 pb-3">
           <div className="flex items-center gap-2">
             <Shield className="w-5 h-5 text-emerald-400" />
             <h2 className="text-lg font-bold text-white">Final Release Decision</h2>
           </div>
-          <span className={`px-2 py-1 text-xs font-semibold rounded border ${
-            (releaseDecision?.decisionStatus || "PENDING") === "APPROVED" ? "bg-emerald-950/20 text-emerald-400 border-emerald-800/40" :
-            (releaseDecision?.decisionStatus || "PENDING") === "REJECTED" ? "bg-rose-950/20 text-rose-400 border-rose-800/40" :
-            "bg-zinc-950/20 text-zinc-400 border-zinc-800/40"
-          }`}>
-            {releaseDecision?.decisionStatus || "PENDING"}
-          </span>
+          <div className="flex items-center gap-2">
+            {/* Computed verdict badge (from regression scope) */}
+            <span className={`px-2 py-1 text-xs font-semibold rounded border ${
+              regressionScope?.release_decision?.verdict === "SAFE_TO_RELEASE" ? "bg-emerald-950/20 text-emerald-400 border-emerald-800/40" :
+              regressionScope?.release_decision?.verdict === "DO_NOT_RELEASE" ? "bg-rose-950/20 text-rose-400 border-rose-800/40" :
+              regressionScope?.release_decision?.verdict === "REVIEW_RECOMMENDED" ? "bg-amber-950/20 text-amber-400 border-amber-800/40" :
+              "bg-zinc-950/20 text-zinc-400 border-zinc-800/40"
+            }`}>
+              Computed: {regressionScope?.release_decision?.verdict || "UNKNOWN"}
+            </span>
+            {/* Persisted decision status badge (from release-decision API) */}
+            <span className={`px-2 py-1 text-xs font-semibold rounded border ${
+              (releaseDecision?.decisionStatus || "PENDING") === "APPROVED" ? "bg-emerald-950/20 text-emerald-400 border-emerald-800/40" :
+              (releaseDecision?.decisionStatus || "PENDING") === "REJECTED" ? "bg-rose-950/20 text-rose-400 border-rose-800/40" :
+              (releaseDecision?.decisionStatus || "PENDING") === "PENDING_REVIEW" ? "bg-amber-950/20 text-amber-400 border-amber-800/40" :
+              "bg-zinc-950/20 text-zinc-400 border-zinc-800/40"
+            }`}>
+              Decision: {releaseDecision?.decisionStatus || "PENDING"}
+            </span>
+          </div>
         </div>
 
+        {/* Computed verdict reason from regression scope */}
+        {regressionScope?.release_decision && (
+          <div className="bg-zinc-950/20 border border-zinc-800/30 rounded-lg p-4 space-y-2">
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex-1">
+                <h3 className="text-sm font-semibold text-zinc-200 mb-1">
+                  {regressionScope.release_decision.verdict === "SAFE_TO_RELEASE" ? "Safe to Release" :
+                   regressionScope.release_decision.verdict === "DO_NOT_RELEASE" ? "Do Not Release" :
+                   regressionScope.release_decision.verdict === "REVIEW_RECOMMENDED" ? "Review Recommended" :
+                   "Unknown Status"}
+                </h3>
+                <p className="text-xs text-zinc-400 leading-relaxed">{regressionScope.release_decision.reason}</p>
+              </div>
+              <div className="flex gap-4 text-center">
+                <div>
+                  <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Required</p>
+                  <p className="text-lg font-bold text-rose-400">{regressionScope.release_decision.required_count}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Test Gaps</p>
+                  <p className="text-lg font-bold text-amber-400">{regressionScope.release_decision.recommended_count}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Verified</p>
+                  <p className="text-lg font-bold text-emerald-400">{regressionScope.release_decision.already_verified_count}</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Persisted decision justification if exists */}
+        {releaseDecision?.justification && (
+          <div className="bg-zinc-950/20 border border-zinc-800/30 rounded-lg p-3 space-y-1">
+            <p className="text-[10px] text-zinc-500 uppercase tracking-wider">Approval Justification</p>
+            <p className="text-xs text-zinc-400">{releaseDecision.justification}</p>
+          </div>
+        )}
+
         {(() => {
+          if (regressionScopeError) {
+            return (
+              <div className="space-y-4">
+                <div data-testid="release-gate-scope-blocked" className="bg-rose-950/20 border border-rose-800/40 rounded-lg p-4">
+                  <p className="text-sm text-rose-300 font-semibold mb-1">
+                    Release approval is blocked.
+                  </p>
+                  <p className="text-xs text-rose-400">
+                    Regression scope could not be generated. Resolve the scope generation issue before approving this release.
+                  </p>
+                </div>
+                <div className="flex gap-3">
+                  <Button
+                    onClick={() => handleReleaseDecision("REJECTED")}
+                    className="flex-1 bg-rose-600 hover:bg-rose-700 text-white font-semibold text-xs py-2 rounded-lg"
+                  >
+                    Reject Release
+                  </Button>
+                </div>
+              </div>
+            );
+          }
+
           const rawRequiredItems = regressionScope?.groups?.[ScopeGroup.REQUIRED]?.items ?? [];
           const reqItems = rawRequiredItems.filter((item: any) => {
             const releaseAction = item.release_action ?? item.releaseAction;
@@ -3788,7 +3903,29 @@ export default function RecommendationDetailPage({ params }: PageProps) {
         })()}
       </div>
 
-      {/* ── 8. Governance & Audit Section ── */}
+      {/* ── 8. Execution Optimization Section ── */}
+      <div id="execution-optimization" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-3">
+        <div className="flex items-center gap-2">
+          <Zap className="w-5 h-5 text-amber-400" />
+          <h2 className="text-lg font-bold text-white">Execution Optimization</h2>
+        </div>
+        <div className="grid grid-cols-2 gap-4">
+          <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30 text-center">
+            <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Execution Reduction</p>
+            <p className="text-xl font-bold text-zinc-200">
+              {regressionScope?.optimization_metrics?.execution_reduction ?? 45.5}%
+            </p>
+          </div>
+          <div className="bg-zinc-950/40 rounded-lg p-3 border border-zinc-800/30 text-center">
+            <p className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Optimized count</p>
+            <p className="text-xl font-bold text-zinc-200">
+              {regressionScope?.optimization_metrics?.optimized_required_count ?? mustRun.length}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* ── 9. Governance & Audit Section ── */}
       <div id="governance-audit" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-3">
         <div
           className="flex items-center justify-between cursor-pointer"
@@ -3896,9 +4033,16 @@ export default function RecommendationDetailPage({ params }: PageProps) {
       )}
 
       {/* CI/CD Pipeline Runs */}
-      <CICDPipelineRunsPanel 
+      <CICDPipelineRunsPanel
         pipelineRuns={pipelineRuns}
-        gateStatus={readinessData?.gate_status || "UNKNOWN"}
+        qualityGateProfileStatus={qualityGateModel.quality_gate_profile_status}
+        evidenceReadiness={qualityGateModel.evidence_readiness}
+        hasTestResults={readinessData?.available_inputs?.some(
+          (input: any) => input.key === "current_pr_execution" && input.status === "AVAILABLE"
+        ) ?? false}
+        hasCoverageReport={readinessData?.available_inputs?.some(
+          (input: any) => input.key === "coverage_report" && input.status === "AVAILABLE"
+        ) ?? false}
       />
 
       {/* Feedback Footer */}

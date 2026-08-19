@@ -1,10 +1,13 @@
 import hashlib
 import json
+import logging
+import uuid
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from uuid import UUID
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.models.repository import Repository
 from app.models.pull_request import PullRequest, PullRequestChangedFile
@@ -21,7 +24,193 @@ from app.models.acceptance_criterion import AcceptanceCriterion
 from app.models.requirement_package import RequirementPackage
 from app.models.requirement_group import RequirementGroup
 from app.services.repository_readiness import RepositoryReadinessService
+from app.services.ac_test_mapping_service import ACTestMappingService
 from app.schemas.recommendation import RecommendationInputSnapshotResponse
+
+logger = logging.getLogger("veriscope.recommendation_input_builder")
+
+
+def _safe_message(exc: Exception, max_len: int = 200) -> str:
+    """Return a safe, single-line, truncated string from an exception."""
+    msg = str(exc).replace("\r", " ").replace("\n", " ") if str(exc) else type(exc).__name__
+    return msg[:max_len]
+
+
+_SOURCE_FILE_EXCLUDES = (".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".lock")
+_TEST_FILE_SUFFIXES = ("_test.py", "test.py", ".spec.ts", ".test.ts", ".test.js", ".spec.js")
+
+
+def _build_readiness_input_summary_for_snapshot(
+    db: Session,
+    repository_id: UUID,
+    pull_request_id: UUID,
+    pr: Optional[PullRequest],
+    latest_coverage: Optional[CoverageReport],
+    changed_files: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Return the normalized readiness input summary consumed by recommendation pages.
+
+    Uses the same authoritative sources as the readiness cards:
+    - ACTestMappingService for AC mapping summary
+    - Granular TestResult rows for current PR test counts
+    - CoverageReport.commit_sha vs PR head SHA for coverage currency
+    - Changed files vs CoverageFileEntry paths for changed-file coverage
+    """
+    mapping_res = ACTestMappingService().build_mappings_for_pr(
+        db=db,
+        repository_id=repository_id,
+        pull_request_id=pull_request_id,
+    )
+    ms = mapping_res.get("mapping_summary") or {}
+
+    user_confirmed = int(ms.get("user_confirmed", 0) or 0)
+    auto_trusted = (
+        int(ms.get("evidence_verified_aligned", 0) or 0)
+        + int(ms.get("metadata_conflict_semantic_match", 0) or 0)
+        + int(ms.get("suggested", 0) or 0)
+    )
+
+    latest_run = db.query(TestRun).filter(
+        TestRun.repository_id == repository_id,
+        TestRun.pull_request_id == pull_request_id,
+    ).order_by(TestRun.created_at.desc()).first()
+
+    total = passed = failed = skipped = 0
+    if latest_run:
+        base_q = db.query(func.count(TestResult.id)).filter(
+            TestResult.test_run_id == latest_run.id
+        )
+        total = base_q.scalar() or 0
+        passed = base_q.filter(
+            func.lower(TestResult.status).in_(["passed", "success"])
+        ).scalar() or 0
+        failed = base_q.filter(
+            func.lower(TestResult.status).in_(["failed", "failure", "error"])
+        ).scalar() or 0
+        skipped = base_q.filter(
+            func.lower(TestResult.status).in_(["skipped", "skip"])
+        ).scalar() or 0
+
+    coverage_current = False
+    coverage_sha_mismatch = False
+    if latest_coverage and pr:
+        coverage_current = bool(latest_coverage.commit_sha == pr.head_commit_sha)
+        coverage_sha_mismatch = bool(
+            latest_coverage.commit_sha and latest_coverage.commit_sha != pr.head_commit_sha
+        )
+
+    source_changed = []
+    test_changed = []
+    for f in changed_files:
+        path = f.get("file_path") or f.get("path") or ""
+        lower = path.lower()
+        if lower.endswith(_SOURCE_FILE_EXCLUDES):
+            continue
+        if any(lower.endswith(suffix) for suffix in _TEST_FILE_SUFFIXES) or "test" in lower:
+            test_changed.append(path)
+        else:
+            source_changed.append(path)
+
+    covered_paths: set = set()
+    if latest_coverage:
+        entries = db.query(CoverageFileEntry).filter(
+            CoverageFileEntry.coverage_report_id == latest_coverage.id
+        ).all()
+        for entry in entries:
+            fp = getattr(entry, "file_path", None)
+            if fp:
+                covered_paths.add(fp)
+
+    changed_source_total = len(source_changed)
+    changed_source_covered = sum(1 for p in source_changed if p in covered_paths)
+    changed_test_total = len(test_changed)
+
+    overall_pct = 0.0
+    if latest_coverage and latest_coverage.line_coverage_ratio is not None:
+        overall_pct = round(float(latest_coverage.line_coverage_ratio) * 100, 1)
+
+    return {
+        "repository_id": str(repository_id),
+        "pull_request_id": str(pull_request_id),
+        "pr_head_sha": pr.head_commit_sha if pr else None,
+        "accepted_acs": int(ms.get("total_acs", 0) or 0),
+        "trusted_ac_mappings": user_confirmed + auto_trusted,
+        "auto_trusted_ac_mappings": auto_trusted,
+        "user_confirmed_ac_mappings": user_confirmed,
+        "review_required_ac_mappings": (
+            int(ms.get("partial_support", 0) or 0)
+            + int(ms.get("no_candidate", 0) or 0)
+            + int(ms.get("rejected", 0) or 0)
+        ),
+        "metadata_conflicts": int(ms.get("metadata_conflict_semantic_match", 0) or 0),
+        "partial_support": int(ms.get("partial_support", 0) or 0),
+        "no_candidate": int(ms.get("no_candidate", 0) or 0),
+        "current_pr_tests_total": total,
+        "current_pr_tests_passed": passed,
+        "current_pr_tests_failed": failed,
+        "current_pr_tests_skipped": skipped,
+        "coverage_is_current": coverage_current,
+        "coverage_sha_mismatch": coverage_sha_mismatch,
+        "changed_source_files_total": changed_source_total,
+        "changed_source_files_covered": changed_source_covered,
+        "changed_test_files_total": changed_test_total,
+        "overall_coverage_percent": overall_pct,
+    }
+
+
+class RecommendationInputBuilderError(Exception):
+    """Raised when a stage inside RecommendationInputBuilder fails."""
+
+    def __init__(
+        self,
+        *,
+        request_id: str,
+        stage: str,
+        original_error: Optional[Exception] = None,
+        message: str = "",
+    ):
+        self.request_id = request_id
+        self.stage = stage
+        self.original_error = original_error
+        self.message = _safe_message(Exception(message) if message else Exception("unknown"))
+        super().__init__(
+            f"RecommendationInputBuilder failed at stage '{stage}' "
+            f"(request_id={request_id}): {self.message}"
+        )
+
+
+def _log_stage(
+    *,
+    request_id: str,
+    stage: str,
+    started: bool,
+    completed: bool,
+    repository_id: Optional[UUID] = None,
+    pull_request_id: Optional[UUID] = None,
+    records_loaded: int = 0,
+    error_type: Optional[str] = None,
+    error_message: str = "",
+    extra: Optional[Dict[str, Any]] = None,
+):
+    payload = {
+        "request_id": request_id,
+        "stage": stage,
+        "started": started,
+        "completed": completed,
+        "repository_id": str(repository_id) if repository_id else None,
+        "pull_request_id": str(pull_request_id) if pull_request_id else None,
+        "records_loaded": records_loaded,
+        "error_type": error_type,
+        "error_message": error_message,
+    }
+    if extra:
+        payload.update(extra)
+    if completed and not error_type:
+        logger.info(json.dumps({"event": "recommendation_input_builder_stage", **payload}))
+    elif completed and error_type:
+        logger.error(json.dumps({"event": "recommendation_input_builder_stage_failed", **payload}))
+    else:
+        logger.info(json.dumps({"event": "recommendation_input_builder_stage_started", **payload}))
 
 
 class RecommendationInputBuilder:
@@ -37,9 +226,84 @@ class RecommendationInputBuilder:
         Deterministically gathers repository + PR evidence (changed files, test runs/results,
         coverage reports/file entries, readiness, fragility patterns) and generates
         an immutable snapshot with a deterministic SHA-256 hash.
+
+        This method is read-only. It explicitly disables autoflush so that any dirty
+        pending state passed in from the caller is not flushed during the read phase.
         """
+        request_id = str(uuid.uuid4())
+        _log_stage(
+            request_id=request_id,
+            stage="build_recommendation_input",
+            started=True,
+            completed=False,
+            repository_id=repository_id,
+            pull_request_id=pull_request_id,
+        )
+
+        try:
+            # Read-only phase: prevent autoflush of any caller-pending state.
+            with db.no_autoflush:
+                return cls._build_snapshot_core(
+                    request_id=request_id,
+                    db=db,
+                    repository_id=repository_id,
+                    pull_request_id=pull_request_id,
+                    workspace=workspace,
+                )
+        except SQLAlchemyError as exc:
+            _log_stage(
+                request_id=request_id,
+                stage="build_recommendation_input",
+                started=True,
+                completed=True,
+                repository_id=repository_id,
+                pull_request_id=pull_request_id,
+                error_type=type(exc).__name__,
+                error_message=_safe_message(exc),
+                extra={"sqlalchemy_exception": repr(exc)},
+            )
+            logger.exception(
+                f"RecommendationInputBuilder first SQLAlchemy error "
+                f"(request_id={request_id}): {exc}"
+            )
+            raise RecommendationInputBuilderError(
+                request_id=request_id,
+                stage="build_recommendation_input",
+                original_error=exc,
+                message=_safe_message(exc),
+            ) from exc
+
+    @classmethod
+    def _build_snapshot_core(
+        cls,
+        request_id: str,
+        db: Session,
+        repository_id: UUID,
+        pull_request_id: UUID,
+        workspace: Workspace
+    ) -> RecommendationInputSnapshotResponse:
+        """Core read-only snapshot construction with per-stage logging."""
+
+        def log(stage: str, started: bool = False, completed: bool = False, records: int = 0, error: Optional[str] = None):
+            _log_stage(
+                request_id=request_id,
+                stage=stage,
+                started=started,
+                completed=completed,
+                repository_id=repository_id,
+                pull_request_id=pull_request_id,
+                records_loaded=records,
+                error_type=type(error).__name__ if error else None,
+                error_message=error or "",
+            )
+
+        log("load_repository", started=True)
         # 1. Load path-backed changed-file evidence for this PR.
+        log("load_pull_request", started=True)
         pr_record = db.query(PullRequest).filter(PullRequest.id == pull_request_id).first()
+        log("load_pull_request", completed=True, records=1 if pr_record else 0)
+
+        log("load_changed_files", started=True)
         from app.services.input_readiness_v2_service import InputReadinessV2Service
         changed_files_evidence = InputReadinessV2Service.get_changed_files_evidence(db, pr_record) if pr_record else {
             "changed_file_paths_available": False,
@@ -131,6 +395,17 @@ class RecommendationInputBuilder:
         # 5. Compute repository readiness
         readiness_svc = RepositoryReadinessService(db)
         readiness = readiness_svc.calculate_readiness(repository_id, workspace.id)
+
+        # 5a. Compute normalized readiness input summary for the recommendation page.
+        # This uses the same authoritative sources as the readiness cards.
+        readiness_input_summary = _build_readiness_input_summary_for_snapshot(
+            db=db,
+            repository_id=repository_id,
+            pull_request_id=pull_request_id,
+            pr=pr_record,
+            latest_coverage=latest_coverage,
+            changed_files=changed_files,
+        )
 
         # 6. Load active fragility patterns sorted by id
         fragility_patterns_db = (
@@ -344,7 +619,7 @@ class RecommendationInputBuilder:
             .filter(
                 AcceptanceCriterion.repository_id == repository_id,
                 AcceptanceCriterion.pull_request_id == pull_request_id,
-                AcceptanceCriterion.status == "ACTIVE"
+                AcceptanceCriterion.status.in_(["ACCEPTED", "NEEDS_REVIEW"])
             )
             .order_by(AcceptanceCriterion.created_at.asc())
             .all()
@@ -486,6 +761,7 @@ class RecommendationInputBuilder:
             "coverage_confidence": coverage_confidence,
             "readiness_state": readiness.readiness_state,
             "readiness_reasons": readiness.readiness_reasons or [],
+            "readiness_input_summary": readiness_input_summary,
             "fragility_patterns": fragility_patterns,
             "behaviors": behaviors_snapshot,
             "journeys": journeys_snapshot,
@@ -524,6 +800,7 @@ class RecommendationInputBuilder:
             coverage_confidence=coverage_confidence,
             readiness_state=readiness.readiness_state,
             readiness_reasons=readiness.readiness_reasons or [],
+            readiness_input_summary=readiness_input_summary,
             fragility_patterns=fragility_patterns,
             behaviors=behaviors_snapshot,
             journeys=journeys_snapshot,

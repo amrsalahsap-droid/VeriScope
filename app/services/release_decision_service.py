@@ -80,33 +80,176 @@ class ReleaseDecisionService:
     def get_release_state(db: Session, run_id: uuid.UUID) -> Optional[Dict[str, Any]]:
         """Get the current release decision state for a recommendation run.
 
+        The release decision is computed from the normalized readiness input
+        summary (`run.evidence_summary_at_generation["readiness_input_summary"]`)
+        so it stays consistent with the readiness cards and does not drift
+        because of stale stored health/status columns.
+
         Args:
             db: Database session
             run_id: Recommendation run ID
 
         Returns:
-            Dict with release decision state or None if no decision exists
+            Dict with release decision state or None if no run exists
         """
+        run = db.query(RecommendationRun).filter(RecommendationRun.id == run_id).first()
+        if not run:
+            return None
+
         decision = db.query(ReleaseDecision).filter(
             ReleaseDecision.recommendation_run_id == run_id,
             ReleaseDecision.is_active == True
         ).first()
 
-        if not decision:
-            return None
+        # Prefer the authoritative normalized readiness summary. If it is missing,
+        # fall back to the stored decision/health fields for backward compatibility.
+        readiness_summary = (
+            (run.evidence_summary_at_generation or {}).get("readiness_input_summary") or {}
+        )
 
-        return {
-            "decisionId": str(decision.id),
-            "decisionStatus": decision.decision_status,
-            "approverId": str(decision.approver_id) if decision.approver_id else None,
-            "approverName": decision.approver_name,
-            "decisionNote": decision.decision_note,
-            "snapshotHash": decision.snapshot_hash,
-            "evidenceHealthStatus": decision.evidence_health_status,
-            "readinessState": decision.readiness_state,
-            "createdAt": decision.created_at.isoformat() + "Z" if decision.created_at else None,
-            "updatedAt": decision.updated_at.isoformat() + "Z" if decision.updated_at else None,
+        total_requirements = int(readiness_summary.get("accepted_acs", 0) or 0)
+        trusted_requirements = int(readiness_summary.get("trusted_ac_mappings", 0) or 0)
+        requirements_requiring_action = int(
+            readiness_summary.get("review_required_ac_mappings", 0) or 0
+        )
+        current_pr_tests_passed = int(
+            readiness_summary.get("current_pr_tests_passed", 0) or 0
+        )
+        current_pr_tests_failed = int(
+            readiness_summary.get("current_pr_tests_failed", 0) or 0
+        )
+        coverage_is_current = bool(readiness_summary.get("coverage_is_current", False))
+
+        # Verification status based purely on normalized AC coverage evidence.
+        if total_requirements == 0:
+            verification_status = "NOT_VERIFIED"
+        elif trusted_requirements == total_requirements and current_pr_tests_passed > 0:
+            verification_status = "FULLY_VERIFIED"
+        elif trusted_requirements > 0:
+            verification_status = "PARTIALLY_VERIFIED"
+        else:
+            verification_status = "NOT_VERIFIED"
+
+        # Quality gate / release blockers derived from normalized evidence.
+        blockers = []
+        if requirements_requiring_action > 0:
+            blockers.append(
+                f"{requirements_requiring_action} acceptance criteria require review"
+            )
+        if current_pr_tests_failed > 0:
+            blockers.append(
+                f"{current_pr_tests_failed} current PR tests failed"
+            )
+        if not coverage_is_current:
+            blockers.append("Coverage is not current for the PR head commit")
+
+        # Optional governance inputs (e.g. manual tests, business intent) are warnings,
+        # not AC verification failures.
+        evidence_summary = run.evidence_summary_at_generation or {}
+        missing_signals = evidence_summary.get("missing_signals") or []
+        optional_governance_missing = bool(missing_signals)
+
+        if blockers:
+            quality_gate = "NOT_READY"
+            quality_gate_reason = "Release blocked: " + "; ".join(blockers)
+        elif optional_governance_missing:
+            quality_gate = "READY_WITH_WARNINGS"
+            quality_gate_reason = (
+                "All ACs have trusted passing evidence. "
+                "Optional governance inputs may still be missing."
+            )
+        else:
+            quality_gate = "READY"
+            quality_gate_reason = "All ACs have trusted passing evidence."
+
+        # ----------------------------------------------------------------------
+        # Required Before Release / Final Release Decision gating
+        # ----------------------------------------------------------------------
+        # Blocker calculation is only trustworthy when the generation succeeded and
+        # the run is not a stale/draft/unsafe artifact.  When it cannot be trusted
+        # we surface CALCULATION_FAILED instead of falsely claiming "all clear".
+        can_compute_blockers = bool(
+            readiness_summary
+            and not run.is_draft
+            and not run.input_stale
+            and not run.generation_blocked_reason
+            and not run.unsafe_for_optimization
+        )
+
+        if can_compute_blockers:
+            if blockers:
+                required_before_release_status = "BLOCKED"
+                final_release_decision = "BLOCKED"
+                approve_enabled = False
+                gating_reason = "Release blocked: " + "; ".join(blockers)
+            elif quality_gate == "READY_WITH_WARNINGS":
+                required_before_release_status = "CLEAR"
+                final_release_decision = "READY_FOR_APPROVAL_WITH_WARNINGS"
+                approve_enabled = True
+                gating_reason = "All blockers clear; optional governance inputs may still be missing."
+            elif quality_gate in ("UNKNOWN", "NOT_READY"):
+                required_before_release_status = "CLEAR"
+                final_release_decision = "GOVERNANCE_OVERRIDE_REQUIRED"
+                approve_enabled = False
+                gating_reason = "Quality gate is not ready; governance override required."
+            else:
+                required_before_release_status = "CLEAR"
+                final_release_decision = "READY_FOR_APPROVAL"
+                approve_enabled = True
+                gating_reason = "All blockers clear."
+        else:
+            failure_reasons = []
+            if not readiness_summary:
+                failure_reasons.append("readiness input summary unavailable")
+            if run.is_draft:
+                failure_reasons.append("recommendation is a draft")
+            if run.input_stale:
+                failure_reasons.append("inputs are stale")
+            if run.generation_blocked_reason:
+                failure_reasons.append(f"generation blocked: {run.generation_blocked_reason}")
+            if run.unsafe_for_optimization:
+                failure_reasons.append("recommendation flagged as unsafe for optimization")
+
+            required_before_release_status = "CALCULATION_FAILED"
+            final_release_decision = "BLOCKED"
+            approve_enabled = False
+            gating_reason = (
+                "Release blockers could not be calculated."
+                if not failure_reasons
+                else "Release blockers could not be calculated: " + "; ".join(failure_reasons) + "."
+            )
+
+        # Legacy stored fields kept for compatibility.
+        stored_readiness = decision.readiness_state if decision else None
+        stored_health = decision.evidence_health_status if decision else run.evidence_health_status
+
+        result = {
+            "decisionId": str(decision.id) if decision else None,
+            "decisionStatus": decision.decision_status if decision else "PENDING_REVIEW",
+            "approverId": str(decision.approver_id) if decision and decision.approver_id else None,
+            "approverName": decision.approver_name if decision else None,
+            "decisionNote": decision.decision_note if decision else None,
+            "snapshotHash": decision.snapshot_hash if decision else ReleaseDecisionService.get_snapshot_hash(run),
+            "evidenceHealthStatus": stored_health,
+            "readinessState": stored_readiness,
+            "verification_status": verification_status,
+            "trusted_requirements": trusted_requirements,
+            "total_requirements": total_requirements,
+            "requirements_requiring_action": requirements_requiring_action,
+            "current_pr_tests_passed": current_pr_tests_passed,
+            "quality_gate": quality_gate,
+            "quality_gate_reason": quality_gate_reason,
+            "quality_gate_profile": "Missing",
+            "evidence_readiness": "Ready" if not blockers else "Not Ready",
+            "required_before_release_status": required_before_release_status,
+            "blockers": blockers,
+            "final_release_decision": final_release_decision,
+            "approve_enabled": approve_enabled,
+            "reason": gating_reason,
+            "createdAt": decision.created_at.isoformat() + "Z" if decision and decision.created_at else None,
+            "updatedAt": decision.updated_at.isoformat() + "Z" if decision and decision.updated_at else None,
         }
+        return result
 
     @staticmethod
     def submit_release_decision(
@@ -139,6 +282,15 @@ class ReleaseDecisionService:
         valid_statuses = {"APPROVED", "REJECTED", "CONDITIONALLY_APPROVED"}
         if decision_status not in valid_statuses:
             raise ValueError(f"Invalid decision status: {decision_status}. Must be one of {valid_statuses}")
+
+        # Approval requires the computed release state to allow it.
+        if decision_status in {"APPROVED", "CONDITIONALLY_APPROVED"}:
+            current_state = ReleaseDecisionService.get_release_state(db, run.id)
+            if current_state and not current_state.get("approve_enabled", True):
+                raise ValueError(
+                    f"RELEASE_DECISION_BLOCKED: Cannot approve release. "
+                    f"Reason: {current_state.get('reason', 'Release blockers not cleared or calculation failed.')}"
+                )
 
         # Validate snapshot hash
         current_snapshot_hash = ReleaseDecisionService.get_snapshot_hash(run)

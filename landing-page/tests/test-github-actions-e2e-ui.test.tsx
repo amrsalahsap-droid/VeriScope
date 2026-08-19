@@ -80,37 +80,37 @@ describe('GitHub Actions E2E UI', () => {
     };
 
     it('displays GitHub status when published', () => {
-      render(<CICDPipelineRunsPanel pipelineRuns={[mockRunWithGitHubState]} gateStatus="PARTIAL" />);
+      render(<CICDPipelineRunsPanel pipelineRuns={[mockRunWithGitHubState]} qualityGateProfileStatus="CONFIGURED" evidenceReadiness="READY_WITH_REVIEW" />);
       
       expect(screen.getByText('GitHub Status: neutral')).toBeInTheDocument();
     });
 
     it('displays PR comment status when posted', () => {
-      render(<CICDPipelineRunsPanel pipelineRuns={[mockRunWithGitHubState]} gateStatus="PARTIAL" />);
+      render(<CICDPipelineRunsPanel pipelineRuns={[mockRunWithGitHubState]} qualityGateProfileStatus="CONFIGURED" evidenceReadiness="READY_WITH_REVIEW" />);
       
       expect(screen.getByText('PR Comment: posted')).toBeInTheDocument();
     });
 
     it('displays failure reason when present', () => {
-      render(<CICDPipelineRunsPanel pipelineRuns={[mockRunWithFailure]} gateStatus="BLOCKED" />);
+      render(<CICDPipelineRunsPanel pipelineRuns={[mockRunWithFailure]} qualityGateProfileStatus="CONFIGURED" evidenceReadiness="BLOCKED" />);
       
       expect(screen.getByText('Error: GitHub API timeout')).toBeInTheDocument();
     });
 
     it('displays branch name when available', () => {
-      render(<CICDPipelineRunsPanel pipelineRuns={[mockRunWithGitHubState]} gateStatus="PARTIAL" />);
+      render(<CICDPipelineRunsPanel pipelineRuns={[mockRunWithGitHubState]} qualityGateProfileStatus="CONFIGURED" evidenceReadiness="READY_WITH_REVIEW" />);
       
       expect(screen.getByText('feature/test')).toBeInTheDocument();
     });
 
     it('does not display GitHub status when not published', () => {
-      render(<CICDPipelineRunsPanel pipelineRuns={[mockRunWithFailure]} gateStatus="BLOCKED" />);
+      render(<CICDPipelineRunsPanel pipelineRuns={[mockRunWithFailure]} qualityGateProfileStatus="CONFIGURED" evidenceReadiness="BLOCKED" />);
       
       expect(screen.queryByText(/GitHub Status:/)).not.toBeInTheDocument();
     });
 
     it('does not display PR comment status when not posted', () => {
-      render(<CICDPipelineRunsPanel pipelineRuns={[mockRunWithFailure]} gateStatus="BLOCKED" />);
+      render(<CICDPipelineRunsPanel pipelineRuns={[mockRunWithFailure]} qualityGateProfileStatus="CONFIGURED" evidenceReadiness="BLOCKED" />);
       
       expect(screen.queryByText(/PR Comment:/)).not.toBeInTheDocument();
     });
@@ -128,7 +128,7 @@ describe('GitHub Actions E2E UI', () => {
         createdAt: '2024-01-01T00:00:00Z'
       };
 
-      const { container } = render(<CICDPipelineRunsPanel pipelineRuns={[mockRun]} gateStatus="PARTIAL" />);
+      const { container } = render(<CICDPipelineRunsPanel pipelineRuns={[mockRun]} qualityGateProfileStatus="CONFIGURED" evidenceReadiness="READY_WITH_REVIEW" />);
       
       expect(container.textContent).toContain('PARTIAL');
     });
@@ -144,7 +144,7 @@ describe('GitHub Actions E2E UI', () => {
         createdAt: '2024-01-01T00:00:00Z'
       };
 
-      const { container } = render(<CICDPipelineRunsPanel pipelineRuns={[mockRun]} gateStatus="PASSED" />);
+      const { container } = render(<CICDPipelineRunsPanel pipelineRuns={[mockRun]} qualityGateProfileStatus="CONFIGURED" evidenceReadiness="READY" />);
       
       // Use container text content to find the specific quality gate badge
       expect(container.textContent).toContain('PASSED');
@@ -161,7 +161,7 @@ describe('GitHub Actions E2E UI', () => {
         createdAt: '2024-01-01T00:00:00Z'
       };
 
-      const { container } = render(<CICDPipelineRunsPanel pipelineRuns={[mockRun]} gateStatus="BLOCKED" />);
+      const { container } = render(<CICDPipelineRunsPanel pipelineRuns={[mockRun]} qualityGateProfileStatus="CONFIGURED" evidenceReadiness="BLOCKED" />);
       
       expect(container.textContent).toContain('BLOCKED');
     });
@@ -179,7 +179,7 @@ describe('GitHub Actions E2E UI', () => {
         createdAt: '2024-01-01T00:00:00Z'
       };
 
-      render(<CICDPipelineRunsPanel pipelineRuns={[mockRun]} gateStatus="PARTIAL" />);
+      render(<CICDPipelineRunsPanel pipelineRuns={[mockRun]} qualityGateProfileStatus="CONFIGURED" evidenceReadiness="READY_WITH_REVIEW" />);
       
       expect(screen.getByText('Download Evidence Artifact')).toBeInTheDocument();
     });
@@ -218,21 +218,21 @@ describe('GitHub Actions E2E UI', () => {
     it('displays inactive status for revoked tokens in UI', () => {
       // This would be tested when the CI Token Management UI is implemented
       // For now, we verify the component structure exists
-      render(<CICDPipelineRunsPanel pipelineRuns={[]} gateStatus="UNKNOWN" />);
+      render(<CICDPipelineRunsPanel pipelineRuns={[]} qualityGateProfileStatus="MISSING" evidenceReadiness="BLOCKED" />);
       
-      expect(screen.getByText((content) => content.includes('No CI/CD runs yet'))).toBeInTheDocument();
+      expect(screen.getByText((content) => content.includes('No CI/CD runs or manual evidence yet'))).toBeInTheDocument();
     });
   });
 
   describe('Empty State', () => {
     it('shows empty state when no pipeline runs exist', () => {
-      render(<CICDPipelineRunsPanel pipelineRuns={[]} gateStatus="UNKNOWN" />);
+      render(<CICDPipelineRunsPanel pipelineRuns={[]} qualityGateProfileStatus="MISSING" evidenceReadiness="BLOCKED" />);
       
-      expect(screen.getByText((content) => content.includes('No CI/CD runs yet'))).toBeInTheDocument();
+      expect(screen.getByText((content) => content.includes('No CI/CD runs or manual evidence yet'))).toBeInTheDocument();
     });
 
     it('empty state includes GitHub Actions snippet', () => {
-      render(<CICDPipelineRunsPanel pipelineRuns={[]} gateStatus="UNKNOWN" />);
+      render(<CICDPipelineRunsPanel pipelineRuns={[]} qualityGateProfileStatus="MISSING" evidenceReadiness="BLOCKED" />);
       
       expect(screen.getByText('GitHub Actions Integration')).toBeInTheDocument();
     });

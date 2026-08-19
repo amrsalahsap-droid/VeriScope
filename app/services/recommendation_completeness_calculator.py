@@ -352,6 +352,144 @@ class RecommendationCompletenessCalculator:
         }
 
     @classmethod
+    def refresh_acceptance_criteria_dimension(
+        cls,
+        historical_assessment: Dict[str, Any],
+        current_ac_count: int,
+    ) -> Dict[str, Any]:
+        """
+        Refresh only the acceptance_criteria dimension of a completeness assessment
+        using a live AC count, without mutating the historical record.
+
+        Returns a copy of the assessment with:
+        - updated acceptance_criteria dimension score/details
+        - acceptance_criteria gap removed if ACs now exist
+        - overall_score and grade recalculated
+        """
+        if not historical_assessment:
+            return cls._empty_result()
+
+        import copy
+        refreshed = copy.deepcopy(historical_assessment)
+
+        has_ac = current_ac_count > 0
+
+        # Recompute AC dimension
+        if not has_ac:
+            ac_score = 0.0
+            ac_details = {
+                "has_acceptance_criteria": False,
+                "acceptance_criteria_count": 0,
+                "missing_ac": True,
+                "ratio": 0.0,
+            }
+        else:
+            # Use existing business_intent_matrix values if available.
+            # These are historical evidence counts and must not be reinterpreted.
+            existing_details = (
+                refreshed.get("dimensions", {})
+                .get("acceptance_criteria", {})
+                .get("details", {})
+            )
+            total_intents = existing_details.get("total_intents", 0)
+            covered = existing_details.get("covered", 0)
+            verified = existing_details.get("verified", 0)
+
+            # Validate that historical counts are non-negative and logically bounded.
+            # Reject incompatible historical counts instead of reusing them blindly.
+            counts_valid = (
+                isinstance(covered, (int, float))
+                and isinstance(verified, (int, float))
+                and isinstance(total_intents, (int, float))
+                and covered >= 0
+                and verified >= 0
+                and total_intents > 0
+                and covered <= total_intents
+                and verified <= total_intents
+                and (covered > 0 or verified > 0)
+            )
+
+            if current_ac_count != total_intents:
+                # AC count has changed since generation; historical coverage counts
+                # are no longer compatible with the current AC set.
+                counts_valid = False
+
+            if counts_valid:
+                coverage_known = True
+                ratio = (covered + 0.5 * verified) / total_intents
+                ac_score = ratio * 15.0
+            else:
+                # ACs exist, but no compatible coverage/verification evidence is
+                # available to this calculator. Do not fabricate coverage credit.
+                coverage_known = False
+                total_intents = current_ac_count
+                covered = 0
+                verified = 0
+                ratio = 0.0
+                ac_score = 0.0
+
+            ac_details = {
+                "has_acceptance_criteria": True,
+                "acceptance_criteria_count": current_ac_count,
+                "total_intents": total_intents,
+                "covered": covered,
+                "verified": verified,
+                "missing_ac": False,
+                "coverage_known": coverage_known,
+                "ratio": round(ratio, 3),
+            }
+
+        # Update AC dimension
+        if "dimensions" in refreshed:
+            refreshed["dimensions"]["acceptance_criteria"] = {
+                "score": round(ac_score, 1),
+                "max": 15,
+                "details": ac_details,
+            }
+
+        # Remove acceptance_criteria gap if ACs now exist
+        if has_ac:
+            refreshed["gaps"] = [
+                g for g in refreshed.get("gaps", [])
+                if g.get("dimension") != "acceptance_criteria"
+            ]
+        else:
+            # Ensure the gap exists if ACs are missing
+            existing_gap = any(
+                g.get("dimension") == "acceptance_criteria"
+                for g in refreshed.get("gaps", [])
+            )
+            if not existing_gap:
+                refreshed.setdefault("gaps", []).append({
+                    "dimension": "acceptance_criteria",
+                    "gap": "No acceptance criteria provided for requirement validation",
+                    "severity": "HIGH",
+                    "suggestion": "Paste acceptance criteria to improve requirement coverage and recommendation accuracy.",
+                })
+
+        # Recalculate overall score
+        dims = refreshed.get("dimensions", {})
+        total_score = sum(
+            dims.get(d, {}).get("score", 0)
+            for d in ("behavior_coverage", "journey_coverage", "scenario_coverage",
+                      "evidence_quality", "signal_diversity", "acceptance_criteria")
+        )
+        refreshed["overall_score"] = round(min(100, max(0, total_score)), 1)
+
+        if refreshed["overall_score"] >= 85:
+            refreshed["grade"] = "EXCELLENT"
+        elif refreshed["overall_score"] >= 70:
+            refreshed["grade"] = "GOOD"
+        elif refreshed["overall_score"] >= 50:
+            refreshed["grade"] = "MODERATE"
+        elif refreshed["overall_score"] >= 30:
+            refreshed["grade"] = "WEAK"
+        else:
+            refreshed["grade"] = "INSUFFICIENT"
+
+        return refreshed
+
+    @classmethod
     def _empty_result(cls) -> Dict[str, Any]:
         return {
             "overall_score": 0,

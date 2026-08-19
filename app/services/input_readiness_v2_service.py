@@ -1918,8 +1918,10 @@ class InputReadinessV2Service:
                 ],
             )
 
-        # File linkage validation
-        covered_files = {fe.file_path for fe in file_entries}
+        # File linkage validation — a file only counts as "covered" if it has at
+        # least one actually-covered line. A file entry with zero covered lines
+        # (0% coverage) must NOT be treated as covered just because a row exists.
+        covered_files = {fe.file_path for fe in file_entries if fe.covered_lines and len(fe.covered_lines) > 0}
         details["covered_files"] = list(covered_files)
 
         logger.info("[INPUT 7 READINESS] Coverage file entries", {
@@ -2043,135 +2045,79 @@ class InputReadinessV2Service:
         details["resolved_test_count"] = len(resolved_tests)
         details["unresolved_test_count"] = len(linked_test_ids) - len(resolved_tests)
 
-        # Determine status based on coverage level and linkage quality
-        # Coverage level hierarchy: TEST_CASE_LEVEL > TEST_FILE_LEVEL > RUN_LEVEL
-        status = "READY"
-        earned_score = weight
+        # ─── Simplified status classification (single source of truth) ───────
+        # MISSING only when: no coverage report / cannot be parsed / no file-level
+        # coverage records exist (covered_file_count == 0 or files_total == 0).
+        # HISTORICAL_ONLY is handled by the SHA-mismatch early-return above, so by
+        # this point is_current is always True and sha_mismatch is always False.
+        # READY / PARTIAL_READY / NO_CHANGED_FILE_COVERAGE are decided purely by
+        # coverable-source-file overlap. Coverage level (RUN_LEVEL / TEST_FILE_LEVEL /
+        # TEST_CASE_LEVEL) and test-to-file link resolution are surfaced as
+        # informational `issues` only — they must never downgrade status to MISSING
+        # or PARTIAL, since file-level coverage that matches the PR is real, current
+        # evidence regardless of link granularity.
+        coverage_level = coverage.coverage_level or CoverageLevel.RUN_LEVEL
         issues = []
 
-        # Check coverage level
-        coverage_level = coverage.coverage_level or CoverageLevel.RUN_LEVEL
-
-        if not file_entries or not coverage.files_total or not coverage.total_lines:
-            status = "PARTIAL"
+        if covered_file_count == 0 or not coverage.files_total:
+            status = "MISSING"
             earned_score = 0
-            issues.append("No file coverage data")
-        elif not covered_files:
-            status = "PARTIAL"
-            earned_score = weight * 0.5
-            issues.append("No covered files found")
-
-        # Coverage level affects score and status
-        if coverage_level == CoverageLevel.RUN_LEVEL:
-            # RUN_LEVEL: aggregate coverage only, useful for risk evidence but not exact test selection
-            # File-level coverage is valid even without test-to-test links
-            if status == "READY":
-                status = "PARTIAL"
-                earned_score = weight * 0.6
-            issues.append("Aggregate coverage only (RUN_LEVEL)")
-        elif coverage_level == CoverageLevel.TEST_FILE_LEVEL:
-            # TEST_FILE_LEVEL: test-file/spec-level coverage
-            if status == "READY":
-                earned_score = weight * 0.8
-        elif coverage_level == CoverageLevel.TEST_CASE_LEVEL:
-            # TEST_CASE_LEVEL: per-test coverage - best for test selection
-            # For TEST_CASE_LEVEL, test-to-test links are expected
-            if status == "READY":
-                status = "TEST_LEVEL_READY"
-                earned_score = weight
-            # Missing test links is only a problem for TEST_CASE_LEVEL
-            if not test_links:
-                if status in ("READY", "TEST_LEVEL_READY"):
-                    status = "PARTIAL"
-                    earned_score = weight * 0.7
-                issues.append("No test-to-file linkage (expected for TEST_CASE_LEVEL)")
-            elif details["unresolved_test_count"] > 0:
-                if status in ("READY", "TEST_LEVEL_READY"):
-                    status = "PARTIAL"
-                    earned_score = weight * 0.8
-                issues.append(f"{details['unresolved_test_count']} test links unresolved")
-        else:
-            # Unknown coverage level - treat as RUN_LEVEL
-            if status == "READY":
-                status = "PARTIAL"
-                earned_score = weight * 0.5
-            issues.append("Unknown coverage level")
-
-        # Changed file coverage classification using coverable source files
-        if coverable_source_changed_files and coverable_source_overlap_count == 0:
-            # No coverable source files covered
-            if status in ("READY", "TEST_LEVEL_READY"):
+            issues.append("No file-level coverage records found")
+        elif coverable_source_changed_files:
+            if coverable_source_overlap_count == 0:
                 status = "NO_CHANGED_FILE_COVERAGE"
                 earned_score = weight * 0.3
-            issues.append("No coverage overlap with coverable source files")
-        elif coverable_source_changed_files and coverable_source_overlap_count > 0 and coverable_source_overlap_count < len(coverable_source_changed_files):
-            # Partial coverable source file coverage
-            if status in ("READY", "TEST_LEVEL_READY"):
+                issues.append("No coverage overlap with coverable source files")
+            elif coverable_source_overlap_count < len(coverable_source_changed_files):
                 status = "PARTIAL_READY"
                 earned_score = weight * 0.7
-            issues.append(f"Partial coverable source file coverage: {coverable_source_overlap_count} of {len(coverable_source_changed_files)} source files covered")
-        elif coverable_source_changed_files and coverable_source_overlap_count == len(coverable_source_changed_files):
-            # All coverable source files covered - this is good
-            if status == "PARTIAL_READY":
-                status = "READY" if coverage_level != CoverageLevel.TEST_CASE_LEVEL else "TEST_LEVEL_READY"
-                earned_score = weight if coverage_level == CoverageLevel.TEST_CASE_LEVEL else weight * 0.9
-        elif not coverable_source_changed_files and changed_test_files:
-            # Only test files changed, no source files
-            # This is acceptable - tests are verified by test execution
-            if status in ("READY", "TEST_LEVEL_READY"):
+                issues.append(
+                    f"Partial coverable source file coverage: {coverable_source_overlap_count} of "
+                    f"{len(coverable_source_changed_files)} source files covered"
+                )
+            else:
                 status = "READY"
-                earned_score = weight if coverage_level == CoverageLevel.TEST_CASE_LEVEL else weight * 0.9
-            issues.append("No coverable source files changed; only test files changed")
+                earned_score = weight
+        else:
+            # No coverable source files changed — only test files (and/or non-coverable
+            # files) changed. Verified by current PR test execution, so READY.
+            status = "READY"
+            earned_score = weight
+            if changed_test_files:
+                issues.append("No coverable source files changed; only test files changed")
 
-        # Relevance — based only on real data signals, NOT on artifact parse confidence.
-        # coverage_artifact_health (parse confidence) reflects how well the file was parsed;
-        # it does NOT mean the coverage is current or relevant to this PR.
-        is_relevant = False
+        # Test-to-file linkage / coverage-level granularity — informational only.
+        if coverage_level == CoverageLevel.TEST_CASE_LEVEL:
+            if not test_links:
+                issues.append("No test-to-file linkage (expected for TEST_CASE_LEVEL)")
+            elif details["unresolved_test_count"] > 0:
+                issues.append(f"{details['unresolved_test_count']} test links unresolved")
+
+        # Relevance — informational signal only, does not affect status.
+        is_relevant = bool((changed_files and overlap_count > 0) or (test_links and len(resolved_tests) > 0))
         relevance_reasons = []
-
         if changed_files and overlap_count > 0:
-            is_relevant = True
             relevance_reasons.append(f"Coverage overlaps {overlap_count} changed files")
-
         if test_links and len(resolved_tests) > 0:
-            is_relevant = True
             relevance_reasons.append(f"Coverage linked to {len(resolved_tests)} resolved tests")
-
         details["is_relevant"] = is_relevant
         details["relevance_reasons"] = relevance_reasons
 
-        # Adjust score if coverage has data but is not relevant to this PR
-        if not is_relevant and status == "READY":
-            status = "PARTIAL"
-            earned_score = weight * 0.8
-            issues.append("Coverage not relevant to current changes")
-
-        # current_pr_coverage_confidence: only meaningful when SHA matches AND data is non-empty.
-        # Do not surface artifact parse confidence as current-PR confidence.
-        has_meaningful_coverage = bool(
-            coverage.files_total and coverage.total_lines and file_entries
-        )
-        if status == "READY" and has_meaningful_coverage:
-            # For RUN_LEVEL, file-level coverage is sufficient
-            if coverage_level == CoverageLevel.RUN_LEVEL:
-                current_pr_cov_confidence = coverage.coverage_confidence or "MODERATE"
-            # For TEST_CASE_LEVEL, test links are required
-            elif coverage_level == CoverageLevel.TEST_CASE_LEVEL and test_links:
-                current_pr_cov_confidence = coverage.coverage_confidence or "MODERATE"
-            elif coverage_level == CoverageLevel.TEST_CASE_LEVEL:
-                current_pr_cov_confidence = "LOW"
-            else:
-                current_pr_cov_confidence = coverage.coverage_confidence or "MODERATE"
-        elif status == "PARTIAL_READY" and has_meaningful_coverage:
-            # PARTIAL_READY: some coverable source files covered, current coverage
+        # current_pr_coverage_confidence: derived directly from status.
+        # HIGH when all coverable source files are covered (READY).
+        # PARTIAL when some are covered (PARTIAL_READY).
+        # LOW when current coverage exists but has no changed-file overlap.
+        # NONE only when MISSING.
+        if status == "READY":
+            current_pr_cov_confidence = "HIGH"
+        elif status == "PARTIAL_READY":
             current_pr_cov_confidence = "PARTIAL"
-        elif status == "NO_CHANGED_FILE_COVERAGE" and has_meaningful_coverage:
-            # NO_CHANGED_FILE_COVERAGE: current coverage but no coverable source file overlap
+        elif status == "NO_CHANGED_FILE_COVERAGE":
             current_pr_cov_confidence = "LOW"
-        elif status == "PARTIAL" and has_meaningful_coverage and (file_entries or test_links):
-            current_pr_cov_confidence = "LOW"
-        else:
+        elif status == "MISSING":
             current_pr_cov_confidence = "NONE"
+        else:
+            current_pr_cov_confidence = "LOW"
 
         details["current_pr_coverage_confidence"] = current_pr_cov_confidence
         details["confidence_impact"] = round(earned_score / weight, 2) if weight else 0
@@ -2184,43 +2130,46 @@ class InputReadinessV2Service:
         confidence_score, confidence_label = get_confidence_score_and_label(current_pr_cov_confidence)
 
         # Build summary and status_reason
-        if status == "TEST_LEVEL_READY":
-            summary = f"Per-test coverage available ({coverage.overall_coverage_pct * 100:.1f}% overall)."
+        if status == "READY":
             if coverable_source_changed_files:
-                summary += f" All {len(coverable_source_changed_files)} coverable source files covered."
-            if changed_test_files:
-                summary += f" {len(changed_test_files)} test files changed."
-            if is_relevant:
-                summary += " Relevant to current PR."
-            details["status_reason"] = "Coverage is current at test-case level and linked to the active PR."
-        elif status == "READY":
-            summary = f"Current coverage available ({coverage.overall_coverage_pct * 100:.1f}% overall, {coverage_level})."
-            if coverable_source_changed_files:
-                summary += f" All {len(coverable_source_changed_files)} coverable source files covered."
-            elif changed_test_files:
-                summary += " No coverable source files changed; only test files changed."
-            if changed_test_files:
-                summary += f" {len(changed_test_files)} test files changed."
-            if is_relevant:
-                summary += " Relevant to current PR."
-            details["status_reason"] = f"Coverage is current at {coverage_level} and linked to the active PR."
+                summary = (
+                    f"Coverage is current and all {len(coverable_source_changed_files)} coverable changed "
+                    f"source files are covered ({coverage.overall_coverage_pct * 100:.1f}% overall)."
+                )
+                if changed_test_files:
+                    summary += f" {len(changed_test_files)} changed test files are verified by current PR test execution."
+                details["status_reason"] = (
+                    f"Coverage is current and all {len(coverable_source_changed_files)} coverable changed source "
+                    f"files are covered."
+                    + (f" {len(changed_test_files)} changed test files are verified by current PR test execution." if changed_test_files else "")
+                )
+            else:
+                summary = f"Current coverage available ({coverage.overall_coverage_pct * 100:.1f}% overall, {coverage_level})."
+                if changed_test_files:
+                    summary += f" No coverable source files changed; {len(changed_test_files)} test files are verified by current PR test execution."
+                details["status_reason"] = "Coverage is current; no coverable source files changed in this PR."
+            if issues:
+                summary += f" ({', '.join(issues)})"
         elif status == "PARTIAL_READY":
-            summary = f"Coverage is current and linked to the active PR. {coverable_source_overlap_count} of {len(coverable_source_changed_files)} coverable source files covered; {len(coverable_source_changed_files) - coverable_source_overlap_count} source files still need review."
+            summary = (
+                f"Coverage is current and linked to the active PR ({coverage.overall_coverage_pct * 100:.1f}% overall). "
+                f"{coverable_source_overlap_count} of {len(coverable_source_changed_files)} coverable source files "
+                f"covered; {len(coverable_source_changed_files) - coverable_source_overlap_count} source files still need review."
+            )
             if changed_test_files:
                 summary += f" {len(changed_test_files)} test files changed."
-            details["status_reason"] = f"Coverage is current but only partially covers coverable source files ({coverable_source_overlap_count}/{len(coverable_source_changed_files)})."
+            details["status_reason"] = (
+                f"Coverage is current but only partially covers coverable source files "
+                f"({coverable_source_overlap_count}/{len(coverable_source_changed_files)})."
+            )
         elif status == "NO_CHANGED_FILE_COVERAGE":
             summary = f"Coverage is current but does not overlap with any coverable source files. ({coverage.overall_coverage_pct * 100:.1f}% overall)."
             if changed_test_files:
                 summary += f" {len(changed_test_files)} test files changed."
             details["status_reason"] = "Coverage is current but has no overlap with coverable source files."
-        elif status == "PARTIAL":
-            summary = f"Partial coverage available ({coverage.overall_coverage_pct * 100:.1f}% overall, {coverage_level})."
-            if issues:
-                summary += f" Issues: {', '.join(issues)}."
-            details["status_reason"] = (
-                f"Coverage exists but is incomplete ({coverage_level}): {', '.join(issues) if issues else 'unknown reason'}."
-            )
+        elif status == "MISSING":
+            summary = "Coverage report exists but no file-level coverage records were found."
+            details["status_reason"] = "No file-level coverage records exist for this coverage report."
         else:
             summary = "Coverage mapping incomplete."
             details["status_reason"] = "Coverage state could not be determined."

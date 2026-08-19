@@ -1,50 +1,63 @@
 /**
  * Quality Gate Badge Component
- * Displays the quality gate status (PASSED, PASSED_WITH_OVERRIDE, PARTIAL, BLOCKED, UNKNOWN)
+ *
+ * Displays the live quality gate status derived from the regression scope
+ * release decision — not the stale readiness snapshot.
+ *
+ * Two pieces of information are shown:
+ * 1. Quality Gate Profile: CONFIGURED | MISSING
+ * 2. Evidence Readiness: READY | READY_WITH_REVIEW | BLOCKED
  */
 
 import React from 'react';
+import type {
+  QualityGateProfileStatus,
+  EvidenceReadiness,
+} from '@/lib/quality-gate';
 
 interface QualityGateBadgeProps {
-  gateStatus: 'PASSED' | 'PASSED_WITH_OVERRIDE' | 'PARTIAL' | 'BLOCKED' | 'UNKNOWN';
+  qualityGateProfileStatus: QualityGateProfileStatus;
+  evidenceReadiness: EvidenceReadiness;
 }
 
-export function QualityGateBadge({ gateStatus }: QualityGateBadgeProps) {
-  const getDisplayLabel = (): string => {
-    switch (gateStatus) {
-      case 'PASSED':
-        return 'PASSED';
-      case 'PASSED_WITH_OVERRIDE':
-        return 'PASSED (Override)';
-      case 'PARTIAL':
-        return 'PARTIAL';
-      case 'BLOCKED':
-        return 'BLOCKED';
-      case 'UNKNOWN':
-      default:
-        return 'UNKNOWN';
-    }
+export function QualityGateBadge({
+  qualityGateProfileStatus,
+  evidenceReadiness,
+}: QualityGateBadgeProps) {
+  const profileLabel =
+    qualityGateProfileStatus === 'CONFIGURED'
+      ? 'Profile: Configured'
+      : 'Profile: Missing';
+
+  const profileStyle =
+    qualityGateProfileStatus === 'CONFIGURED'
+      ? 'bg-emerald-950/20 text-emerald-400 border-emerald-800/40'
+      : 'bg-amber-950/20 text-amber-400 border-amber-800/40';
+
+  const readinessLabel: Record<EvidenceReadiness, string> = {
+    READY: 'Evidence Readiness: READY',
+    READY_WITH_REVIEW: 'Evidence Readiness: REVIEW',
+    BLOCKED: 'Evidence Readiness: BLOCKED',
   };
 
-  const getBadgeStyle = () => {
-    switch (gateStatus) {
-      case 'PASSED':
-        return 'bg-emerald-950/20 text-emerald-400 border-emerald-800/40';
-      case 'PASSED_WITH_OVERRIDE':
-        return 'bg-amber-950/20 text-amber-400 border-amber-800/40';
-      case 'PARTIAL':
-        return 'bg-amber-950/20 text-amber-400 border-amber-800/40';
-      case 'BLOCKED':
-        return 'bg-rose-950/20 text-rose-400 border-rose-800/40';
-      case 'UNKNOWN':
-      default:
-        return 'bg-zinc-950/20 text-zinc-400 border-zinc-800/40';
-    }
+  const readinessStyle: Record<EvidenceReadiness, string> = {
+    READY: 'bg-emerald-950/20 text-emerald-400 border-emerald-800/40',
+    READY_WITH_REVIEW: 'bg-amber-950/20 text-amber-400 border-amber-800/40',
+    BLOCKED: 'bg-rose-950/20 text-rose-400 border-rose-800/40',
   };
 
   return (
-    <span className={`px-2 py-1 text-xs font-semibold rounded border ${getBadgeStyle()}`}>
-      Quality Gate: {getDisplayLabel()}
-    </span>
+    <div className="flex items-center gap-2">
+      <span
+        className={`px-2 py-1 text-xs font-semibold rounded border ${profileStyle}`}
+      >
+        Quality Gate {profileLabel}
+      </span>
+      <span
+        className={`px-2 py-1 text-xs font-semibold rounded border ${readinessStyle[evidenceReadiness]}`}
+      >
+        {readinessLabel[evidenceReadiness]}
+      </span>
+    </div>
   );
 }

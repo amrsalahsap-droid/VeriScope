@@ -673,6 +673,7 @@ def refresh_repository_intelligence(
 
             except Exception as e:
                 logger.exception(f"BehaviorScenario/Coverage step failed: {e}")
+                db.rollback()
                 failed_steps.append("BEHAVIOR_SCENARIO_COVERAGE")
                 partial_errors.append({
                     "code": "BEHAVIOR_SCENARIO_COVERAGE_FAILED",

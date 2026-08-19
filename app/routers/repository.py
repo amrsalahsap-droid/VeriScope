@@ -1,7 +1,7 @@
 from uuid import UUID
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
-from fastapi import APIRouter, Depends, status, HTTPException, UploadFile, File, Form, Header
+from fastapi import APIRouter, Depends, status, HTTPException, UploadFile, File, Form, Header, Body
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.db.session import get_db
@@ -831,7 +831,7 @@ def get_repository_coverage_summary(
 def create_recommendation(
     repository_id: UUID,
     pull_request_id: UUID,
-    payload: Optional[RecommendationGeneratePayload] = None,
+    payload: Optional[RecommendationGeneratePayload] = Body(None),
     workspace: Workspace = Depends(get_current_workspace),
     db: Session = Depends(get_db)
 ):
@@ -906,6 +906,21 @@ def create_recommendation(
             headers={"X-Error-Code": "PR_NOT_READY"}
         )
 
+    # DRAFT_ONLY policy: require explicit acknowledgement before generating a draft recommendation.
+    readiness_acknowledged = (payload.readiness_acknowledged if payload else False)
+    if pr_readiness.readiness_level == "DRAFT_ONLY" and not readiness_acknowledged:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error_code": "RECOMMENDATION_DRAFT_NOT_ACKNOWLEDGED",
+                "message": "Pull request readiness is DRAFT_ONLY. Acknowledge the draft readiness to generate a draft recommendation.",
+                "pr_readiness_level": "DRAFT_ONLY",
+                "generation_mode": "BLOCKED",
+                "blocking_inputs": ["readiness_acknowledgement"],
+            },
+            headers={"X-Error-Code": "RECOMMENDATION_DRAFT_NOT_ACKNOWLEDGED"}
+        )
+
     # 5. Verify repository readiness — must be READY or NEEDS_COVERAGE (low-coverage dry run allowed)
     readiness_svc = RepositoryReadinessService(db)
     readiness = readiness_svc.calculate_readiness(repository_id, workspace.id)
@@ -944,7 +959,7 @@ def create_recommendation(
     if generation_mode == "confident":
         try:
             from app.services.input_readiness_v2_service import InputReadinessV2Service
-            v2_readiness = InputReadinessV2Service(db).calculate_readiness(
+            v2_readiness = InputReadinessV2Service(db).assess(
                 repository_id=repository_id,
                 pull_request_id=pull_request_id
             )
@@ -956,8 +971,12 @@ def create_recommendation(
 
                 # Build a human-readable reason
                 if not primary_reason:
-                    input5 = (v2_readiness.inputs or {}).get("INPUT_5")
-                    if input5 and input5.status in ("MISSING", "PARTIAL", "REVIEW_NEEDED"):
+                    input5 = next(
+                        (inp for inp in (v2_readiness.inputs or [])
+                         if getattr(inp, 'input_id', None) == "INPUT_5"),
+                        None
+                    )
+                    if input5 and getattr(input5, 'status', None) in ("MISSING", "PARTIAL", "REVIEW_NEEDED"):
                         primary_reason = "AC \u2192 Test Mapping is partial and unconfirmed."
                     elif not v2_readiness.can_generate_draft:
                         primary_reason = "Minimum inputs required for draft generation are missing."
@@ -982,12 +1001,16 @@ def create_recommendation(
             logging.getLogger("veriscope.repository_router").warning(
                 f"InputReadinessV2 check failed for confident generation (non-fatal): {_readiness_exc}"
             )
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
     # Enforce minimum: draft requires at least Input 1 (PR package)
     if generation_mode == "draft":
         try:
             from app.services.input_readiness_v2_service import InputReadinessV2Service
-            v2_readiness_draft = InputReadinessV2Service(db).calculate_readiness(
+            v2_readiness_draft = InputReadinessV2Service(db).assess(
                 repository_id=repository_id,
                 pull_request_id=pull_request_id
             )
@@ -1008,6 +1031,20 @@ def create_recommendation(
             logging.getLogger("veriscope.repository_router").warning(
                 f"InputReadinessV2 draft check failed (non-fatal): {_draft_exc}"
             )
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+    # Determine generation mode from readiness/payload.
+    requested_mode = (payload.mode if payload and payload.mode else None) or "confident"
+    if pr_readiness.readiness_level == "DRAFT_ONLY":
+        generation_mode = "draft"
+    else:
+        generation_mode = requested_mode
+
+    blocking_inputs = [inp.get("key", "unknown") for inp in (getattr(pr_readiness, "blocking_inputs", None) or [])]
+    warning_inputs = [inp.get("key", "unknown") for inp in (getattr(pr_readiness, "warning_inputs", None) or [])]
 
     # 7. Run recommendation engine with debug logging
     svc = RecommendationService(db)
@@ -1045,6 +1082,9 @@ def create_recommendation(
         "pr_readiness_level": pr_readiness.readiness_level,
         "pr_can_generate": pr_readiness.can_generate,
         "readiness_acknowledged": readiness_acknowledged,
+        "generation_mode": generation_mode,
+        "blocking_inputs": blocking_inputs,
+        "warning_inputs": warning_inputs,
         "input_builder_started": False,
         "input_builder_completed": False,
         "ranking_completed": False,
@@ -1084,19 +1124,26 @@ def create_recommendation(
         raise
     except Exception as e:
         db.rollback()
-        generation_log["error_code"] = "UNKNOWN_GENERATION_ERROR"
+        generation_log["error_code"] = "RECOMMENDATION_GENERATION_FAILED"
         logger.exception(f"Recommendation engine failed for PR {pr.id}: {e}")
         logger.error(f"Generation log: {generation_log}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        # Capture stage from RecommendationInputBuilderError without exposing internals.
+        failed_stage = getattr(e, "stage", None) if hasattr(e, "stage") else None
+        request_id = getattr(e, "request_id", None) if hasattr(e, "request_id") else None
+        if failed_stage:
+            generation_log["failed_stage"] = failed_stage
+        if request_id:
+            generation_log["request_id"] = request_id
         from fastapi.responses import JSONResponse
         return JSONResponse(
             status_code=500,
             content={
                 "error_code": "RECOMMENDATION_GENERATION_FAILED",
-                "message": "Veriscope could not generate this recommendation.",
-                "detail": str(e),
-                "traceback": traceback.format_exc(),
-                "generation_log": generation_log
+                "message": "VeriScope could not generate this recommendation. Check backend logs with the provided request ID.",
+                "stage": failed_stage,
+                "request_id": request_id,
+                "can_retry": True,
+                "generation_log": generation_log,
             },
             headers={"X-Error-Code": "RECOMMENDATION_GENERATION_FAILED"}
         )

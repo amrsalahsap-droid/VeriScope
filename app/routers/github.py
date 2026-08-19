@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from uuid import UUID
 from typing import Optional, Dict, Any
-from fastapi import APIRouter, Depends, Header, Request, status, HTTPException, BackgroundTasks, UploadFile, File, Form
+from fastapi import APIRouter, Depends, Header, Request, status, HTTPException, BackgroundTasks, UploadFile, File, Form, Body
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
@@ -27,6 +27,7 @@ from app.services.coverage_ingestion import CoverageIngestionService, CoverageIn
 from sqlalchemy import func, distinct
 from app.models.user import Workspace, User
 from app.schemas.debugging import PRDebugResponse
+from app.schemas.recommendation import RecommendationGeneratePayload
 from app.services.github_app import GitHubAppService
 from app.dependencies.auth import get_current_workspace, require_workspace_member, get_current_user
 from pydantic import BaseModel
@@ -1976,7 +1977,7 @@ def sync_pull_requests(
 def create_recommendation(
     repository_id: UUID,
     pull_request_id: UUID,
-    payload: Optional[RecommendationGeneratePayload] = None,
+    payload: Optional[RecommendationGeneratePayload] = Body(None),
     workspace: Workspace = Depends(get_current_workspace),
     db: Session = Depends(get_db)
 ):
@@ -1990,7 +1991,7 @@ def create_recommendation(
     collection, new run record per invocation).
     """
     from app.services.recommendation import RecommendationService
-    from app.schemas.recommendation import RecommendationRunCreate, RecommendationGeneratePayload
+    from app.schemas.recommendation import RecommendationRunCreate
     from app.services.repository_readiness import RepositoryReadinessService
 
     # 1. Verify repository belongs to workspace
@@ -2026,6 +2027,30 @@ def create_recommendation(
     # 4. Run recommendation engine
     svc = RecommendationService(db)
     readiness_acknowledged = payload.readiness_acknowledged if payload else False
+
+    # DRAFT_ONLY handling: if PR readiness is draft-only and user has not
+    # acknowledged, block the request before starting input builder.
+    from app.services.recommendation_readiness_service import RecommendationReadinessService
+    pr_readiness = RecommendationReadinessService(db).assess_readiness(
+        repository_id=str(repository_id),
+        pull_request_id=str(pr.id)
+    )
+    if pr_readiness and pr_readiness.readiness_level == "DRAFT_ONLY" and not readiness_acknowledged:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error_code": "RECOMMENDATION_DRAFT_NOT_ACKNOWLEDGED",
+                "message": (
+                    "Pull request readiness is DRAFT_ONLY. "
+                    "Acknowledge the draft readiness to generate a draft recommendation."
+                ),
+                "pr_readiness_level": "DRAFT_ONLY",
+                "generation_mode": "BLOCKED",
+                "blocking_inputs": ["readiness_acknowledgement"],
+            }
+        )
+
     try:
         run = svc.create_recommendation_run(
             RecommendationRunCreate(
@@ -2036,15 +2061,29 @@ def create_recommendation(
                 readiness_acknowledged=readiness_acknowledged
             )
         )
-    except HTTPException:
+    except HTTPException as http_exc:
         db.rollback()
-        raise
+        # If the service raised a structured detail dict, pass it through.
+        # Otherwise wrap raw string details into a safe structure.
+        detail = http_exc.detail
+        if isinstance(detail, dict) and detail.get("error_code"):
+            raise http_exc
+        raise HTTPException(
+            status_code=http_exc.status_code or status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error_code": "RECOMMENDATION_GENERATION_FAILED",
+                "message": str(detail) if not isinstance(detail, dict) else detail,
+            },
+        ) from http_exc
     except Exception as e:
         db.rollback()
         logger.exception(f"Recommendation engine failed for PR {pr.id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Recommendation engine error: {str(e)}"
+            detail={
+                "error_code": "RECOMMENDATION_GENERATION_FAILED",
+                "message": "VeriScope could not generate the recommendation.",
+            }
         )
 
     # 5. Build response — use only real persisted fields, no fabricated values

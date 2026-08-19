@@ -21,8 +21,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -63,14 +63,14 @@ storage/
 *.sqlite
 *.sqlite3
 
-# Test and debug scripts
-test_*.py
-validate_*.py
-verify_*.py
-trigger_*.py
-update_*.py
-summarize_*.py
-sync_*.py
+# Test and debug scripts (root-level ad-hoc scripts only, not tests/ or landing-page/__tests__/)
+/test_*.py
+/validate_*.py
+/verify_*.py
+/trigger_*.py
+/update_*.py
+/summarize_*.py
+/sync_*.py
 
 # Temporary output files
 *.txt

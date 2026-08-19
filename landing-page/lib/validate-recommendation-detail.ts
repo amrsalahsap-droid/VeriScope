@@ -182,6 +182,7 @@ export function validateRecommendationDetailView({
   if (r.renderedScenarioIds && r.renderedScenarioIds.length > 0) {
     const counts: Record<string, number> = {};
     for (const id of r.renderedScenarioIds) {
+      if (!id) continue; // skip missing/undefined/empty identities
       counts[id] = (counts[id] || 0) + 1;
     }
     const dups = Object.entries(counts)

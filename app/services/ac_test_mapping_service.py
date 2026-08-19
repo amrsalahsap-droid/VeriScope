@@ -993,10 +993,11 @@ class ACTestMappingService:
 
         # ── Execution summary from TestRun ─────────────────────────────────────
         try:
-            pr_test_runs = db.query(TestRun).filter(
-                TestRun.repository_id == repo_uuid,
-                TestRun.pull_request_id == pr_uuid
-            ).order_by(TestRun.created_at.desc()).limit(1).all()
+            with db.begin_nested():
+                pr_test_runs = db.query(TestRun).filter(
+                    TestRun.repository_id == repo_uuid,
+                    TestRun.pull_request_id == pr_uuid
+                ).order_by(TestRun.created_at.desc()).limit(1).all()
             latest_run = pr_test_runs[0] if pr_test_runs else None
         except Exception:
             latest_run = None
@@ -1105,10 +1106,11 @@ class ACTestMappingService:
         # no candidate. They sit above no_candidate but below any real candidate.
         accepted_gap_ac_ids: set = set()
         try:
-            gap_decisions = db.query(ACMappingDecision).filter(
-                ACMappingDecision.repository_id == repo_uuid,
-                ACMappingDecision.pull_request_id == pr_uuid
-            ).all()
+            with db.begin_nested():
+                gap_decisions = db.query(ACMappingDecision).filter(
+                    ACMappingDecision.repository_id == repo_uuid,
+                    ACMappingDecision.pull_request_id == pr_uuid
+                ).all()
             for gd in gap_decisions:
                 ac_id = getattr(gd, "acceptance_criterion_id", None)
                 if ac_id:

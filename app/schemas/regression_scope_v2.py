@@ -4,7 +4,9 @@ Unified scope model for regression testing that consolidates all scope concepts
 into a single, consistent contract.
 """
 
-from pydantic import BaseModel, Field
+import re
+
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from enum import Enum
@@ -108,7 +110,8 @@ class ScopeItem(BaseModel):
     test_references: List[str] = Field(default_factory=list, description="References to tests")
     can_auto_execute: bool = Field(..., description="Whether this item can be auto-executed")
     execution_status: Optional[str] = Field(None, description="Current execution status (PASSED, FAILED, NOT_RUN, SKIPPED)")
-    estimated_effort: Optional[str] = Field(None, description="Estimated effort for manual items")
+    estimated_effort: Optional[str] = Field(None, description="Estimated effort display label (e.g. '10 min')")
+    estimated_effort_minutes: Optional[int] = Field(None, description="Estimated effort in minutes (machine-readable)")
     is_required_for_release: bool = Field(..., description="Whether this item is required for release")
     is_manual_only: bool = Field(..., description="Whether this item is manual-only")
     provider: Optional[str] = Field(None, description="Provider/source for manual tests (e.g. MANUAL_CSV, TESTRAIL)")
@@ -135,6 +138,30 @@ class ScopeItem(BaseModel):
     test_run_commit_sha: Optional[str] = Field(None, description="Test run commit SHA for freshness proof")
     pull_request_head_sha: Optional[str] = Field(None, description="Pull request head commit SHA for freshness proof")
     reason_code: Optional[str] = Field(None, description="Reason code explaining bucket assignment")
+
+    @field_validator("estimated_effort", mode="before")
+    @classmethod
+    def _coerce_effort_to_label(cls, v):
+        """Coerce numeric effort values (e.g. 10) to a display label ('10 min')."""
+        if v is None:
+            return v
+        if isinstance(v, bool):
+            return str(v)
+        if isinstance(v, (int, float)):
+            minutes = int(v)
+            return f"{minutes} min"
+        return v
+
+    @model_validator(mode="after")
+    def _sync_effort_minutes(self):
+        """Keep estimated_effort and estimated_effort_minutes consistent."""
+        if self.estimated_effort_minutes is None and self.estimated_effort:
+            match = re.search(r"(\d+)", self.estimated_effort)
+            if match:
+                self.estimated_effort_minutes = int(match.group(1))
+        elif self.estimated_effort_minutes is not None and not self.estimated_effort:
+            self.estimated_effort = f"{self.estimated_effort_minutes} min"
+        return self
 
 
 class ScopeGroupSummary(BaseModel):
@@ -213,7 +240,8 @@ class TraceabilitySummary(BaseModel):
     covered: int = Field(..., description="Number of requirements with fresh passing tests (ALREADY_VERIFIED)")
     missing: int = Field(..., description="Number of requirements without evidence (REQUIRED)")
     not_mapped: int = Field(..., description="Number of requirements without database_ac_id (no traceability link)")
-    partial: int = Field(..., description="Number of requirements with partial evidence")
+    review_required: int = Field(0, description="Number of requirements requiring manual review")
+    unknown_statuses: List[str] = Field(default_factory=list, description="Unrecognized coverage statuses encountered during summarization")
 
 
 class ReleaseDecision(BaseModel):

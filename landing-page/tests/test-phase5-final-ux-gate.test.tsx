@@ -407,11 +407,13 @@ describe("Phase 5 Final UX Gate Validation", () => {
     });
 
     const headings = [
-      "Release Decision",
+      "Recommendation Summary",
+      "Evidence Summary",
       "Required Before Release",
       "Regression Scope Plan",
-      "Business Risk Review",
-      "Coverage & Traceability",
+      "Risk Review",
+      "Traceability Audit",
+      "Final Release Decision",
       "Execution Optimization",
       "Governance & Audit"
     ];
@@ -447,7 +449,7 @@ describe("Phase 5 Final UX Gate Validation", () => {
       expect(screen.getAllByText("Verify password strength validation")[0]).toBeInTheDocument();
     });
 
-    expect(screen.getByText("Business Risk Review")).toBeInTheDocument();
+    expect(screen.getByText("Risk Review")).toBeInTheDocument();
     // Check that items in the list display effective risk and review actions
     expect(screen.getAllByTitle("Accept generated risk").length).toBeGreaterThan(0);
     expect(screen.getAllByTitle("Override risk").length).toBeGreaterThan(0);
@@ -461,7 +463,7 @@ describe("Phase 5 Final UX Gate Validation", () => {
       expect(screen.getByText("Limited Evidence")).toBeInTheDocument();
     });
 
-    expect(screen.getByText("Release Decision")).toBeInTheDocument();
+    expect(screen.getByText("Recommendation Summary")).toBeInTheDocument();
     expect(screen.getAllByText(/Current PR execution passed 18 tests/).length).toBeGreaterThan(0);
   });
 
@@ -603,7 +605,7 @@ describe("Phase 5 Final UX Gate Validation", () => {
 
     renderPage();
     await waitFor(() => {
-      expect(screen.getByText("Release Decision")).toBeInTheDocument();
+      expect(screen.getByText("Recommendation Summary")).toBeInTheDocument();
     });
 
     // Check h2 sections still render despite no items inside lists

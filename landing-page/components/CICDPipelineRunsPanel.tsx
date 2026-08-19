@@ -9,6 +9,10 @@ import { GitBranch } from 'lucide-react';
 import { GitHubActionsSnippet } from './GitHubActionsSnippet';
 import { QualityGateBadge } from './QualityGateBadge';
 import { EvidenceArtifactDownloadButton } from './EvidenceArtifactDownloadButton';
+import type {
+  QualityGateProfileStatus,
+  EvidenceReadiness,
+} from '@/lib/quality-gate';
 
 interface PipelineRun {
   id: string;
@@ -39,13 +43,20 @@ interface PipelineRun {
 
 interface CICDPipelineRunsPanelProps {
   pipelineRuns: PipelineRun[];
-  gateStatus: 'PASSED' | 'PASSED_WITH_OVERRIDE' | 'PARTIAL' | 'BLOCKED' | 'UNKNOWN';
+  qualityGateProfileStatus: QualityGateProfileStatus;
+  evidenceReadiness: EvidenceReadiness;
+  hasTestResults?: boolean;
+  hasCoverageReport?: boolean;
 }
 
-export function CICDPipelineRunsPanel({ 
-  pipelineRuns, 
-  gateStatus 
+export function CICDPipelineRunsPanel({
+  pipelineRuns,
+  qualityGateProfileStatus,
+  evidenceReadiness,
+  hasTestResults = false,
+  hasCoverageReport = false,
 }: CICDPipelineRunsPanelProps) {
+  const hasManualEvidence = hasTestResults || hasCoverageReport;
   return (
     <div id="cicd-pipeline-runs" className="bg-zinc-900/30 border border-zinc-800/60 rounded-xl p-5 space-y-4">
       <div className="flex items-center justify-between border-b border-zinc-800/40 pb-3">
@@ -53,15 +64,29 @@ export function CICDPipelineRunsPanel({
           <GitBranch className="w-5 h-5 text-blue-400" />
           <h2 className="text-lg font-bold text-white">CI/CD Pipeline Runs</h2>
         </div>
-        <QualityGateBadge gateStatus={gateStatus} />
+        <QualityGateBadge qualityGateProfileStatus={qualityGateProfileStatus} evidenceReadiness={evidenceReadiness} />
       </div>
       
       {/* Empty State - shown when no pipeline runs exist */}
       {!pipelineRuns || pipelineRuns.length === 0 ? (
-        <div className="text-sm text-zinc-400">
-          No CI/CD runs yet.
-          <br />
-          Trigger Veriscope from GitHub Actions to create a pipeline run.
+        <div className="text-sm text-zinc-400 space-y-2">
+          {hasManualEvidence ? (
+            <>
+              <p>
+                <span className="font-semibold text-zinc-300">CI/CD runs:</span> Not connected
+              </p>
+              <p className="font-semibold text-zinc-300">Manual evidence:</p>
+              <ul className="list-disc list-inside text-zinc-400">
+                {hasTestResults && <li>Test results uploaded</li>}
+                {hasCoverageReport && <li>Coverage uploaded</li>}
+              </ul>
+            </>
+          ) : (
+            <p>No CI/CD runs or manual evidence yet.</p>
+          )}
+          {!hasManualEvidence && (
+            <p>Trigger Veriscope from GitHub Actions to create a pipeline run.</p>
+          )}
         </div>
       ) : (
         /* Pipeline Run Rows - shown when pipeline runs exist */
