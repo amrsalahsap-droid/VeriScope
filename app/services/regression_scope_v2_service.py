@@ -830,8 +830,49 @@ class RegressionScopeV2Service:
             include_safe_to_skip, audit, db=db, include_diagnostics=include_diagnostics, mode=mode
         )
 
-        # Phase 7: Build traceability summary from evidence graph
-        traceability = snapshot_data.get("acTraceability", []) or []
+        # Phase 7: Build traceability summary from live evidence graph.
+        # The persisted snapshot is historical/audit data and may be stale.
+        # Always derive traceability rows from current evidence so the summary
+        # reflects the actual classification state without mutating history.
+        live_traceability = []
+        try:
+            from app.services.evidence_graph.requirement_evidence_graph_service import RequirementEvidenceGraphService
+
+            graph_service = RequirementEvidenceGraphService(db)
+            live_view_model = graph_service.build_evidence_graph(
+                repository_id=str(run.repository_id),
+                pull_request_id=str(pr.id),
+                head_sha=pr.head_commit_sha,
+                changed_files=changed_file_paths,
+                pr_description=None,
+                recommendation_run_id=str(run.id),
+                canonical_ac_rows=ac_rows,
+            )
+            for row in live_view_model.ac_traceability or []:
+                live_traceability.append(
+                    {
+                        "requirementId": row.requirement_id,
+                        "readableId": row.readable_id,
+                        "title": row.title,
+                        "fullText": row.full_text,
+                        "coverageStatus": row.coverage_status,
+                        "linkedExistingTests": row.linked_existing_tests,
+                        "linkedMissingTest": row.linked_missing_test,
+                        "priority": row.priority,
+                        "notes": row.notes,
+                        "manualSupportStatus": getattr(row, "manual_support_status", "MANUAL_NOT_MAPPED"),
+                        "manualValidation": getattr(row, "manual_validation", {}),
+                        "sourceAcNumber": getattr(row, "source_ac_number", None),
+                        "databaseAcId": getattr(row, "database_ac_id", None),
+                    }
+                )
+        except Exception as e:
+            logger.warning(
+                f"[ScopeGen] Failed to build live traceability rows for run {run_id}; "
+                f"falling back to persisted snapshot: {e}"
+            )
+
+        traceability = live_traceability or (snapshot_data.get("acTraceability", []) or [])
         traceability_summary = RegressionScopeV2Service._build_traceability_summary(traceability)
         
         # Phase 7: Build release decision from change impact model
