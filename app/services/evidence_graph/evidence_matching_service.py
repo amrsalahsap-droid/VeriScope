@@ -479,10 +479,29 @@ class EvidenceMatchingService:
             contradictions.append("SIGN_UP vs UPDATE_PASSWORD")
 
         # 8. RESET_PASSWORD vs UPDATE_PASSWORD
-        if (req_flow == "PASSWORD_RESET" and test_flow == "UPDATE_PASSWORD") or \
-           (req_flow == "UPDATE_PASSWORD" and test_flow == "PASSWORD_RESET") or \
-           (in_title(req_norm, "reset") and in_title(test_norm, "update")) or \
-           (in_title(req_norm, "update") and in_title(test_norm, "reset")):
+        # Flow-based contradiction remains when normalized flows are genuinely opposite.
+        # Title-based contradiction must only fire when one side is clearly RESET-only
+        # and the other side is clearly UPDATE-only. Compound titles containing both
+        # "update" and "reset" (e.g. "update/reset operation") are not opposites.
+        req_has_reset = in_title(req_norm, "reset")
+        req_has_update = in_title(req_norm, "update")
+        test_has_reset = in_title(test_norm, "reset")
+        test_has_update = in_title(test_norm, "update")
+        req_reset_only = req_has_reset and not req_has_update
+        req_update_only = req_has_update and not req_has_reset
+        test_reset_only = test_has_reset and not test_has_update
+        test_update_only = test_has_update and not test_has_reset
+
+        is_flow_contradiction = (
+            (req_flow == "PASSWORD_RESET" and test_flow == "UPDATE_PASSWORD") or
+            (req_flow == "UPDATE_PASSWORD" and test_flow == "PASSWORD_RESET")
+        )
+        is_title_contradiction = (
+            (req_reset_only and test_update_only) or
+            (req_update_only and test_reset_only)
+        )
+
+        if is_flow_contradiction or is_title_contradiction:
             contradictions.append("RESET_PASSWORD vs UPDATE_PASSWORD")
 
         # 8.5. ACCOUNT_SECURITY_VALIDATION vs SCOPED_FLOW

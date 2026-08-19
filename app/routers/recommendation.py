@@ -4,9 +4,123 @@ import os
 import logging
 from fastapi import APIRouter, Depends, status, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from app.db.session import get_db
 
 logger = logging.getLogger(__name__)
+
+from app.models.test_result import TestRun, TestResult, TestCase
+from app.models.coverage import CoverageReport, CoverageFileEntry
+from app.models.acceptance_criterion import AcceptanceCriterion
+
+
+def _get_readiness_input_summary(db: Session, run, pr) -> dict:
+    """Return the normalized readiness input summary stored at generation time, or a fallback."""
+    summary = (
+        (run.evidence_summary_at_generation or {}).get("readiness_input_summary")
+        if run.evidence_summary_at_generation
+        else None
+    )
+    if summary:
+        return summary
+
+    fallback = {
+        "accepted_acs": 0,
+        "trusted_ac_coverage": 0,
+        "auto_trusted": 0,
+        "review_required": 0,
+        "current_pr_tests_passed": 0,
+        "current_pr_tests_failed": 0,
+        "current_pr_tests_skipped": 0,
+        "coverage_current": False,
+        "changed_source_files_covered": 0,
+        "changed_source_files_total": 0,
+    }
+    if not pr:
+        return fallback
+
+    # AC counts from stored snapshot
+    ac_snapshot = run.ac_traceability_snapshot_json or []
+    if ac_snapshot:
+        fallback["accepted_acs"] = len(ac_snapshot)
+        fallback["trusted_ac_coverage"] = sum(
+            1 for a in ac_snapshot if a.get("coverageStatus") == "covered"
+        )
+        fallback["review_required"] = sum(
+            1 for a in ac_snapshot if a.get("coverageStatus") in ("missing", "partially covered")
+        )
+
+    # Current PR test results: count actual TestResult rows, not TestRun metadata
+    latest_run = db.query(TestRun).filter(
+        TestRun.repository_id == run.repository_id,
+        TestRun.pull_request_id == pr.id,
+    ).order_by(TestRun.created_at.desc()).first()
+    if latest_run:
+        fallback["current_pr_tests_passed"] = (
+            db.query(func.count(TestResult.id)).filter(
+                TestResult.test_run_id == latest_run.id,
+                func.lower(TestResult.status).in_(["passed", "success"]),
+            ).scalar() or 0
+        )
+        fallback["current_pr_tests_failed"] = (
+            db.query(func.count(TestResult.id)).filter(
+                TestResult.test_run_id == latest_run.id,
+                func.lower(TestResult.status).in_(["failed", "failure", "error"]),
+            ).scalar() or 0
+        )
+        fallback["current_pr_tests_skipped"] = (
+            db.query(func.count(TestResult.id)).filter(
+                TestResult.test_run_id == latest_run.id,
+                func.lower(TestResult.status).in_(["skipped", "skip"]),
+            ).scalar() or 0
+        )
+
+    # Coverage currency
+    if run.coverage_report_id:
+        cr = db.query(CoverageReport).filter(CoverageReport.id == run.coverage_report_id).first()
+        if cr and cr.commit_sha == pr.head_commit_sha:
+            fallback["coverage_current"] = True
+
+    return fallback
+
+
+def _current_pr_passed_test_cases(db: Session, run, pr) -> List[dict]:
+    """Return every test case that passed in the latest PR test run."""
+    if not pr:
+        return []
+    latest_run = db.query(TestRun).filter(
+        TestRun.repository_id == run.repository_id,
+        TestRun.pull_request_id == pr.id,
+    ).order_by(TestRun.created_at.desc()).first()
+    if not latest_run:
+        return []
+    passed_results = db.query(TestResult).filter(
+        TestResult.test_run_id == latest_run.id,
+        func.lower(TestResult.status).in_(["passed", "success"]),
+    ).all()
+    tcs = {
+        str(tc.id): tc
+        for tc in db.query(TestCase).filter(TestCase.repository_id == run.repository_id).all()
+    }
+    out = []
+    for result in passed_results:
+        tc = tcs.get(str(getattr(result, "test_case_id", None)))
+        if not tc:
+            continue
+        parts = tc.stable_identity.split("::")
+        out.append({
+            "stable_identity": tc.stable_identity,
+            "display_name": parts[-1] if parts else tc.stable_identity,
+            "suite_name": parts[0] if len(parts) > 1 else "",
+            "test_case_id": str(tc.id),
+            "candidate_status": "ALREADY_PASSED_CURRENT_PR",
+            "execution_aware_tier": "already_verified",
+            "active_action": "ALREADY_VERIFIED",
+            "included": True,
+        })
+    return out
+
+
 from app.schemas.recommendation import (
     RecommendationRunCreate,
     RecommendationRunResponse,
@@ -265,6 +379,10 @@ def create_recommendation_run(generate_in: RecommendationGenerateRequest, db: Se
         logging.getLogger("veriscope.api").warning(
             f"InputReadinessV2 check raised an exception during generation gate: {_exc}"
         )
+        try:
+            db.rollback()
+        except Exception:
+            pass
         if mode == "confident":
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -696,13 +814,13 @@ def get_recommendation_run(
 
         if snapshot:
             has_snapshot = True
-            snapshot_head_sha = snapshot.head_commit_sha
-            
-            if pr and pr.head_commit_sha != snapshot.head_commit_sha:
+            snapshot_head_sha = snapshot.head_commit_sha or run.head_commit_sha_at_generation
+
+            if pr and pr.head_commit_sha != snapshot_head_sha:
                 audit_status = "OUTDATED"
                 is_stale = True
-                stale_reason = f"PR head commit SHA changed from {snapshot.head_commit_sha} to {pr.head_commit_sha}."
-                message = f"Generated from {snapshot.head_commit_sha[:7]} (outdated), current PR head is {pr.head_commit_sha[:7]}. Regenerate before signoff."
+                stale_reason = f"PR head commit SHA changed from {snapshot_head_sha} to {pr.head_commit_sha}."
+                message = f"Generated from {snapshot_head_sha[:7] if snapshot_head_sha else 'unknown'} (outdated), current PR head is {pr.head_commit_sha[:7] if pr.head_commit_sha else 'unknown'}. Regenerate before signoff."
             else:
                 audit_status = "AUDITABLE"
                 message = "Recommendation has an auditable PR package snapshot."
@@ -722,8 +840,16 @@ def get_recommendation_run(
                 message = "Recommendation has an auditable PR package snapshot."
         
         else:
-            audit_status = "LEGACY_NO_SNAPSHOT"
-            message = "Existing recommendation predates PR package snapshot support. Regenerate for auditability."
+            # Fallback: recommendation was generated before snapshot columns existed,
+            # but the PR itself has a head SHA. Do not report "commit unknown".
+            if pr and pr.head_commit_sha:
+                has_direct_snapshot_json = True
+                snapshot_head_sha = pr.head_commit_sha
+                audit_status = "AUDITABLE"
+                message = "Recommendation has an auditable PR package snapshot."
+            else:
+                audit_status = "LEGACY_NO_SNAPSHOT"
+                message = "Existing recommendation predates PR package snapshot support. Regenerate for auditability."
 
     recommendation_audit_obj = {
         "status": audit_status,
@@ -954,6 +1080,13 @@ def get_recommendation_run(
     mapping_review_needed_tests = [t for t in test_list if t["execution_aware_tier"] == "mapping_review_needed"]
     not_executed_tests = [t for t in test_list if t["execution_aware_tier"] == "fallback" and t["candidate_status"] in ("NOT_EXECUTED_FOR_CURRENT_PR", None)]
 
+    # The "Already Verified" section must reflect ALL tests that passed on the current PR,
+    # not only the subset that also appears in the recommended test list.
+    readiness_input_summary = _get_readiness_input_summary(db, run, pr)
+    current_pr_passed_tests = _current_pr_passed_test_cases(db, run, pr)
+    if current_pr_passed_tests:
+        already_verified_tests = current_pr_passed_tests
+
     # Evidence signals
     original_mode = run.recommendation_mode or "NORMAL"
     quality = run.evidence_quality or "UNKNOWN"
@@ -1021,6 +1154,14 @@ def get_recommendation_run(
         warnings.append("Coverage confidence is low. Test selection is broader than usual.")
     if run.unsafe_for_optimization:
         warnings.append("This PR has evidence integrity issues. Results should be treated as advisory.")
+
+    # Release decision: use the normalized evidence-based calculation shared with
+    # the dedicated release-decision endpoint. Keep engine-level warnings separate.
+    from app.services.release_decision_service import ReleaseDecisionService
+    release_decision = ReleaseDecisionService.get_release_state(db, run.id)
+    if release_decision is None:
+        release_decision = {}
+    release_decision["warnings"] = warnings
 
     # Detect Evidence Gaps & Analyze Missing Coverage & Generate Testing Scope
     from app.services.evidence_gap_detector import EvidenceGapDetector
@@ -1146,6 +1287,19 @@ def get_recommendation_run(
                 "title": mt.title
             })
 
+    # Build live acceptance criteria response (authoritative current AC source)
+    live_acceptance_criteria = _build_acceptance_criteria_response(
+        db, run, impact_profile, readiness_input_summary, pr
+    )
+
+    # Refresh completeness assessment using live AC count
+    from app.services.recommendation_completeness_calculator import RecommendationCompletenessCalculator
+    historical_completeness = impact_profile.get("completeness_assessment") if impact_profile else None
+    current_completeness_assessment = RecommendationCompletenessCalculator.refresh_acceptance_criteria_dimension(
+        historical_assessment=historical_completeness,
+        current_ac_count=len(live_acceptance_criteria),
+    ) if historical_completeness else None
+
     return {
         "id": str(run.id),
         "created_at": run.created_at.isoformat() + "Z" if run.created_at else None,
@@ -1201,7 +1355,7 @@ def get_recommendation_run(
             "changed_files_count": len(changed_files),
             "risk_level": risk_level,
             "bullets": explanation["executive_summary"],
-            "impact_profile": impact_profile or {},
+            "impact_profile": {**(impact_profile or {}), "completeness_assessment": current_completeness_assessment} if impact_profile else {},
         },
         # Section 2: Testing Strategy
         "testing_strategy": {
@@ -1292,18 +1446,21 @@ def get_recommendation_run(
         "business_intent": impact_profile.get("business_intent_coverage_matrix") if impact_profile else None,
         # Fragility Intelligence
         "fragility": _build_fragility_response(db, run, changed_files, impact_profile),
-        # Acceptance Criteria - get from input snapshot if available, otherwise from signal breakdown
-        "acceptance_criteria": _build_acceptance_criteria_response(db, run, impact_profile),
+        # Acceptance Criteria / Coverage & Traceability rows - normalized AC mapping state.
+        "acceptance_criteria": live_acceptance_criteria,
         "requirement_gaps": impact_profile.get("requirement_gap_report", {}).get("gaps", []) if impact_profile else [],
         "business_intent_coverage_matrix": impact_profile.get("business_intent_coverage_matrix") if impact_profile else None,
         "pr_description_template_suggestion": impact_profile.get("pr_description_template_suggestion") if impact_profile else None,
         # Phase 2I: Completeness Assessment
-        "completeness_assessment": impact_profile.get("completeness_assessment") if impact_profile else None,
+        "completeness_assessment": current_completeness_assessment,
         # Readiness and acknowledgement fields
         "readiness_acknowledged": run.readiness_acknowledged,
         "readiness_acknowledged_at": run.readiness_acknowledged_at.isoformat() + "Z" if run.readiness_acknowledged_at else None,
         "readiness_acknowledged_missing_inputs": run.readiness_acknowledged_missing_inputs,
         "readiness_decision": run.readiness_decision,
+        "readiness_input_summary": readiness_input_summary,
+        "head_commit_sha": run.head_commit_sha_at_generation or (pr.head_commit_sha if pr else None),
+        "release_decision": release_decision,
         # Outcome Summary
         "outcome": _build_outcome_summary(db, recommendation_run_id),
         # Staleness fields
@@ -1332,48 +1489,197 @@ def _build_acceptance_criteria_response(
     db: Session,
     run,
     impact_profile: Optional[Dict] = None,
+    readiness_input_summary: Optional[Dict[str, Any]] = None,
+    pr = None,
 ) -> List[Dict[str, Any]]:
     """
-    Build acceptance criteria response for a recommendation run.
+    Build acceptance criteria / Coverage & Traceability rows for a recommendation run.
 
-    Prioritizes manually pasted AC from input snapshot, falls back to signal breakdown.
+    Uses the normalized AC-level mapping state (`run.ac_traceability_snapshot_json`)
+    as the source of truth.  Falls back to the canonical DB acceptance criteria and the
+    input snapshot, but never to stale signal breakdowns.  Rows are deduplicated by
+    stable AC key / ID and expose the normalized status model expected by the page.
     """
     from app.models.recommendation import RecommendationInputSnapshot
     from app.models.acceptance_criterion import AcceptanceCriterion
 
-    # First, try to get AC from the input snapshot (manually pasted AC)
+    summary = (
+        readiness_input_summary
+        or (run.evidence_summary_at_generation or {}).get("readiness_input_summary")
+        or {}
+    )
+    trusted_mapping_statuses = {
+        "confirmed", "evidence_verified_aligned", "metadata_conflict_semantic_match",
+        "suggested", "accepted_gap", "user_confirmed", "veriscope_key_verified",
+        "USER_CONFIRMED", "VERISCOPE_KEY_VERIFIED", "EVIDENCE_VERIFIED_ALIGNED",
+    }
+    not_mapped_statuses = {"no_candidate", "NO_CANDIDATE"}
+    review_required_statuses = {"partial_support", "rejected", "PARTIAL_SUPPORT", "REJECTED"}
+
+    # Build a lookup of the normalized traceability snapshot keyed by every stable identifier.
+    ac_status_map: Dict[str, Dict[str, Any]] = {}
+    for item in run.ac_traceability_snapshot_json or []:
+        for key_field in ("ac_id", "id", "stable_ac_key", "normalized_key"):
+            key = str(item.get(key_field) or "")
+            if key:
+                ac_status_map[key] = item
+
+    # --- Collect canonical AC rows from DB and the input snapshot ----------------
+    db_rows = []
+    if run.pull_request_id or (pr and pr.id):
+        pr_id = run.pull_request_id or pr.id
+        db_rows = db.query(AcceptanceCriterion).filter(
+            AcceptanceCriterion.pull_request_id == pr_id
+        ).all()
+
     snapshot = db.query(RecommendationInputSnapshot).filter(
         RecommendationInputSnapshot.recommendation_run_id == run.id
     ).first()
+    snapshot_acs = list((snapshot and snapshot.acceptance_criteria) or [])
 
-    if snapshot and snapshot.acceptance_criteria:
-        # Return manually pasted AC from snapshot
-        return snapshot.acceptance_criteria
+    rows_by_key: Dict[str, Dict[str, Any]] = {}
 
-    # Fallback: Get AC from database for this PR
-    if run.pull_request_id:
-        ac_rows = db.query(AcceptanceCriterion).filter(
-            AcceptanceCriterion.pull_request_id == run.pull_request_id
-        ).all()
-        if ac_rows:
-            return [
-                {
-                    "id": str(ac.id),
-                    "text": ac.text,
-                    "normalized_key": ac.normalized_key,
-                    "criterion_type": ac.criterion_type,
-                    "source": ac.source,
-                    "confidence": ac.confidence,
-                    "evidence_excerpt": ac.evidence_excerpt,
-                }
-                for ac in ac_rows
-            ]
+    def _stable_key(ac_dict: dict) -> str:
+        return str(
+            ac_dict.get("stable_ac_key")
+            or ac_dict.get("normalized_key")
+            or ac_dict.get("id")
+            or ac_dict.get("ac_id")
+            or ""
+        )
 
-    # Final fallback: Return from signal breakdown if available
-    if impact_profile:
-        return impact_profile.get("business_intent_signal_breakdown", {}).get("acceptance_criteria", [])
+    def _ac_ref(ac_dict: dict) -> str:
+        source_num = ac_dict.get("source_number")
+        if source_num is not None:
+            return f"AC-{int(source_num):02d}"
+        key = _stable_key(ac_dict)
+        if key:
+            return key
+        return str(ac_dict.get("id") or ac_dict.get("ac_id") or "UNKNOWN")
 
-    return []
+    # DB rows are canonical; normalized snapshot rows enrich them.
+    for ac in db_rows:
+        ac_dict = {
+            "id": str(ac.id),
+            "text": ac.text,
+            "title": ac.title,
+            "stable_ac_key": getattr(ac, "stable_ac_key", None),
+            "normalized_key": ac.normalized_key,
+            "source_number": getattr(ac, "source_number", None),
+            "criterion_type": ac.criterion_type,
+            "source": ac.source,
+            "confidence": ac.confidence,
+            "evidence_excerpt": ac.evidence_excerpt,
+        }
+        rows_by_key[_stable_key(ac_dict) or str(ac.id)] = ac_dict
+
+    for item in snapshot_acs:
+        item = dict(item)
+        key = _stable_key(item) or str(item.get("id") or "")
+        if not key:
+            continue
+        if key in rows_by_key:
+            # Merge normalized fields into the canonical DB row.
+            existing = rows_by_key[key]
+            for k, v in item.items():
+                if v is not None and (existing.get(k) is None or k in ("mapping_status", "coverageStatus")):
+                    existing[k] = v
+        else:
+            rows_by_key[key] = item
+
+    # Ensure every entry in the traceability snapshot has a row, even if it is
+    # missing from the DB/input snapshot.
+    for item in run.ac_traceability_snapshot_json or []:
+        key = _stable_key(item)
+        if not key:
+            continue
+        if key not in rows_by_key:
+            rows_by_key[key] = {
+                "id": item.get("ac_id") or item.get("id"),
+                "text": item.get("ac_title") or item.get("title"),
+                "title": item.get("ac_title") or item.get("title"),
+                "stable_ac_key": item.get("stable_ac_key"),
+                "normalized_key": item.get("stable_ac_key") or item.get("normalized_key"),
+                "source_number": item.get("source_number"),
+            }
+
+    # --- Aggregate normalized evidence signals ----------------------------------
+    total_acs = int(summary.get("accepted_acs", len(rows_by_key)) or len(rows_by_key))
+    trusted_count = int(summary.get("trusted_ac_mappings", 0) or 0)
+    passed_count = int(summary.get("current_pr_tests_passed", 0) or 0)
+    coverage_is_current = bool(summary.get("coverage_is_current", summary.get("coverage_current", False)))
+    # If all trusted ACs have passing current PR tests, every trusted row can be
+    # treated as already verified.
+    trusted_with_passed = trusted_count > 0 and passed_count >= trusted_count
+
+    # --- Build normalized row statuses ------------------------------------------
+    result = []
+    for key, ac_dict in rows_by_key.items():
+        ac_id = str(ac_dict.get("id") or key)
+        stable_key = ac_dict.get("stable_ac_key") or ac_dict.get("normalized_key") or key
+        snap = (
+            ac_status_map.get(ac_id)
+            or ac_status_map.get(stable_key)
+            or ac_status_map.get(key)
+            or {}
+        )
+        raw_mapping = snap.get("mapping_status") or "no_candidate"
+        raw_coverage = snap.get("coverageStatus") or "missing"
+
+        # Normalize mapping status.
+        raw_mapping_lower = str(raw_mapping).lower()
+        if raw_mapping_lower in trusted_mapping_statuses:
+            mapping_status = "TRUSTED"
+        elif raw_mapping_lower in not_mapped_statuses:
+            mapping_status = "NOT_MAPPED"
+        elif raw_mapping_lower in review_required_statuses:
+            mapping_status = "NEEDS_REVIEW"
+        else:
+            mapping_status = "NOT_MAPPED"
+
+        # Normalize coverage status.
+        raw_coverage_lower = str(raw_coverage).lower()
+        if raw_coverage_lower in ("covered", "cover"):
+            coverage_status = "COVERED" if coverage_is_current else "SOURCE_COVERED"
+        elif raw_coverage_lower in ("partially covered", "partial"):
+            coverage_status = "SOURCE_COVERED"
+        else:
+            coverage_status = "MISSING"
+
+        # Normalize execution / recommendation statuses.
+        if mapping_status == "TRUSTED" and trusted_with_passed:
+            test_execution_status = "PASSED"
+            recommendation_status = "ALREADY_VERIFIED"
+        elif mapping_status == "TRUSTED":
+            test_execution_status = "NOT_EXECUTED"
+            recommendation_status = "NO_RERUN_NEEDED"
+        else:
+            test_execution_status = "NOT_EXECUTED"
+            recommendation_status = "RECOMMENDED"
+
+        row = {
+            # Normalized Coverage & Traceability row model.
+            "id": ac_id,
+            "ac_ref": _ac_ref(ac_dict),
+            "text": ac_dict.get("text") or ac_dict.get("title") or ac_dict.get("ac_title") or "",
+            "mapping_status": mapping_status,
+            "test_execution_status": test_execution_status,
+            "coverage_status": coverage_status,
+            "recommendation_status": recommendation_status,
+            # Stable identifiers used for deduplication.
+            "stable_ac_key": stable_key,
+            "normalized_key": ac_dict.get("normalized_key") or stable_key,
+            # Legacy fields kept for backward compatibility.
+            "criterion_type": ac_dict.get("criterion_type"),
+            "source": ac_dict.get("source"),
+            "confidence": ac_dict.get("confidence"),
+            "evidence_excerpt": ac_dict.get("evidence_excerpt"),
+            "legacy_mapping_status": raw_mapping,
+            "legacy_coverage_status": raw_coverage,
+        }
+        result.append(row)
+
+    return result
 
 
 def _build_fragility_response(
@@ -2817,9 +3123,19 @@ def _resolve_acceptance_criteria_text(run, pr, db) -> dict:
     if pr:
         ac_rows = db.query(AcceptanceCriterion).filter(
             AcceptanceCriterion.pull_request_id == pr.id
-        ).all()
+        ).order_by(AcceptanceCriterion.source_number).all()
         if ac_rows:
-            text = "\n".join([f"- {row.text}" for row in ac_rows])
+            text_lines = []
+            for row in ac_rows:
+                if row.source_number is not None and row.source_number > 0:
+                    # Preserve authoritative source number so ACExtractionService
+                    # can recover the original AC identity instead of renumbering.
+                    text_lines.append(f"{row.source_number}. {row.text}")
+                else:
+                    # Legacy AC rows without source_number fall back to bullet
+                    # form, which causes the existing positional counter fallback.
+                    text_lines.append(f"- {row.text}")
+            text = "\n".join(text_lines)
             return {
                 "text": text,
                 "source_type": "DB_ACCEPTANCE_CRITERION",
@@ -3902,6 +4218,24 @@ def get_regression_scope_v2(
                 message=f"Scope generation failed: {str(e)}"
             )
     except ValueError as e:
+        import traceback
+        import uuid as _uuid
+        from pydantic import ValidationError
+        _request_id = str(_uuid.uuid4())
+        logger.error(
+            f"[ScopeGen] Validation error (request_id={_request_id}):\n{traceback.format_exc()}"
+        )
+        if isinstance(e, ValidationError):
+            # Never expose raw Pydantic validation details/URLs to the UI.
+            return RegressionScopeV2Response(
+                status="ERROR",
+                scope=None,
+                error_code="REGRESSION_SCOPE_GENERATION_FAILED",
+                message=(
+                    "Unable to generate regression scope. "
+                    f"Check backend logs with request ID {_request_id}."
+                ),
+            )
         return RegressionScopeV2Response(
             status="ERROR",
             scope=None,
@@ -3910,12 +4244,19 @@ def get_regression_scope_v2(
         )
     except Exception as e:
         import traceback
-        logger.error(f"[ScopeGen] Full traceback:\n{traceback.format_exc()}")
+        import uuid as _uuid
+        _request_id = str(_uuid.uuid4())
+        logger.error(
+            f"[ScopeGen] Full traceback (request_id={_request_id}):\n{traceback.format_exc()}"
+        )
         return RegressionScopeV2Response(
             status="ERROR",
             scope=None,
-            error_code="INTERNAL_ERROR",
-            message=str(e)
+            error_code="REGRESSION_SCOPE_GENERATION_FAILED",
+            message=(
+                "Unable to generate regression scope. "
+                f"Check backend logs with request ID {_request_id}."
+            ),
         )
 
 

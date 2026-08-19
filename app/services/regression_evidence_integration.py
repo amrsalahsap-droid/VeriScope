@@ -106,22 +106,41 @@ class RegressionEvidenceIntegration:
             test_type = self._determine_test_type(tc)
 
             # Reconstruct acceptance_criterion_metadata and declared_ac_id
+            # from the actual persisted TestCase fields. Prefer explicit JUnit
+            # metadata; do not fabricate a direct identity when sources conflict.
             ac_metadata = None
             declared_ac_id = None
-            if hasattr(tc, "acceptance_criterion_metadata") and tc.acceptance_criterion_metadata:
-                ac_metadata = tc.acceptance_criterion_metadata
-                declared_ac_id = ac_metadata.get("acceptance_criterion_id") or ac_metadata.get("ac_id")
+
+            # 1. Collect explicit AC identity sources from the imported test case.
+            source_metadata = getattr(tc, "source_metadata_json", {}) or {}
+            explicit_sources = set()
+            if source_metadata:
+                for key in ("declared_ac_id", "acceptance_criterion", "ac_id"):
+                    val = source_metadata.get(key)
+                    if val:
+                        explicit_sources.add(str(val).strip())
+            if getattr(tc, "external_ac_ref", None):
+                explicit_sources.add(str(tc.external_ac_ref).strip())
+
+            if len(explicit_sources) == 1:
+                declared_ac_id = explicit_sources.pop()
+                ac_metadata = {
+                    "acceptance_criterion_id": declared_ac_id,
+                    "ac_id": declared_ac_id,
+                    "acceptance_criterion_text": source_metadata.get("acceptance_criterion_text"),
+                }
+            elif len(explicit_sources) > 1:
+                # Conflicting explicit identities: do not propagate as a trusted
+                # direct AC match. Leave declared_ac_id None so the test falls
+                # back to fuzzy matching rather than asserting a false identity.
+                declared_ac_id = None
+                ac_metadata = None
             elif tc.id in link_map:
+                # Existing FileTestLink fallback when no explicit test-case metadata.
                 declared_ac_id = link_map[tc.id]
                 ac_metadata = {
                     "acceptance_criterion_id": declared_ac_id,
-                    "ac_id": declared_ac_id
-                }
-            elif hasattr(tc, "declared_ac_id") and tc.declared_ac_id:
-                declared_ac_id = tc.declared_ac_id
-                ac_metadata = {
-                    "acceptance_criterion_id": declared_ac_id,
-                    "ac_id": declared_ac_id
+                    "ac_id": declared_ac_id,
                 }
 
             test_node = TestNode(

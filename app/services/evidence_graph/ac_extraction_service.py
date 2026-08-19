@@ -301,9 +301,12 @@ class ACExtractionService:
                     current_candidate = [match.group(1)]
                     is_bullet = True
                     matched = True
-                    # Increment original AC number for numbered items
-                    if re.match(r'^\s*\d+\.\s+', stripped):
-                        original_ac_number += 1
+                    # Capture the original AC number from numbered items.
+                    # This preserves authoritative source identity (e.g. "13. ...")
+                    # instead of renumbering from a positional counter.
+                    numbered_match = re.match(r'^\s*(\d+)\.\s+', stripped)
+                    if numbered_match:
+                        original_ac_number = int(numbered_match.group(1))
                     break
 
             if not matched:
@@ -436,7 +439,8 @@ class ACExtractionService:
                 source="acceptance_criteria",
                 is_real_testable_requirement=True,
                 scenario_signature=signature,
-                node_type="PARENT_REQUIREMENT"
+                node_type="PARENT_REQUIREMENT",
+                source_number=original_number,
             )
             req_node.match_score = confidence
             result.requirement_nodes.append(req_node)
