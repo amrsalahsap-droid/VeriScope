@@ -209,6 +209,9 @@ class RegressionEvidenceIntegration:
                     "ac_id": declared_ac_id
                 }
 
+            originating_run_commit_sha = (
+                tr.test_run.commit_sha if tr.test_run else head_sha
+            )
             execution_node = ExecutionNode(
                 test_id=str(tr.id),
                 test_name=tr.test_case.test_name if tr.test_case else "Unknown",
@@ -216,7 +219,7 @@ class RegressionEvidenceIntegration:
                 status=tr.status,
                 duration=tr.duration or 0.0,
                 pull_request_id=pull_request_id,
-                head_sha=head_sha,
+                head_sha=originating_run_commit_sha,
                 source_file="",
                 mapped_test_node_id=str(tr.test_case_id) if tr.test_case else None,
                 mapped_requirement_ids=[],  # Will be populated by matching

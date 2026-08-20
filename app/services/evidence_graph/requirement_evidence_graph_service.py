@@ -212,7 +212,7 @@ class RequirementEvidenceGraphService:
         test_nodes: List[TestNode]
     ) -> List[ExecutionNode]:
         """Build ExecutionNodes from current PR test results."""
-        test_results = self._load_current_pr_test_results(pull_request_id)
+        test_results = self._load_current_pr_test_results(pull_request_id, head_sha)
 
         test_map = {t.test_id: t for t in test_nodes}
         return self.integration.build_execution_nodes(
@@ -222,28 +222,53 @@ class RequirementEvidenceGraphService:
             test_map
         )
 
-    def _load_current_pr_test_results(self, pull_request_id: str):
+    def _load_current_pr_test_results(
+        self,
+        pull_request_id: str,
+        head_sha: str
+    ) -> List:
         """
-        Load current PR JUnit test results using the real persisted relationship.
-        Must not use TestResult.pull_request_id since that field does not exist.
+        Load current PR JUnit test results for the current PR head SHA.
+
+        Eligible TestResults are those in TestRuns that belong to the target
+        pull request AND whose commit_sha equals the current PR head. For each
+        TestCase, only the result from the latest eligible TestRun is retained,
+        so partial reruns are handled correctly: a rerun of one test does not
+        erase previously valid current-head results for other tests.
         """
         import logging
         from app.models.test_result import TestResult, TestRun
-        
+
         logger = logging.getLogger(__name__)
-        
-        if not pull_request_id:
-            logger.warning("No pull_request_id provided to load current PR test results.")
+
+        if not pull_request_id or not head_sha:
+            logger.warning("No pull_request_id or head_sha provided to load current PR test results.")
             return []
-            
-        test_results = self.db.query(TestResult).join(TestRun).filter(
-            TestRun.pull_request_id == pull_request_id
-        ).all()
-        
-        if not test_results:
+
+        ordered_results = (
+            self.db.query(TestResult)
+            .join(TestRun, TestResult.test_run_id == TestRun.id)
+            .filter(
+                TestRun.pull_request_id == pull_request_id,
+                TestRun.commit_sha == head_sha,
+            )
+            .order_by(TestRun.created_at.desc(), TestRun.id.desc())
+            .all()
+        )
+
+        # Reconcile to one authoritative result per TestCase: latest eligible run wins.
+        seen_test_case_ids = set()
+        reconciled_results = []
+        for result in ordered_results:
+            if result.test_case_id in seen_test_case_ids:
+                continue
+            seen_test_case_ids.add(result.test_case_id)
+            reconciled_results.append(result)
+
+        if not reconciled_results:
             logger.warning("No current PR test execution relationship found for this recommendation run.")
-            
-        return test_results
+
+        return reconciled_results
 
     def _load_current_coverage_reports(
         self,
@@ -446,17 +471,23 @@ class RequirementEvidenceGraphService:
             if not test_case_ids:
                 continue
             
-            # Get the most recent TestRun for the repository
-            # We need to determine repository_id from context - for now, use the first test case
+            # Determine repository_id from the linked test case, then select the
+            # most recent TestRun for the current PR at the current head SHA.
             if test_case_ids:
                 first_tc = self.db.query(TestCase).filter(TestCase.id == test_case_ids[0]).first()
                 if first_tc:
                     repository_id = first_tc.repository_id
                     
-                    # Get the most recent TestRun for this repository
-                    latest_run = self.db.query(TestRun).filter(
-                        TestRun.repository_id == repository_id
-                    ).order_by(TestRun.created_at.desc()).first()
+                    # Select the most recent TestRun that belongs to the current
+                    # PR and was executed at the current PR head SHA.
+                    if not pull_request_id or not head_sha:
+                        latest_run = None
+                    else:
+                        latest_run = self.db.query(TestRun).filter(
+                            TestRun.repository_id == repository_id,
+                            TestRun.pull_request_id == pull_request_id,
+                            TestRun.commit_sha == head_sha
+                        ).order_by(TestRun.created_at.desc()).first()
                     
                     if latest_run:
                         # Check for passing TestResults in this run

@@ -6,6 +6,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.services.ac_test_mapping_service import ACTestMappingService
+from app.utils.file_classifier import classify_changed_file
 from app.config import settings
 from app.schemas.input_readiness_v2 import (
     InputReadinessV2Response,
@@ -198,10 +199,9 @@ class InputReadinessV2Service:
 
         else:
             # All hard blockers are READY!
-            # Rule 7: Missing confidence boosters Cap:
-            # If release_context (Input 8), environment_matrix (Input 9), known_risks (Input 11), 
-            # quality_gate_profile (Input 10), or out_of_scope (Input 12) are missing:
-            # do not allow HIGH_CONFIDENCE_READY and set confident_generation = False.
+            # Optional confidence/governance boosters (Inputs 8, 9, 10, 11, 12) may reduce
+            # confidence ceiling and produce warnings, but they do not force DRAFT_ONLY
+            # when all hard evidence is READY and the score is above the confident threshold.
             has_missing_boosters = (
                 i8.status in ("MISSING", "BLOCKED") or
                 i9.status in ("MISSING", "BLOCKED") or
@@ -211,16 +211,10 @@ class InputReadinessV2Service:
             )
 
             if confidence_score >= CONFIDENT_READY_THRESHOLD:
-                if has_missing_boosters:
-                    generation_status = "DRAFT_ONLY"
-                    can_generate = "DRAFT_ONLY"
-                    confident_generation = False
-                    primary_message = "Core inputs ready but confidence boosters are missing. Only draft recommendations can be generated."
-                else:
-                    generation_status = "HIGH_CONFIDENCE_READY"
-                    can_generate = "YES"
-                    confident_generation = True
-                    primary_message = "All critical inputs are ready. High-confidence regression planning is available."
+                generation_status = "HIGH_CONFIDENCE_READY"
+                can_generate = "YES"
+                confident_generation = True
+                primary_message = "All critical inputs are ready. High-confidence regression planning is available."
             elif confidence_score >= MINIMUM_READY_THRESHOLD:
                 generation_status = "DRAFT_ONLY"
                 can_generate = "DRAFT_ONLY"
@@ -319,8 +313,10 @@ class InputReadinessV2Service:
 
         # Confident generation only allowed if:
         # 1. All hard blockers are READY (not PARTIAL or REVIEW_NEEDED)
-        # 2. No missing confidence boosters (Inputs 8, 9, 10, 11, 12)
+        # 2. Confidence score is at or above the confident threshold
         # 3. Confirmed AC -> Test mappings > 0
+        # Optional confidence/governance boosters (Inputs 8, 9, 10, 11, 12) do not block
+        # confident generation; they only reduce the confidence ceiling and emit warnings.
         can_generate_confident = False
         hard_blockers_ready = (
             i1.status == "READY" and 
@@ -329,18 +325,13 @@ class InputReadinessV2Service:
             i5.status == "READY" and 
             i6.status == "READY"
         )
-        no_missing_boosters = (
-            i8.status not in ("MISSING", "BLOCKED") and
-            i9.status not in ("MISSING", "BLOCKED") and
-            i10.status not in ("MISSING", "BLOCKED") and
-            i11.status not in ("MISSING", "BLOCKED") and
-            i12.status not in ("MISSING", "BLOCKED")
-        )
         confirmed_mappings_positive = True
         if hasattr(i5, "details") and isinstance(i5.details, dict):
             confirmed_mappings_positive = i5.details.get("confirmed_mapping_count", 1) > 0
-        
-        if hard_blockers_ready and no_missing_boosters and confirmed_mappings_positive:
+
+        if (hard_blockers_ready and
+            confirmed_mappings_positive and
+            confidence_score >= CONFIDENT_READY_THRESHOLD):
             can_generate_confident = True
 
         # Determine primary reason
@@ -371,16 +362,8 @@ class InputReadinessV2Service:
             primary_reason = "Test execution results are missing."
         elif i6.status == "STALE":
             primary_reason = "PR test results are stale."
-        elif i10.status in ("MISSING", "BLOCKED"):
-            primary_reason = "Quality Gate Profile is missing."
-        elif i12.status in ("MISSING", "BLOCKED"):
-            primary_reason = "Out-of-Scope Declaration is missing."
-        elif i8.status in ("MISSING", "BLOCKED"):
-            primary_reason = "Release Context is missing."
-        elif i9.status in ("MISSING", "BLOCKED"):
-            primary_reason = "Environment Support Matrix is missing."
-        elif i11.status in ("MISSING", "BLOCKED"):
-            primary_reason = "Known Defects / Accepted Risks are missing."
+        # Optional confidence/governance boosters (Inputs 8-12) do not become the
+        # primary generation-failure reason; they are reported as warnings only.
 
         # Calculate separate confidence concepts
         evidence_completeness = self._calculate_evidence_completeness(all_inputs)
@@ -1931,63 +1914,6 @@ class InputReadinessV2Service:
         })
 
         # Classify changed files into coverable source, test, and non-coverable files
-        def classify_changed_file(file_path: str) -> str:
-            """Classify a changed file as source, test, or non-coverable."""
-            path_lower = file_path.lower()
-            
-            # Test file patterns
-            test_patterns = [
-                "__tests__",
-                "test_",
-                "_test.",
-                ".test.",
-                ".spec.",
-                "_spec.",
-                "spec_",
-                "/tests/",
-                "/test/",
-            ]
-            
-            # Non-coverable file patterns
-            non_coverable_patterns = [
-                "/docs/",
-                "/documentation/",
-                "/.github/",
-                "/.vscode/",
-                "/.idea/",
-                "/node_modules/",
-                "/.next/",
-                "/build/",
-                "/dist/",
-                "/out/",
-                "/.cache/",
-                "/coverage/",
-                "/.env",
-                "package-lock.json",
-                "yarn.lock",
-                "pnpm-lock.yaml",
-                "dockerfile",
-                "docker-compose",
-                ".md",
-                ".txt",
-                ".json",
-                ".yaml",
-                ".yml",
-            ]
-            
-            # Check for test files
-            for pattern in test_patterns:
-                if pattern in path_lower or path_lower.endswith(pattern):
-                    return "test"
-            
-            # Check for non-coverable files
-            for pattern in non_coverable_patterns:
-                if pattern in path_lower or path_lower.endswith(pattern):
-                    return "non_coverable"
-            
-            # Default to coverable source file
-            return "source"
-
         coverable_source_changed_files = set()
         changed_test_files = set()
         non_coverable_changed_files = set()

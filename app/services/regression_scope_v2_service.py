@@ -252,7 +252,9 @@ class RegressionScopeV2Service:
             impact_depth = test_data.get("impact_depth", 0)
             evidence_path = test_data.get("evidence_path", [])
             
-            # Get execution status for this test
+            # Resolve execution status and freshness from the target PR's evidence.
+            # Prefer a current-head result; fall back to an older same-PR result as STALE.
+            # Results from other PRs must not influence this scope.
             execution_status = "NOT_RUN"
             freshness_status = "UNKNOWN"
             latest_result_created_at = None
@@ -268,19 +270,39 @@ class RegressionScopeV2Service:
                         ).first()
                     
                     if test_case:
-                        # Get latest test result
-                        latest_result = db.query(TestResult).filter(
-                            TestResult.test_case_id == test_case.id
-                        ).order_by(TestResult.created_at.desc()).first()
+                        # Step 1: current PR + current head result
+                        current_head_result = (
+                            db.query(TestResult)
+                            .join(TestRun, TestResult.test_run_id == TestRun.id)
+                            .filter(
+                                TestResult.test_case_id == test_case.id,
+                                TestRun.pull_request_id == pr.id,
+                                TestRun.commit_sha == pr.head_commit_sha,
+                            )
+                            .order_by(TestRun.created_at.desc(), TestRun.id.desc())
+                            .first()
+                        )
                         
-                        if latest_result:
-                            execution_status = latest_result.status
-                            latest_result_created_at = latest_result.created_at
+                        if current_head_result:
+                            execution_status = (current_head_result.status or "UNKNOWN").upper()
+                            latest_result_created_at = current_head_result.created_at
+                            freshness_status = "FRESH"
+                        else:
+                            # Step 2: older same-PR result is stale evidence, still actionable
+                            stale_result = (
+                                db.query(TestResult)
+                                .join(TestRun, TestResult.test_run_id == TestRun.id)
+                                .filter(
+                                    TestResult.test_case_id == test_case.id,
+                                    TestRun.pull_request_id == pr.id,
+                                )
+                                .order_by(TestRun.created_at.desc(), TestRun.id.desc())
+                                .first()
+                            )
                             
-                            # Determine freshness
-                            if pr.head_commit_sha and latest_result.commit_sha == pr.head_commit_sha:
-                                freshness_status = "FRESH"
-                            else:
+                            if stale_result:
+                                execution_status = (stale_result.status or "UNKNOWN").upper()
+                                latest_result_created_at = stale_result.created_at
                                 freshness_status = "STALE"
                 except Exception as e:
                     logger.error(f"Failed to get execution status for test {stable_test_id}: {e}")
@@ -404,7 +426,9 @@ class RegressionScopeV2Service:
         audit: bool,
         db: Session = None,
         include_diagnostics: bool = False,
-        mode: ScopeMode = ScopeMode.TARGETED
+        mode: ScopeMode = ScopeMode.TARGETED,
+        live_ac_traceability: List[Dict[str, Any]] = None,
+        live_ac_classifications: Dict[str, str] = None
     ) -> RegressionScopeV2:
         """Generate regression scope with structural impact as primary core.
         
@@ -441,28 +465,46 @@ class RegressionScopeV2Service:
         )
         
         # Step 2: Create scope items from AC traceability (overlay)
-        traceability = snapshot_data.get("acTraceability", []) or []
+        # Prefer the current live traceability over the historical snapshot.
+        traceability = live_ac_traceability or snapshot_data.get("acTraceability", []) or []
         ac_scope_items = []
-        
+
+        # Evidence-graph statuses that guarantee a fresh passing current-PR result.
+        # Only VERIFIED_BY_CURRENT_PR_EXECUTION means the test passed at the
+        # current PR head; mapping/trust states do not prove execution.
+        live_verified_statuses = {
+            "VERIFIED_BY_CURRENT_PR_EXECUTION",
+        }
+
         for trace in traceability:
             coverage_status = trace.get("coverageStatus", "MISSING")
             linked_tests = trace.get("linkedExistingTests", []) or []
-            
-            # Find real AC
-            ac = next((row for row in ac_rows if str(row.id) == trace.get("requirementId")), None)
-            
+
+            # Find real AC using the authoritative database identity.
+            ac_id = trace.get("databaseAcId") or trace.get("requirementId")
+            ac = next((row for row in ac_rows if str(row.id) == ac_id), None)
+
             if ac:
                 # Create scope item from AC trace
                 item = RegressionScopeV2Service._create_scope_item_from_trace(
                     trace, audit, db=db, repository_id=run.repository_id, ac=ac
                 )
-                
-                # Resolve test evidence
-                evidence = RegressionScopeV2Service._resolve_test_evidence_for_ac(
-                    ac, pr, db, linked_tests, run.repository_id
-                )
-                item.execution_status = evidence['execution_status']
-                item.freshness_status = evidence['freshness_status']
+
+                # Authoritative live classification is the source of truth for current-PR evidence.
+                # The traceability coverageStatus is a display label and may be stale.
+                ac_classification = (live_ac_classifications or {}).get(str(trace.get("databaseAcId"))) or coverage_status
+                if ac_classification in live_verified_statuses:
+                    item.execution_status = "PASSED"
+                    item.freshness_status = "FRESH"
+                    item.reason = f"Current PR evidence verified ({ac_classification})"
+                    item.reason_code = "LIVE_VERIFIED_CURRENT_PR"
+                else:
+                    # Resolve test evidence from DB for non-verified cases
+                    evidence = RegressionScopeV2Service._resolve_test_evidence_for_ac(
+                        ac, pr, db, linked_tests, run.repository_id
+                    )
+                    item.execution_status = evidence['execution_status']
+                    item.freshness_status = evidence['freshness_status']
                 
                 # Determine initial bucket based on structural impact
                 # If this AC is structurally impacted (has overlapping files), use structural rules
@@ -766,6 +808,8 @@ class RegressionScopeV2Service:
                     canonical_ac_rows=ac_rows,
                 )
                 graph_service.persist_graph_snapshot(str(run.id), view_model)
+                # Reuse the freshly-built graph in Phase 7/8 instead of rebuilding it.
+                live_view_model = view_model
                 # Refresh run so the persisted snapshot is visible in this session.
                 db.refresh(run)
 
@@ -823,33 +867,34 @@ class RegressionScopeV2Service:
         changed_files = snapshot_data.get("changedFiles", []) or []
         evidence_items = snapshot_data.get("acTraceability", []) or []
 
-        # Generate scope based on structural impact as primary core
-        # Structural impact produces base candidates, then AC/risk overlays add context
-        scope = RegressionScopeV2Service._generate_structural_first_scope(
-            run, pr, ac_rows, snapshot_data, structural_result,
-            include_safe_to_skip, audit, db=db, include_diagnostics=include_diagnostics, mode=mode
-        )
+        # Build current live evidence graph once before constructing scope items.
+        # If the snapshot-fallback branch above already built it, reuse that instance.
+        if 'live_view_model' not in locals():
+            live_view_model = None
+        live_ac_traceability: List[Dict[str, Any]] = []
+        if live_view_model is None:
+            try:
+                from app.services.evidence_graph.requirement_evidence_graph_service import RequirementEvidenceGraphService
 
-        # Phase 7: Build traceability summary from live evidence graph.
-        # The persisted snapshot is historical/audit data and may be stale.
-        # Always derive traceability rows from current evidence so the summary
-        # reflects the actual classification state without mutating history.
-        live_traceability = []
-        try:
-            from app.services.evidence_graph.requirement_evidence_graph_service import RequirementEvidenceGraphService
+                graph_service = RequirementEvidenceGraphService(db)
+                live_view_model = graph_service.build_evidence_graph(
+                    repository_id=str(run.repository_id),
+                    pull_request_id=str(pr.id),
+                    head_sha=pr.head_commit_sha,
+                    changed_files=changed_file_paths,
+                    pr_description=None,
+                    recommendation_run_id=str(run.id),
+                    canonical_ac_rows=ac_rows,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[ScopeGen] Failed to build live evidence graph before scope construction "
+                    f"for run {run_id}; falling back to snapshot: {e}"
+                )
 
-            graph_service = RequirementEvidenceGraphService(db)
-            live_view_model = graph_service.build_evidence_graph(
-                repository_id=str(run.repository_id),
-                pull_request_id=str(pr.id),
-                head_sha=pr.head_commit_sha,
-                changed_files=changed_file_paths,
-                pr_description=None,
-                recommendation_run_id=str(run.id),
-                canonical_ac_rows=ac_rows,
-            )
+        if live_view_model is not None:
             for row in live_view_model.ac_traceability or []:
-                live_traceability.append(
+                live_ac_traceability.append(
                     {
                         "requirementId": row.requirement_id,
                         "readableId": row.readable_id,
@@ -866,14 +911,34 @@ class RegressionScopeV2Service:
                         "databaseAcId": getattr(row, "database_ac_id", None),
                     }
                 )
-        except Exception as e:
-            logger.warning(
-                f"[ScopeGen] Failed to build live traceability rows for run {run_id}; "
-                f"falling back to persisted snapshot: {e}"
-            )
 
-        traceability = live_traceability or (snapshot_data.get("acTraceability", []) or [])
-        traceability_summary = RegressionScopeV2Service._build_traceability_summary(traceability)
+        # Authoritative per-AC classification from the live evidence graph.
+        # coverageStatus on traceability rows is a display label; the RequirementNode
+        # classification is the source of truth for current-PR execution state.
+        live_ac_classifications: Dict[str, str] = {}
+        if live_view_model is not None:
+            live_ac_classifications = {
+                str(row.database_ac_id): row.classification.value
+                for row in (live_view_model.requirements or [])
+                if row.database_ac_id
+            }
+
+        # Generate scope based on structural impact as primary core
+        # Structural impact produces base candidates, then AC/risk overlays add context
+        scope = RegressionScopeV2Service._generate_structural_first_scope(
+            run, pr, ac_rows, snapshot_data, structural_result,
+            include_safe_to_skip, audit, db=db, include_diagnostics=include_diagnostics, mode=mode,
+            live_ac_traceability=live_ac_traceability or None,
+            live_ac_classifications=live_ac_classifications or None
+        )
+
+        # Phase 7: Build traceability summary from live evidence graph.
+        # The persisted snapshot is historical/audit data and may be stale.
+        # Always derive traceability rows from current evidence so the summary
+        # reflects the actual classification state without mutating history.
+        # The live graph was already built once above; reuse its rows here.
+        live_traceability = live_ac_traceability or (snapshot_data.get("acTraceability", []) or [])
+        traceability_summary = RegressionScopeV2Service._build_traceability_summary(live_traceability)
         
         # Phase 7: Build release decision from change impact model
         # We need to build the change impact model to get the release action scope
@@ -886,7 +951,7 @@ class RegressionScopeV2Service:
         
         # Build test_mappings from traceability data
         test_mappings = {}
-        for trace in traceability:
+        for trace in live_traceability:
             database_ac_id = trace.get("databaseAcId")
             if database_ac_id:
                 ac_id = str(database_ac_id)
@@ -916,7 +981,7 @@ class RegressionScopeV2Service:
             
             # Phase 7: Enrich scope items with impact information from change impact model
             scope = RegressionScopeV2Service._enrich_scope_with_impact_data(
-                scope, change_impact_model, traceability, ac_rows
+                scope, change_impact_model, live_traceability, ac_rows
             )
         except Exception as e:
             logger.error(f"[Phase7] Failed to build release decision or enrich scope: {e}")
@@ -985,7 +1050,7 @@ class RegressionScopeV2Service:
             
             # Extract existing test names for deduplication
             existing_test_names = set()
-            for trace in traceability:
+            for trace in live_traceability:
                 linked_tests = trace.get('linkedExistingTests', [])
                 for test in linked_tests:
                     test_name = test if isinstance(test, str) else str(test)
@@ -2462,11 +2527,11 @@ class RegressionScopeV2Service:
         
         # Load from DB if not provided but db session and repository_id are present
         if not ac and db and repository_id:
-            requirement_id = trace.get("requirementId")
-            if requirement_id:
+            db_ac_id = trace.get("databaseAcId") or trace.get("requirementId")
+            if db_ac_id:
                 try:
                     ac = db.query(AcceptanceCriterion).filter(
-                        AcceptanceCriterion.id == requirement_id,
+                        AcceptanceCriterion.id == db_ac_id,
                         AcceptanceCriterion.repository_id == repository_id
                     ).first()
                 except Exception:
@@ -2480,8 +2545,12 @@ class RegressionScopeV2Service:
         else:
             source_ac_number = trace.get("sourceAcNumber")
 
+        # Authoritative item identity is the stable database AC id, not the
+        # potentially stale evidence-graph requirement id.
+        item_id = str(ac.id) if ac else str(trace.get("databaseAcId") or trace.get("requirementId", ""))
+
         return ScopeItem(
-            id=trace.get("requirementId", ""),
+            id=item_id,
             readable_id=readable_id,
             source_ac_number=source_ac_number,
             title=title,
@@ -3706,6 +3775,80 @@ class RegressionScopeV2Service:
         "Deferred": "review_required",
         "Optional": "review_required",
     }
+
+    @staticmethod
+    def _filter_verified_requirement_gaps(
+        recommendations: List[Any], view_model: Any
+    ) -> Tuple[List[Any], int]:
+        """Remove REQUIREMENT_GAP recommendations that are already verified by live evidence.
+
+        Matching prefers the stable database_ac_id, falling back to requirement_id,
+        readable_id, or normalized title only when no stable id is present.
+        """
+        if not recommendations or not view_model:
+            return recommendations, 0
+
+        from app.services.regression_evidence_classifier import EvidenceClassification
+
+        verified_statuses = {
+            EvidenceClassification.VERIFIED_BY_CURRENT_PR_EXECUTION,
+        }
+
+        # Also accept equivalent string values in case classification is serialized.
+        verified_values = {"VERIFIED_BY_CURRENT_PR_EXECUTION", "VERIFIED", "AUTO_TRUSTED", "USER_CONFIRMED"}
+
+        verified_db_ids = set()
+        verified_fallback_ids = set()
+        verified_titles = set()
+        for req in view_model.requirements or []:
+            classification = getattr(req, "classification", None)
+            class_value = getattr(classification, "value", str(classification)) if classification is not None else None
+            is_verified = classification in verified_statuses or class_value in verified_values
+            if not is_verified:
+                continue
+
+            db_id = getattr(req, "database_ac_id", None)
+            req_id = getattr(req, "requirement_id", None)
+            readable_id = getattr(req, "readable_id", None)
+            title = getattr(req, "title", None)
+
+            if db_id:
+                verified_db_ids.add(str(db_id))
+                if req_id:
+                    verified_fallback_ids.add(str(req_id))
+                if readable_id:
+                    verified_fallback_ids.add(str(readable_id).strip().upper())
+            else:
+                if req_id:
+                    verified_fallback_ids.add(str(req_id))
+                if readable_id:
+                    verified_fallback_ids.add(str(readable_id).strip().upper())
+                if title:
+                    verified_titles.add(str(title).strip().lower())
+
+        kept = []
+        removed = 0
+        for rec in recommendations:
+            if getattr(rec, "source", None) != "REQUIREMENT_GAP":
+                kept.append(rec)
+                continue
+
+            link_id = getattr(rec, "linked_requirement_id", None)
+            if link_id:
+                link_id_str = str(link_id)
+                if link_id_str in verified_db_ids or link_id_str in verified_fallback_ids:
+                    removed += 1
+                    continue
+
+            # Title fallback only when no stable id exists on the verified requirement.
+            title = getattr(rec, "title", None)
+            if title and str(title).strip().lower() in verified_titles:
+                removed += 1
+                continue
+
+            kept.append(rec)
+
+        return kept, removed
 
     @staticmethod
     def _build_traceability_summary(traceability: List[Dict[str, Any]]) -> TraceabilitySummary:

@@ -19,6 +19,7 @@ from app.schemas.structural_impact import (
 )
 from app.services.dependency_expansion_resolver import DependencyExpansionResolver
 from app.services.coverage_query import CoverageQueryService
+from app.utils.file_classifier import classify_changed_file
 from app.constants.evidence import CoverageLevel
 
 logger = logging.getLogger(__name__)
@@ -137,8 +138,12 @@ class StructuralImpactSelectionService:
                         "coverage_ratio": coverage_response.file_coverage_details.get(file_path, {}).get("line_coverage_ratio"),
                     })
 
-        # Identify unmapped impacted files (no coverage/test mapping)
+        # Identify unmapped impacted files (no coverage/test mapping).
+        # Only coverable production source files are eligible for source coverage gaps.
         for file_path in impacted_files:
+            classification = classify_changed_file(file_path)
+            if classification in ("test", "non_coverable"):
+                continue
             if file_path not in coverage_response.covered_files:
                 unmapped_impacted_files.append(file_path)
                 coverage_gaps.append({
