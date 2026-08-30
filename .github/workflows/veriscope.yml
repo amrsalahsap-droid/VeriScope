@@ -1,0 +1,23 @@
+name: Veriscope Quality Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  veriscope:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Veriscope analysis
+        run: |
+          curl -sS -X POST "http://localhost:8000/repositories/a88386cc-87e7-43c2-ab73-c825777efb24/pipeline-runs" \
+            -H "Authorization: Bearer XTuKPwiTm7qcYL68Uv4oZ95q6gKK4uV2FLmTX--5GSs" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "provider": "GITHUB_ACTIONS",
+              "externalRunId": "${{ github.run_id }}",
+              "pullRequestNumber": ${{ github.event.pull_request.number }},
+              "commitSha": "${{ github.sha }}",
+              "branch": "${{ github.head_ref }}",
+              "triggerSource": "pull_request"
+            }'
